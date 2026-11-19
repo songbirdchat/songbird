@@ -153,6 +153,32 @@ fn react(m: &mut Message, emoji: &str, by: Vec<Option<ContactId>>) {
     });
 }
 
+/// A real account's starting point: nobody, no chats, no calls. Only the
+/// defaults of settings and session come from [`seed`]; everything else
+/// arrives from the server and app-core (the owner's rule: no mock data).
+pub fn empty() -> Seed {
+    let base = seed();
+    Seed {
+        me: Profile {
+            name: String::new(),
+            username: String::new(),
+            about: String::new(),
+            status_line: None,
+            presence: Presence::Online,
+            seed: 42,
+        },
+        contacts: Vec::new(),
+        chats: Vec::new(),
+        messages: HashMap::new(),
+        calls: Vec::new(),
+        call_links: Vec::new(),
+        devices: Vec::new(),
+        settings: base.settings,
+        session: base.session,
+    }
+}
+
+/// The demo data, for screenshot fixtures only (see `store::demo`).
 pub fn seed() -> Seed {
     // ---------------------------------------------------------- people
     let mut contacts = vec![

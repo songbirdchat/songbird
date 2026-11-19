@@ -191,10 +191,21 @@ pub fn install(s: Store) {
     provide_context(s);
 }
 
+/// Whether this run shows the demo data: only a preview build started as a
+/// screenshot fixture (`SONGBIRD_ONBOARDED=1`, or the `songbird-onboarded`
+/// marker in the data folder). Every other run is a real account on the
+/// real backend, starting empty.
+pub fn demo() -> bool {
+    cfg!(test)
+        || crate::PREVIEW_BUILD
+            && (std::env::var_os("SONGBIRD_ONBOARDED").is_some()
+                || data_dir().is_some_and(|d| d.join("songbird-onboarded").exists()))
+}
+
 impl Store {
-    /// The seeded mock, with the onboarding state from storage.
+    /// The store: empty for a real account, the demo data for fixtures.
     pub fn new() -> Self {
-        let seed = seed::seed();
+        let seed = if demo() { seed::seed() } else { seed::empty() };
         // Debug builds only: `SONGBIRD_ONBOARDED=1` skips the first run (for
         // screenshot tests of the rest of the app).
         // …or a `songbird-onboarded` file in the app's data folder (for

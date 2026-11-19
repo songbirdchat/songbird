@@ -150,7 +150,8 @@ pub fn restore() {
         })
         .unwrap_or_default();
     live().set(Live {
-        enabled: Storage::get_item(K_ENABLED).is_some(),
+        // Always on for a real account; only the screenshot fixtures run without it.
+        enabled: !crate::store::demo() || Storage::get_item(K_ENABLED).is_some(),
         endpoint,
         account: Storage::get_item(K_ACCOUNT),
         device: Storage::get_item(K_DEVICE),

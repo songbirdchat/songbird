@@ -315,11 +315,9 @@ pub(super) fn claim_username(s: Store, f: Flow) -> View {
         dismiss_keyboard();
         saving.set(true);
         let wanted = name();
-        // mock: claiming the name (app-core `claim_username`), case-insensitively unique.
-        set_timeout(Duration::from_millis(600), move || {
-            if !saving.try_set(false) {
-                return;
-            }
+        // Claimed on the server (only its hash and a proof leave the device).
+        {
+            saving.set(false);
             if crate::backend::is_live() && crate::backend::registered() {
                 spawn(async move {
                     match crate::backend::claim_username(&wanted).await {
@@ -336,7 +334,7 @@ pub(super) fn claim_username(s: Store, f: Flow) -> View {
             } else {
                 f.taken.set(Some(wanted));
             }
-        });
+        }
     };
     let options = username_suggestions(&lost, |n| s.username_available(n));
     flow_layout(
