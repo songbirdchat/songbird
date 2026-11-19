@@ -980,3 +980,53 @@ mod tests {
         );
     }
 }
+
+/// `YYYY-MM-DD HH:MM` (UTC) of Unix milliseconds.
+pub fn date_time(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    // Howard Hinnant's civil-from-days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        tod / 3600,
+        (tod % 3600) / 60
+    )
+}
+
+impl Store {
+    /// The chat as a plain text file (one line per message, UTC times),
+    /// written on this device for the user to save (Export chat).
+    pub fn export_text(&self, chat: ChatId) -> String {
+        let now_ms = nsh_core::time::unix_ms() as i64;
+        let title = self.chat(chat).map(|c| c.title).unwrap_or_default();
+        let mut out = format!("Songbird chat: {title}\nExported {}\n\n", date_time(now_ms));
+        for m in self.messages_of(chat) {
+            let who = self.contact_name(m.from);
+            out.push_str(&format!(
+                "[{}] {who}: {}\n",
+                date_time(now_ms + m.at * 60_000),
+                m.body.preview()
+            ));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod date_tests {
+    #[test]
+    fn dates_are_civil() {
+        assert_eq!(super::date_time(0), "1970-01-01 00:00");
+        assert_eq!(super::date_time(1_795_000_000_000), "2026-11-18 11:06");
+    }
+}

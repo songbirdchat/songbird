@@ -390,9 +390,11 @@ fn contact_info(chat: ChatId) -> AnyElement {
 
     let blocked = move || peer.with(|p| p.as_ref().is_some_and(|p| p.blocked));
     let danger = group([
-        Row::new("Export chat").icon(Icon::Upload).on_press(|| {
-            // mock: app-core writes an encrypted export the user saves.
-            toast("Export ready. Saved to Files.");
+        Row::new("Export chat").icon(Icon::Upload).on_press(move || {
+            // A text file of the chat, saved where the user chooses. It
+            // leaves Songbird's encryption: the user decides where it goes.
+            let text = s.export_text(chat);
+            save_file("songbird-chat.txt", text.into_bytes());
         }).build(),
         Row::new("Clear chat")
             .icon(Icon::Trash)
