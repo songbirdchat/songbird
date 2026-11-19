@@ -206,10 +206,13 @@ fn body() -> AnyElement {
                     .subtitle("This takes a moment."),
                 Some(true) => Row::new("Export report…")
                     .icon(Icon::Download)
-                    .subtitle("Ready. It's available for 3 days.")
+                    .subtitle("Ready. Choose where to save it.")
                     .on_press(move || {
-                        // mock: the save dialog (app-core `export_account` writes the file).
-                        toast("Report saved to Downloads");
+                        crate::backend::run(async {
+                            let bytes = crate::backend::account::report_file().await?;
+                            crate::ui::save_file("songbird-account-report.json", bytes);
+                            Ok(())
+                        });
                     }),
             };
             group([row.build()]).into_element()
@@ -414,14 +417,11 @@ fn delete_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
             ))
             .child(
                 btn("Delete account", Variant::Danger, BtnSize::Md, move || {
-                    confirm("Delete your account?", "This can't be undone.", "Delete account", move || {
-                        // mock: app-core `delete_account` (the server deletes every store, D-0041).
-                        open.set(false);
-                        typed.set(String::new());
-                        nav::pop_to_root();
-                        s.replay_onboarding();
-                        toast("Your account was deleted");
-                    })
+                    open.set(false);
+                    typed.set(String::new());
+                    let _ = s;
+                    // The server deletes every store (D-0041); this device erases its own.
+                    crate::features::settings::account::delete_account();
                 })
                 .disabled(move || !matches()),
             ),

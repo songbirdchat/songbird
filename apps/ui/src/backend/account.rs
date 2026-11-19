@@ -122,3 +122,10 @@ pub fn summarize(v: &Value) -> String {
         a["inactivity_months"].as_u64().unwrap_or(12),
     )
 }
+
+/// The account's server-side report as a file the user keeps (pretty JSON:
+/// what the server holds, none of it message content).
+pub async fn report_file() -> Result<Vec<u8>, Problem> {
+    let v = export().await?;
+    serde_json::to_vec_pretty(&v).map_err(|_| super::problem("The report couldn't be written."))
+}

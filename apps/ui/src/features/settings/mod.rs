@@ -8,7 +8,7 @@
 //! `Store::settings_update` / `profile_update` or the intents in
 //! `store::ext_settings`.
 
-mod account;
+pub(crate) mod account;
 mod appearance;
 mod centre;
 mod chats;

@@ -977,3 +977,33 @@ pub fn share_text(text: impl Into<String>) {
         })
     });
 }
+
+/// Asks where to save `bytes` (the system's save dialog) and writes them
+/// there. On platforms without a save dialog the file goes to the app's
+/// documents folder and the toast says where.
+pub fn save_file(suggested: impl Into<String>, bytes: Vec<u8>) {
+    let suggested = suggested.into();
+    Owner::detached().run(|| {
+        spawn(async move {
+            let dialog = nsh_core::file_dialog::SaveDialog::new().file_name(suggested.clone());
+            let path = match nsh_core::prelude::pick_save_path(dialog).await {
+                Ok(Some(p)) => p,
+                Ok(None) => return,
+                Err(_) => match data_dir() {
+                    Some(d) => d.join(&suggested),
+                    None => {
+                        toast("This device has no place to save files.");
+                        return;
+                    }
+                },
+            };
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => toast(format!(
+                    "Saved {}",
+                    path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+                )),
+                Err(_) => toast("The file couldn't be saved there."),
+            }
+        })
+    });
+}

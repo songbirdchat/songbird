@@ -198,6 +198,26 @@ pub fn set_endpoint(endpoint: Endpoint) {
     live().update(|l| l.endpoint = endpoint);
 }
 
+/// Erases what this device keeps of a deleted account: the encrypted message
+/// store, its key, the photo and the account's local keys.
+pub fn erase_local() {
+    if let Some(d) = data_dir() {
+        for f in ["songbird-core.db", "songbird-core.db-wal", "songbird-core.db-shm", "songbird-avatar.img"] {
+            let _ = std::fs::remove_file(d.join(f));
+        }
+    }
+    for k in [
+        "sb.core.db_key",
+        "sb.core.device_identity",
+        "sb.avatar",
+        "sb.username_link",
+        "sb.profile_key",
+        "sb.profile_version",
+    ] {
+        Storage::remove_item(k);
+    }
+}
+
 /// Forgets this device's account locally (the server keeps it).
 pub fn forget() {
     disconnect();
@@ -560,6 +580,7 @@ pub async fn delete_account() -> Result<(), Problem> {
     let (status, body) = signed("DELETE", "/v1/account", None, false).await?;
     if (200..300).contains(&status) {
         forget();
+        erase_local();
         Ok(())
     } else {
         Err(explain(status, &body))

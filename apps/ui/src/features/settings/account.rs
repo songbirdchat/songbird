@@ -165,7 +165,11 @@ fn request_info() {
                         .child(banner(Tone::Secure, Icon::Check, "Your report is ready. It stays on this device until you export it."))
                         .child(card().child(body(move || ext.with(|x| x.account_report.clone().unwrap_or_default()))))
                         .child(btn_with_icon("Export report", Some(Icon::Download), Variant::Outline, BtnSize::Md, || {
-                            toast("Saved to Files")
+                            crate::backend::run(async {
+                                let bytes = crate::backend::account::report_file().await?;
+                                crate::ui::save_file("songbird-account-report.json", bytes);
+                                Ok(())
+                            });
                         }))
                 },
             ))
@@ -173,7 +177,7 @@ fn request_info() {
     });
 }
 
-fn delete_account() {
+pub(crate) fn delete_account() {
     confirm(
         "Delete your account?",
         "Your account, username and devices are removed from Songbird's servers. Messages on your devices are erased. This can't be undone.",
@@ -183,11 +187,14 @@ fn delete_account() {
             if crate::backend::is_live() && crate::backend::registered() {
                 crate::backend::run(async {
                     crate::backend::delete_account().await?;
-                    toast("Account deletion requested");
+                    let s = crate::store::store();
+                    crate::nav::pop_to_root();
+                    s.replay_onboarding();
+                    toast("Your account was deleted");
                     Ok(())
                 });
             } else {
-                toast("Account deletion requested");
+                toast("This device isn't connected to Songbird, so there's no account to delete.");
             }
         },
     );

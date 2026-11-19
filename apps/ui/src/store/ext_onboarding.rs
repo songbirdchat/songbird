@@ -555,7 +555,12 @@ impl Store {
     pub fn request_account_report(&self) {
         let extra = self.account_extra();
         extra.update(|a| a.report = Some(false));
-        later(1800, move || extra.update(|a| a.report = Some(true)));
+        // The server's export (`GET /v1/account/export`): ready when it answers.
+        crate::backend::run(async move {
+            let r = crate::backend::account::export().await;
+            extra.update(|a| a.report = if r.is_ok() { Some(true) } else { None });
+            r.map(|_| ())
+        });
     }
 
     /// Mock: switching accounts swaps the profile shown (app-core keeps a
