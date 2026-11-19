@@ -598,9 +598,13 @@ pub(super) fn recovery(s: Store, f: Flow) -> View {
                         Some(Icon::Download),
                         Variant::Secondary,
                         BtnSize::Md,
-                        || {
-                            // mock: app-core renders the PDF; the save dialog picks where.
-                            toast("Recovery sheet saved to Downloads");
+                        move || {
+                            // A printable text sheet, saved where the user chooses.
+                            let key = s.session.with_untracked(|x| x.recovery_key.clone());
+                            let sheet = format!(
+                                "SONGBIRD RECOVERY KEY\n\n{key}\n\nThis key restores your Songbird backups and your account.\nKeep it somewhere safe and offline. Anyone with it can read your backups.\nSongbird can't recover it for you.\n"
+                            );
+                            save_file("songbird-recovery-key.txt", sheet.into_bytes());
                         },
                     )),
             )

@@ -682,6 +682,20 @@ pub fn conversation(chat: ChatId) -> AnyElement {
                 .flex_1()
                 .overflow_hidden()
                 .bind_motion(&cv.shake)
+                // The wallpaper chosen in Settings → Chats, over chats that
+                // keep the default theme (a chat's own theme takes over).
+                .child(view().absolute().inset_0().bg(move || {
+                    let own_theme = s
+                        .chat(chat)
+                        .is_some_and(|c| c.theme != crate::store::ChatTheme::default());
+                    if own_theme {
+                        AdaptiveColor::TRANSPARENT
+                    } else {
+                        crate::features::settings::chats::wallpaper_tint(
+                            s.settings.with(|x| x.chat_wallpaper),
+                        )
+                    }
+                }))
                 // The chat's scene, behind the messages (Prompt 9).
                 .child(scene::scene_layer(chat))
                 .child(list::message_list(cv))

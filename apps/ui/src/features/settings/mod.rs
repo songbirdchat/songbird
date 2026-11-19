@@ -11,7 +11,7 @@
 pub(crate) mod account;
 mod appearance;
 mod centre;
-mod chats;
+pub(crate) mod chats;
 mod extras;
 mod links;
 mod notifications;

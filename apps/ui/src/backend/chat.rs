@@ -350,6 +350,7 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
     });
     if !mine && count_unread {
         s.edit_chat(chat, |c| c.unread += 1);
+        s.on_incoming(chat);
         let sender = s.contact(chat).map(|c| c.name);
         s.arrive(crate::store::Arrival::Message {
             chat,

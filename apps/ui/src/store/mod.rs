@@ -441,6 +441,9 @@ impl Store {
         let incoming = (from.is_some() && !system).then(|| (msg.body.preview(), from));
         self.messages
             .update(|m| m.entry(chat).or_default().push(msg));
+        if incoming.is_some() {
+            self.on_incoming(chat);
+        }
         if let Some((preview, Some(from))) = incoming {
             let sender = self.contact(from).map(|c| c.name);
             self.arrive(Arrival::Message {
@@ -450,6 +453,15 @@ impl Store {
             });
         }
         id
+    }
+
+    /// An incoming message brings an archived chat back to the list unless
+    /// "Keep chats archived" is on (Settings → Chats).
+    pub fn on_incoming(&self, chat: ChatId) {
+        let keep = self.settings.with_untracked(|x| x.keep_archived);
+        if !keep && self.chat(chat).is_some_and(|c| c.archived) {
+            self.edit_chat(chat, |c| c.archived = false);
+        }
     }
 
     /// Tells the notifier, if one listens.

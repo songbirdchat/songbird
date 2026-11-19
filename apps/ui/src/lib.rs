@@ -94,6 +94,8 @@ pub fn App() -> impl IntoElement {
     // the account's other devices (Prompt 9); before the connection, which
     // reads the proxy setting.
     backend::records::restore(s);
+    // A status whose real expiry passed while the app was closed goes now.
+    s.schedule_status_expiry();
     camera::install_for_app();
     backend::restore();
     backend::avatar::restore(

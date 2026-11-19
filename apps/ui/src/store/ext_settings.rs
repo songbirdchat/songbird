@@ -285,16 +285,29 @@ impl Store {
             x.status_expires_ms = expires_ms;
             x.status_emoji = emoji;
         });
-        if let Some(until) = until {
-            // mock: a real expiry runs on the clock; the demo clears after
-            // the same number of seconds as minutes, so it can be seen.
-            let s = *self;
-            let secs = (until - now).max(1) as u64;
-            set_timeout(Duration::from_secs(secs), move || {
-                if s.ext().with_untracked(|x| x.status_until == Some(until)) {
-                    s.clear_status();
-                }
-            });
+        self.schedule_status_expiry();
+    }
+
+    /// Clears the status when its real expiry comes (now, if it already
+    /// passed while the app was closed). Called on every change and at start.
+    pub fn schedule_status_expiry(&self) {
+        let expires_ms = self.ext().with_untracked(|x| x.status_expires_ms);
+        if expires_ms == 0 {
+            return;
+        }
+        let now_ms = nsh_core::time::unix_ms().max(0.0) as u64;
+        let s = *self;
+        let fire = move || {
+            if s.ext()
+                .with_untracked(|x| x.status_expires_ms == expires_ms)
+            {
+                s.clear_status();
+            }
+        };
+        if expires_ms <= now_ms {
+            fire();
+        } else {
+            set_timeout(Duration::from_millis(expires_ms - now_ms), fire);
         }
     }
 
