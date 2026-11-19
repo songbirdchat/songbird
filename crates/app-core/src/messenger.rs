@@ -142,6 +142,11 @@ pub enum Received {
         /// The group.
         group: [u8; 16],
     },
+    /// This device was removed from a group (or its leaving went through).
+    RemovedFromGroup {
+        /// The group.
+        group: [u8; 16],
+    },
     /// A group's title or membership changed.
     GroupUpdated {
         /// The group.

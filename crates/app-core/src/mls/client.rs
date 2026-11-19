@@ -254,12 +254,59 @@ impl<N: Net> Messenger<N> {
         for a in accounts {
             kps.extend(self.key_packages_of(a).await?);
         }
-        let mut group = MlsGroup::load(self.mls.storage(), &GroupId::from_slice(gid))
+        self.commit(gid, kps, Vec::new()).await
+    }
+
+    /// Removes every device of `accounts` from a group (an admin who outranks them; the server
+    /// checks the roles rule, §6.6).
+    pub async fn remove_members(&mut self, gid: &[u8; 16], accounts: &[[u8; 16]]) -> Result<()> {
+        let mut devices = Vec::new();
+        for a in accounts {
+            devices.extend(self.devices_of(a, false).await?.into_iter().map(|(d, _)| d));
+        }
+        let group = self.load_group(gid)?;
+        let leaves: Vec<LeafNodeIndex> = group
+            .members()
+            .filter(|m| {
+                devices
+                    .iter()
+                    .any(|d| d.as_slice() == m.credential.serialized_content())
+            })
+            .map(|m| m.index)
+            .collect();
+        if leaves.is_empty() {
+            return Ok(());
+        }
+        self.commit(gid, Vec::new(), leaves).await
+    }
+
+    /// Commits proposals others queued (a member leaving): no role is needed (§6.7).
+    pub async fn commit_pending(&mut self, gid: &[u8; 16]) -> Result<()> {
+        let group = self.load_group(gid)?;
+        if group.pending_proposals().next().is_none() {
+            return Ok(());
+        }
+        self.commit(gid, Vec::new(), Vec::new()).await
+    }
+
+    fn load_group(&self, gid: &[u8; 16]) -> Result<MlsGroup> {
+        MlsGroup::load(self.mls.storage(), &GroupId::from_slice(gid))
             .map_err(|_| Error::Storage)?
-            .ok_or(Error::NoSession)?;
+            .ok_or(Error::NoSession)
+    }
+
+    /// One commit with adds and removals (and any queued proposals), sent and merged on 200.
+    async fn commit(
+        &mut self,
+        gid: &[u8; 16],
+        adds: Vec<KeyPackage>,
+        removes: Vec<LeafNodeIndex>,
+    ) -> Result<()> {
+        let mut group = self.load_group(gid)?;
         let (commit, welcome, info) = group
             .commit_builder()
-            .propose_adds(kps)
+            .propose_adds(adds)
+            .propose_removals(removes)
             .load_psks(self.mls.storage())
             .map_err(|_| Error::Malformed)?
             .create_group_info(true)
@@ -295,6 +342,72 @@ impl<N: Net> Messenger<N> {
             self.save_mls()?;
             Err(Error::Server(status))
         }
+    }
+
+    /// Leaves a group: proposes this device's own removal (`SelfRemove`,
+    /// `POST /v1/groups/propose`); the next member to commit removes it (§6.7). The group is
+    /// forgotten here at once.
+    pub async fn leave_group(&mut self, gid: &[u8; 16]) -> Result<()> {
+        let mut group = self.load_group(gid)?;
+        let msg = group
+            .leave_group_via_self_remove(&self.mls, &self.mls_signer)
+            .map_err(|_| Error::Malformed)?;
+        let mut body = vec![1];
+        body.extend_from_slice(gid);
+        body.extend_from_slice(&tls(&msg)?);
+        let (status, _) = self.net.api("POST", "/v1/groups/propose", body).await?;
+        if status != 204 && status != 200 {
+            return Err(Error::Server(status));
+        }
+        let _ = group.delete(self.mls.storage());
+        self.save_mls()
+    }
+
+    /// Sends files to a group: each encrypted and uploaded once for every other device in it.
+    pub async fn send_group_files(
+        &mut self,
+        gid: &[u8; 16],
+        files: Vec<(Vec<u8>, crate::attachments::FileMeta)>,
+        text: &str,
+    ) -> Result<[u8; 16]> {
+        let fetches = self.group_devices(gid)?.len().saturating_sub(1).max(1);
+        let mut pointers = Vec::with_capacity(files.len());
+        let mut preview = String::new();
+        for (bytes, meta) in &files {
+            let (mut p, ct) = crate::attachments::encrypt(bytes, meta)?;
+            let id = crate::attachments::upload(&self.net, &ct, fetches).await?;
+            p.object_id = id.to_vec();
+            p.uploaded_at_ms = now_ms();
+            if preview.is_empty() {
+                preview = crate::messenger::attachment_label(&p);
+            }
+            pointers.push(p);
+        }
+        let message = songbird_content::schema::Message {
+            text: (!text.is_empty()).then(|| Text {
+                body: text.into(),
+                spans: Vec::new(),
+            }),
+            attachments: pointers,
+            ..Default::default()
+        };
+        let data = DataMessage {
+            group_id: gid.to_vec(),
+            kind: Some(data_message::Kind::Message(message)),
+            ..Default::default()
+        };
+        let shown = if text.is_empty() {
+            preview
+        } else {
+            text.to_owned()
+        };
+        let id = self.send_group_data(gid, data, &shown).await?;
+        let me = self.local.account;
+        for (i, (bytes, _)) in files.iter().enumerate() {
+            self.store
+                .put_file(&me, &id, u32::try_from(i).unwrap_or(u32::MAX), bytes)?;
+        }
+        Ok(id)
     }
 
     /// The accounts' devices in a group, as this device sees them.
@@ -449,6 +562,7 @@ impl<N: Net> Messenger<N> {
         Ok(Received::Joined { group: gid })
     }
 
+    #[allow(clippy::too_many_lines, reason = "one match over the MLS message kinds, read top to bottom")]
     async fn process(&mut self, msg: ProtocolMessage, stamp: Option<Stamp>) -> Result<Received> {
         let gid: [u8; 16] = msg
             .group_id()
@@ -477,7 +591,31 @@ impl<N: Net> Messenger<N> {
                     .merge_staged_commit(&self.mls, *staged)
                     .map_err(|_| Error::Storage)?;
                 self.save_mls()?;
+                // A commit that removed this device: the group is over for it.
+                if !group.is_active() {
+                    let _ = group.delete(self.mls.storage());
+                    self.save_mls()?;
+                    return Ok(Received::RemovedFromGroup { group: gid });
+                }
                 Ok(Received::System)
+            }
+            // A member's own `SelfRemove` (leaving): kept, and committed by this device now
+            // (no role is needed). The delivery service's removals need each device's account,
+            // which a device does not learn from the tree: left to other members and the
+            // server for now (D-0147).
+            ProcessedMessageContent::ProposalMessage(p) => {
+                if matches!(p.proposal(), Proposal::SelfRemove) {
+                    group
+                        .store_pending_proposal(self.mls.storage(), *p)
+                        .map_err(|_| Error::Storage)?;
+                    self.save_mls()?;
+                    let _ = self.commit_pending(&gid).await;
+                    return Ok(Received::GroupUpdated {
+                        group: gid,
+                        title: String::new(),
+                    });
+                }
+                Ok(Received::Nothing)
             }
             ProcessedMessageContent::ApplicationMessage(app) => {
                 self.save_mls()?;

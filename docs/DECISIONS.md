@@ -199,6 +199,26 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0147 — Groups: removing, leaving, adding later, media
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision: removing a person removes every leaf of their devices in one commit (the server
+  enforces the roles rule); leaving proposes the device's own `SelfRemove`
+  (`POST /v1/groups/propose`) and forgets the group; a member who receives a `SelfRemove`
+  stores it and commits it at once (no role needed); a commit that removes this device ends the
+  group here; adding people later is the same commit as creating; photos and files in groups are
+  uploaded once with `fetches` = the other devices in the group. The app's Exit group, Remove
+  and Add members act on real groups.
+- Evidence: `gate_a2::group_photos_removals_and_leaving` against the real stack (eight gate
+  tests pass).
+- Consequences, recorded rather than faked: a device does not learn other members' accounts
+  from the MLS tree (credentials are device IDs), so it cannot yet apply the roles rule to
+  received commits or judge the delivery service's removal proposals itself; the server applies
+  both today. A device-to-account map signed into the group (or carried in the roles extension)
+  is the follow-up.
+
 ## D-0146 — The group client: create, join, commit and talk over the delivery service
 
 - Date: 2026-11-19

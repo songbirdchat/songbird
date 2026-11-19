@@ -799,12 +799,18 @@ impl Store {
     }
 
     pub fn remove_member(&self, chat: ChatId, contact: ContactId) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::remove_from_group(chat, contact);
+        }
         self.edit_chat(chat, |c| c.members.retain(|m| m.contact != Some(contact)));
         let name = self.contact_name(Some(contact));
         self.push_message(chat, None, Body::System(format!("You removed {name}")));
     }
 
     pub fn add_members(&self, chat: ChatId, contacts: Vec<ContactId>) {
+        if crate::backend::chat::owns(chat) && crate::backend::chat::all_real(&contacts) {
+            crate::backend::chat::add_to_group(chat, contacts.clone());
+        }
         for &contact in &contacts {
             self.edit_chat(chat, |c| {
                 c.members.push(Member {

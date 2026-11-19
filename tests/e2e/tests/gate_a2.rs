@@ -977,3 +977,72 @@ async fn a_group_is_created_joined_and_talked_in() {
             .any(|c| c.id == gid && c.group)
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn group_photos_removals_and_leaving() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    let gid = alice
+        .core
+        .create_group("Trip", &[bob.account])
+        .await
+        .unwrap();
+    assert_eq!(pump_app(&mut bob).await, Received::Joined { group: gid });
+    assert!(matches!(
+        pump_app(&mut bob).await,
+        Received::GroupUpdated { .. }
+    ));
+
+    // A photo in the group: uploaded once for Bob's device, verified by Bob's app-core.
+    let photo: Vec<u8> = (0..100_000u32)
+        .map(|i| u8::try_from(i % 239).unwrap())
+        .collect();
+    let meta = songbird_app_core::attachments::FileMeta {
+        content_type: "image/jpeg".into(),
+        file_name: "view.jpg".into(),
+        ..Default::default()
+    };
+    let id = alice
+        .core
+        .send_group_files(&gid, vec![(photo.clone(), meta)], "")
+        .await
+        .unwrap();
+    let Received::Message(m) = pump_app(&mut bob).await else {
+        panic!("a photo")
+    };
+    assert_eq!((m.chat, m.text.as_str()), (gid, "Photo"));
+    assert_eq!(
+        &*bob.core.file(&alice.account, &id, 0).await.unwrap(),
+        &photo
+    );
+
+    // Alice (the owner) removes Bob: Bob's device learns it is out.
+    alice
+        .core
+        .remove_members(&gid, &[bob.account])
+        .await
+        .unwrap();
+    assert_eq!(alice.core.group_devices(&gid).unwrap().len(), 1);
+    assert_eq!(
+        pump_app(&mut bob).await,
+        Received::RemovedFromGroup { group: gid }
+    );
+
+    // A second group; this time Bob leaves by himself and Alice's device commits his removal.
+    let gid2 = alice
+        .core
+        .create_group("Book club", &[bob.account])
+        .await
+        .unwrap();
+    assert_eq!(pump_app(&mut bob).await, Received::Joined { group: gid2 });
+    assert!(matches!(
+        pump_app(&mut bob).await,
+        Received::GroupUpdated { .. }
+    ));
+    bob.core.leave_group(&gid2).await.unwrap();
+    assert!(
+        matches!(pump_app(&mut alice).await, Received::GroupUpdated { group, .. } if group == gid2)
+    );
+    assert_eq!(alice.core.group_devices(&gid2).unwrap().len(), 1);
+}

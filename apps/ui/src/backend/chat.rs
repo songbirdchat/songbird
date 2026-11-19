@@ -160,6 +160,54 @@ fn ensure_group(s: Store, gid: [u8; 16], title: &str) -> ChatId {
     id
 }
 
+/// A group operation in app-core, its failure shown in plain words.
+fn group_op<F>(chat: ChatId, failed: &'static str, op: F)
+where
+    F: for<'a> FnOnce(
+            &'a mut Core,
+            [u8; 16],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = songbird_app_core::Result<()>> + 'a>,
+        > + 'static,
+{
+    let Some(gid) = group_of(chat) else { return };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        op(m, gid).await.map_err(|_| super::problem(failed))
+    });
+}
+
+/// Leaves a real group.
+pub fn leave_group(chat: ChatId) {
+    group_op(chat, "Leaving the group failed. Try again.", |m, gid| {
+        Box::pin(async move { m.leave_group(&gid).await })
+    });
+}
+
+/// Adds real contacts to a real group.
+pub fn add_to_group(chat: ChatId, contacts: Vec<ContactId>) {
+    let accounts: Vec<[u8; 16]> = contacts.iter().filter_map(|c| account_of(*c)).collect();
+    group_op(chat, "They couldn't be added. Try again.", move |m, gid| {
+        Box::pin(async move { m.add_members(&gid, &accounts).await })
+    });
+}
+
+/// Removes a real contact from a real group (admins; the server checks the role).
+pub fn remove_from_group(chat: ChatId, contact: ContactId) {
+    let Some(account) = account_of(contact) else {
+        return;
+    };
+    group_op(
+        chat,
+        "They couldn't be removed. Only admins can remove people.",
+        move |m, gid| Box::pin(async move { m.remove_members(&gid, &[account]).await }),
+    );
+}
+
 /// Creates a real group with real contacts: the chat shows at once; app-core creates it on the
 /// server, adds every member's devices and sends the title (D-0146).
 pub fn create_group(s: Store, title: String, members: Vec<ContactId>) -> ChatId {
@@ -597,7 +645,11 @@ pub fn save_media(msg: MsgId, name: String) {
 /// Sends picked files: shown at once as Sending, then encrypted, uploaded
 /// and sent by app-core (D-0141).
 pub fn send_picked(s: Store, chat: ChatId, files: Vec<nsh_core::picker::PickedFile>, photos: bool) {
-    let Some(to) = account_of(chat) else { return };
+    let group = group_of(chat);
+    let to = account_of(chat);
+    if group.is_none() && to.is_none() {
+        return;
+    }
     for f in files {
         let bytes = f.data.bytes().to_vec();
         if bytes.is_empty() {
@@ -636,7 +688,11 @@ pub fn send_picked(s: Store, chat: ChatId, files: Vec<nsh_core::picker::PickedFi
                 .as_mut()
                 .ok_or_else(|| super::problem("Not connected yet."))?;
             let me = m.local().account;
-            let r = m.send_files(&to, vec![(bytes, meta)], "").await;
+            let r = match (group, to) {
+                (Some(gid), _) => m.send_group_files(&gid, vec![(bytes, meta)], "").await,
+                (None, Some(to)) => m.send_files(&to, vec![(bytes, meta)], "").await,
+                (None, None) => Err(songbird_app_core::Error::NoSession),
+            };
             let st = r.as_ref().ok().and_then(|id| {
                 m.store
                     .message(&me, id)

@@ -639,6 +639,9 @@ impl Store {
     /// Leaves a group. An owner who leaves hands the group to
     /// [`successor`].
     pub fn exit_group(&self, chat: ChatId) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::leave_group(chat);
+        }
         let Some(c) = self.chat(chat) else { return };
         let was_owner = my_role(&c) == Some(Role::Owner);
         let heir = if was_owner { successor(&c) } else { None };
