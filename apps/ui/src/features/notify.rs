@@ -134,8 +134,15 @@ pub fn install(focus_of: impl Fn() -> Option<u64> + 'static) {
             let _ = request_notification_permission().await;
         }
     });
-    watch(s, focused, focus_of, |n: Notice| {
-        let notification = Notification::new(n.id, n.title, n.body).silent(n.silent);
+    watch(s, focused, focus_of, move |n: Notice| {
+        let mut notification = Notification::new(n.id, n.title, n.body).silent(n.silent);
+        // The user's message tone (Settings → Notifications), Songbird's own.
+        let tone = s.ext().with_untracked(|x| x.message_tone);
+        if let Some(path) = crate::sounds::asset(&tone) {
+            notification = notification.sound(path);
+        } else if tone == "None" {
+            notification = notification.silent(true);
+        }
         spawn(async move {
             let _ = show_notification(notification).await;
         });

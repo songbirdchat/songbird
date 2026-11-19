@@ -14,6 +14,7 @@ pub mod camera;
 pub mod features;
 pub mod nav;
 pub mod shell;
+pub mod sounds;
 pub mod store;
 pub mod theming;
 pub mod ui;

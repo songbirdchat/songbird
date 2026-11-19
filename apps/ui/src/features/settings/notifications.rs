@@ -225,8 +225,10 @@ fn tone_page(
                                         x.message_tone = t
                                     }
                                 });
-                                // mock: the sound plays through the platform's audio session.
-                                if t != "None" {
+                                if t == "None" {
+                                    crate::sounds::stop();
+                                } else {
+                                    crate::sounds::play(t);
                                     announce_for_accessibility(format!("Playing {t}"));
                                 }
                             },
