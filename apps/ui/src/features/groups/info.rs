@@ -1091,7 +1091,7 @@ fn media_tile(_s: Store, chat: ChatId, m: crate::store::Message) -> AnyElement {
         ),
         _ => (String::new(), false, 1, 1),
     };
-    let src = crate::ui::portrait::photo(&alt, id, w, h);
+    let src = crate::ui::portrait::message_photo(&alt, id, w, h);
     let side = if wide() { 112.0 } else { 116.0 };
     press_surface(Press::Tile, move || media::open_viewer(chat, id))
         .accessibility_label(if video {

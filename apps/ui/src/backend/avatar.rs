@@ -43,7 +43,7 @@ fn set_photo(seed: u64, bytes: &[u8]) {
 }
 
 /// `data:` URI of image bytes (the type sniffed).
-fn data_uri(bytes: &[u8]) -> String {
+pub(crate) fn data_uri(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mime = nsh_core::picker::sniff(bytes).unwrap_or("image/jpeg");
     let mut s = String::with_capacity(bytes.len() * 4 / 3 + 32);

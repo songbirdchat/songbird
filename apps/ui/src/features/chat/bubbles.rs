@@ -1043,11 +1043,34 @@ fn photo_frame(shot: Memo<(String, u64, u32, u32)>, label: impl Fn() -> String +
         .role(AccessibilityRole::Image)
         .label(label)
         .child(
-            image(move || shot.with(|s| portrait::photo(&s.0, s.1, s.2.max(1), s.3.max(1))))
-                .absolute()
-                .inset_0()
-                .object_fit(ResizeMode::Cover),
+            image(move || {
+                shot.with(|s| {
+                    // A real photo: its bytes once this device has them
+                    // (tap to download); the illustrations only in the demo.
+                    if crate::backend::chat::is_media(s.1) {
+                        crate::backend::chat::media_src(s.1).unwrap_or_else(|| ImageSrc::from(""))
+                    } else {
+                        portrait::photo(&s.0, s.1, s.2.max(1), s.3.max(1))
+                    }
+                })
+            })
+            .absolute()
+            .inset_0()
+            .object_fit(ResizeMode::Cover),
         )
+        .child(when(
+            move || {
+                shot.with(|s| {
+                    crate::backend::chat::is_media(s.1)
+                        && crate::backend::chat::media_src(s.1).is_none()
+                })
+            },
+            move || {
+                icon_btn(Icon::Download, "Download photo", move || {
+                    crate::backend::chat::load_photo(shot.with_untracked(|s| s.1));
+                })
+            },
+        ))
 }
 
 /// A small label over a photo ("HD", a video's length): a dark scrim pill
@@ -1319,6 +1342,7 @@ fn voice_body(cv: Conv, item: ItemMemo) -> AnyElement {
 
 fn file_body(cv: Conv, item: ItemMemo) -> AnyElement {
     let ink = ink_of(cv, item);
+    let id = sel(item, |i| i.m.id);
     let info = sel(item, |i| match &i.m.body {
         Body::File { name, size, kind } => (name.clone(), size.clone(), kind.clone()),
         _ => Default::default(),
@@ -1361,8 +1385,15 @@ fn file_body(cv: Conv, item: ItemMemo) -> AnyElement {
                 ),
         )
         .child(icon_btn(Icon::Download, "Download", move || {
-            // mock: app-core downloads and decrypts the file.
-            toast(format!("Saved {}", info.with_untracked(|i| i.0.clone())));
+            // Downloaded, verified and decrypted by app-core, then saved
+            // where the user chooses.
+            let name = info.with_untracked(|i| i.0.clone());
+            let msg = id.get_untracked();
+            if crate::backend::chat::is_media(msg) {
+                crate::backend::chat::save_media(msg, name);
+            } else {
+                toast("This file is only in the demo.");
+            }
         }))
         .into_element()
 }

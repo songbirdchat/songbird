@@ -572,7 +572,33 @@ impl<N: Net> Messenger<N> {
         } else {
             text.to_owned()
         };
-        self.send_data(to, data, &shown).await
+        let id = self.send_data(to, data, &shown).await?;
+        // The sender keeps its own files (encrypted at rest, in the store).
+        for (i, (bytes, _)) in files.iter().enumerate() {
+            self.store
+                .put_file(&me, &id, u32::try_from(i).unwrap_or(u32::MAX), bytes)?;
+        }
+        Ok(id)
+    }
+
+    /// The `idx`-th file of a stored message: from the store, or downloaded, verified and kept.
+    pub async fn file(
+        &mut self,
+        author: &[u8; 16],
+        id: &[u8; 16],
+        idx: u32,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        if let Some(b) = self.store.file(author, id, idx)? {
+            return Ok(b);
+        }
+        let row = self.store.message(author, id)?.ok_or(Error::Malformed)?;
+        let pointer = attachments_of(&row.content)
+            .into_iter()
+            .nth(usize::try_from(idx).map_err(|_| Error::Malformed)?)
+            .ok_or(Error::Malformed)?;
+        let bytes = crate::attachments::download(&self.net, &pointer).await?;
+        self.store.put_file(author, id, idx, &bytes)?;
+        Ok(bytes)
     }
 
     /// Sends a location the user picked on the map (PROTOCOL §5.4 `LocationPin`).
@@ -982,6 +1008,21 @@ impl<N: Net> Messenger<N> {
             _ => {}
         }
         Ok(Received::System)
+    }
+}
+
+/// The attachment pointers of a stored message's content.
+#[must_use]
+pub fn attachments_of(content: &[u8]) -> Vec<schema::AttachmentPointer> {
+    let Ok(c) = Content::decode(content) else {
+        return Vec::new();
+    };
+    match c.body {
+        Some(Body::Data(DataMessage {
+            kind: Some(data_message::Kind::Message(m)),
+            ..
+        })) => m.attachments,
+        _ => Vec::new(),
     }
 }
 

@@ -154,11 +154,25 @@ fn attach_sheet(cv: Conv) -> AnyElement {
             .is_some_and(|c| matches!(c.kind, ChatKind::WhatsApp(_)));
     let tiles = move || {
         let tiles = vec![
-            // mock: the system photo picker; app-core encrypts and uploads.
+            // The system photo picker; app-core encrypts and uploads (D-0141).
             tile(
                 Icon::Image,
                 "Photos",
                 then(|cv| {
+                    if crate::backend::chat::owns(cv.chat) {
+                        let (s, chat) = (cv.s, cv.chat);
+                        let hd = s.settings.with_untracked(|x| x.hd_uploads);
+                        spawn(async move {
+                            let mut r = nsh_core::picker::PickRequest::new(true, 10);
+                            // Standard quality scales photos down; HD keeps them.
+                            if !hd {
+                                r.max_dimension = Some(DevicePixels(1600));
+                            }
+                            let files = pick_images(r).await;
+                            crate::backend::chat::send_picked(s, chat, files, true);
+                        });
+                        return;
+                    }
                     cv.send_body(Body::Image {
                         caption: String::new(),
                         alt: "A photo from your library: a street in the old town at dusk".into(),
@@ -169,11 +183,21 @@ fn attach_sheet(cv: Conv) -> AnyElement {
                 }),
             ),
             tile(Icon::Camera, "Camera", then(|cv| cv.camera_open.set(true))),
-            // mock: the document picker.
+            // The system's document picker; app-core encrypts and uploads.
             tile(
                 Icon::File,
                 "Document",
                 then(|cv| {
+                    if crate::backend::chat::owns(cv.chat) {
+                        let (s, chat) = (cv.s, cv.chat);
+                        spawn(async move {
+                            let r = nsh_core::picker::FilePickRequest::new(true, 10)
+                                .max_size(songbird_app_core::attachments::MAX_FILE as u64);
+                            let files = pick_files(r).await;
+                            crate::backend::chat::send_picked(s, chat, files, false);
+                        });
+                        return;
+                    }
                     cv.send_body(Body::File {
                         name: "Meeting notes.pdf".into(),
                         size: "312 KB".into(),

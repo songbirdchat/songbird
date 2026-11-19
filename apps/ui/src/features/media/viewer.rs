@@ -318,7 +318,7 @@ fn picture(
     // The same mock photo as the bubble and the media grid: the message's
     // id is the seed, its own frame the shape.
     let (pw, ph) = (w.max(1), h.max(1));
-    let src = crate::ui::portrait::photo(&alt, m.id, pw, ph);
+    let src = crate::ui::portrait::message_photo(&alt, m.id, pw, ph);
     let fade = animated_value(if motion::reduced() { 1.0 } else { 0.0 });
     fade.timing(1.0, motion::BASE, Easing::EaseOut);
     let size = move || {

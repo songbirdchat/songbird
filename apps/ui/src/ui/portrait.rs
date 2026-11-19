@@ -350,3 +350,14 @@ mod photo_tests {
         assert_eq!(photo_markup("x", 5, 16, 9), photo_markup("x", 5, 16, 9));
     }
 }
+
+/// A message's photo: the real one for a real attachment (empty until this
+/// device has it), the illustration only in the demo fixtures.
+pub fn message_photo(alt: &str, id: u64, w: u32, h: u32) -> ImageSrc {
+    if crate::backend::chat::is_media(id) {
+        crate::backend::chat::load_photo(id);
+        crate::backend::chat::media_src(id).unwrap_or_else(|| ImageSrc::from(""))
+    } else {
+        photo(alt, id, w, h)
+    }
+}

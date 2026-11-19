@@ -26,6 +26,7 @@ Status: ☐ open · ☑ done (with the commit).
 - ☑ Account report saved; account deletion erases this device; linked devices real (D-0140)
 - ☑ Wallpaper, status expiry, recovery sheet, keep-archived, chat export, Songbird's own tones
 - ☑ Attachments in app-core: encrypted upload, verified download, end to end (D-0141)
+- ☑ Photos and documents in real chats: system pickers, sent through app-core, shown and saved; received files kept encrypted in the store; auto-download for photos honoured; HD uploads keep full size (D-0141)
 - ☑ Location: self-hosted OpenStreetMap tiles, the map picker, real places sent and shown (D-0142)
 - ☑ 1:1 text chats through app-core: send, receive, ticks, read receipts, new chat by username (675bfff)
 
@@ -58,7 +59,7 @@ Status: ☐ open · ☑ done (with the commit).
 **M5 groups and communities (b, c):** create, members, roles, invite links, join requests, change log,
 permissions enforced.
 
-**M6 attachments (a, b, c):** photos, documents, voice notes (microphone, e), the user's own GPS position (e; picking on the map is done), view-once,
+**M6 attachments, the rest (a, b, c):** voice notes (microphone, e), video playback, view-once, the user's own GPS position (e; picking on the map is done), view-once,
 download, save, HD, auto-download.
 
 **Calls (b, c, e):** LiveKit client media, devices, screen share, call links, verification symbols.

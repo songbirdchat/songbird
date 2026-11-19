@@ -52,6 +52,8 @@ thread_local! {
     /// Real accounts by UI contact ID, and app-core message IDs by UI ID.
     static ACCOUNTS: RefCell<HashMap<ContactId, [u8; 16]>> = RefCell::new(HashMap::new());
     static OUTGOING: RefCell<HashMap<MsgId, [u8; 16]>> = RefCell::new(HashMap::new());
+    /// Real media messages: UI message → (author, app-core message ID).
+    static MEDIA: RefCell<HashMap<MsgId, ([u8; 16], [u8; 16])>> = RefCell::new(HashMap::new());
     /// Accounts whose profile was fetched this run.
     static PROFILED: RefCell<std::collections::HashSet<[u8; 16]>> = RefCell::new(std::collections::HashSet::new());
 }
@@ -360,6 +362,10 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
     }
     let from = (!mine).then_some(chat);
     let body = body_of(row);
+    let media = matches!(body, Body::Image { .. } | Body::File { .. });
+    if media {
+        MEDIA.with_borrow_mut(|m| m.insert(id, (row.author, row.id)));
+    }
     s.messages.update(|m| {
         m.entry(chat).or_default().push(crate::store::Message {
             id,
@@ -377,6 +383,21 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
             receipts: Vec::new(),
         });
     });
+    // Auto-download (Settings → Storage and data): what the user allowed,
+    // by kind. Phones can't tell Wi-Fi from mobile data here, so they follow
+    // the mobile choice; desktops the Wi-Fi one.
+    if media && !mine {
+        let photo = s
+            .message(chat, id)
+            .is_some_and(|m| matches!(m.body, Body::Image { .. }));
+        let (wifi, mobile) = s
+            .settings
+            .with_untracked(|x| if photo { x.auto_photos } else { x.auto_docs });
+        let allowed = if is_desktop() { wifi } else { mobile };
+        if allowed && photo {
+            load_photo(id);
+        }
+    }
     if !mine && count_unread {
         s.edit_chat(chat, |c| c.unread += 1);
         s.on_incoming(chat);
@@ -389,8 +410,183 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
     }
 }
 
+/// Shown media by UI message (photos as images).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Shown(pub HashMap<MsgId, nsh_core::element::ImageSrc>);
+
+fn shown() -> Signal<Shown> {
+    global::<Shown>()
+}
+
+/// Whether `msg` is a real attachment app-core holds.
+pub fn is_media(msg: MsgId) -> bool {
+    MEDIA.with_borrow(|m| m.contains_key(&msg))
+}
+
+/// The photo of a real media message, once this device has it (tracked).
+pub fn media_src(msg: MsgId) -> Option<nsh_core::element::ImageSrc> {
+    shown().with(|m| m.0.get(&msg).cloned())
+}
+
+fn show_bytes(msg: MsgId, bytes: &[u8]) {
+    let src = nsh_core::element::ImageSrc::from(super::avatar::data_uri(bytes));
+    shown().update(|m| {
+        m.0.insert(msg, src);
+    });
+}
+
+/// Fetches a real media message's file (from the encrypted store, else the
+/// server: downloaded, verified, kept), then `then` with its bytes.
+fn with_file(msg: MsgId, then: impl FnOnce(Vec<u8>) + 'static) {
+    let Some((author, id)) = MEDIA.with_borrow(|m| m.get(&msg).copied()) else {
+        return;
+    };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        let bytes = m
+            .file(&author, &id, 0)
+            .await
+            .map_err(|_| super::problem("The file couldn't be downloaded. Try again."))?;
+        drop(guard);
+        then(bytes.to_vec());
+        Ok(())
+    });
+}
+
+/// Shows a photo (downloading it if needed).
+pub fn load_photo(msg: MsgId) {
+    if media_src(msg).is_none() {
+        with_file(msg, move |b| show_bytes(msg, &b));
+    }
+}
+
+/// Saves a real media message's file where the user chooses.
+pub fn save_media(msg: MsgId, name: String) {
+    with_file(msg, move |b| crate::ui::save_file(name, b));
+}
+
+/// Sends picked files: shown at once as Sending, then encrypted, uploaded
+/// and sent by app-core (D-0141).
+pub fn send_picked(s: Store, chat: ChatId, files: Vec<nsh_core::picker::PickedFile>, photos: bool) {
+    let Some(to) = account_of(chat) else { return };
+    for f in files {
+        let bytes = f.data.bytes().to_vec();
+        if bytes.is_empty() {
+            continue;
+        }
+        let body = if photos {
+            Body::Image {
+                caption: String::new(),
+                alt: f.name.clone(),
+                w: u32::try_from(f.size.width.0).unwrap_or(1).max(1),
+                h: u32::try_from(f.size.height.0).unwrap_or(1).max(1),
+                hd: s.settings.with_untracked(|x| x.hd_uploads),
+            }
+        } else {
+            Body::File {
+                name: f.name.clone(),
+                size: human_size(bytes.len()),
+                kind: kind_of(&f.mime),
+            }
+        };
+        let ui = s.push_message(chat, None, body);
+        if photos {
+            show_bytes(ui, &bytes);
+        }
+        let meta = songbird_app_core::attachments::FileMeta {
+            content_type: f.mime.clone(),
+            file_name: f.name.clone(),
+            width: u32::try_from(f.size.width.0).unwrap_or(0),
+            height: u32::try_from(f.size.height.0).unwrap_or(0),
+            ..Default::default()
+        };
+        super::run(async move {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let m = guard
+                .as_mut()
+                .ok_or_else(|| super::problem("Not connected yet."))?;
+            let me = m.local().account;
+            let r = m.send_files(&to, vec![(bytes, meta)], "").await;
+            let st = r.as_ref().ok().and_then(|id| {
+                m.store
+                    .message(&me, id)
+                    .ok()
+                    .flatten()
+                    .map(|row| (*id, row.status))
+            });
+            drop(guard);
+            match st {
+                Some((id, status)) => {
+                    OUTGOING.with_borrow_mut(|o| o.insert(ui, id));
+                    MEDIA.with_borrow_mut(|x| x.insert(ui, (me, id)));
+                    set_status(s, &id, status);
+                    Ok(())
+                }
+                None => {
+                    s.fail(chat, ui);
+                    Err(super::problem("The file couldn't be sent."))
+                }
+            }
+        });
+    }
+}
+
+fn human_size(n: usize) -> String {
+    let n = n as f64;
+    if n >= 1_048_576.0 {
+        format!("{:.1} MB", n / 1_048_576.0)
+    } else {
+        format!("{:.0} KB", (n / 1024.0).max(1.0))
+    }
+}
+
+fn kind_of(mime: &str) -> String {
+    match mime {
+        "application/pdf" => "PDF".into(),
+        m if m.starts_with("text/") => "Text".into(),
+        m if m.starts_with("image/") => "Image".into(),
+        m if m.starts_with("audio/") => "Audio".into(),
+        m if m.starts_with("video/") => "Video".into(),
+        m => m.rsplit('/').next().unwrap_or("File").to_uppercase(),
+    }
+}
+
 /// What a stored message shows as: its text, or a real place on the map.
 fn body_of(row: &MessageRow) -> Body {
+    if let Some(p) = songbird_app_core::messenger::attachments_of(&row.content)
+        .into_iter()
+        .next()
+    {
+        let caption = if row.text == songbird_app_core::messenger::attachment_label(&p) {
+            String::new()
+        } else {
+            row.text.clone()
+        };
+        return if p.content_type.starts_with("image/") {
+            Body::Image {
+                caption,
+                alt: p.file_name,
+                w: p.width.max(1),
+                h: p.height.max(1),
+                hd: false,
+            }
+        } else {
+            Body::File {
+                name: if p.file_name.is_empty() {
+                    "File".into()
+                } else {
+                    p.file_name
+                },
+                size: human_size(usize::try_from(p.size).unwrap_or(0)),
+                kind: kind_of(&p.content_type),
+            }
+        };
+    }
     if let Some((lat, lon, name)) = songbird_app_core::messenger::location_of(&row.content) {
         let label = if name.is_empty() {
             format!("{lat:.5}, {lon:.5}")

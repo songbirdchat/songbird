@@ -607,15 +607,24 @@ async fn a_photo_goes_encrypted_and_arrives_verified() {
     };
     let pointer = &msg.attachments[0];
     assert_eq!(pointer.size, 300_000);
-    let got = songbird_app_core::attachments::download(bob.core.net(), pointer)
-        .await
-        .unwrap();
-    assert_eq!(&*got, &photo);
-    // A changed digest is refused before any byte is trusted.
+    // A changed digest is refused before any byte is trusted (and nothing is confirmed).
     let mut forged = pointer.clone();
     forged.digest[0] ^= 1;
     assert!(
         songbird_app_core::attachments::download(bob.core.net(), &forged)
+            .await
+            .is_err()
+    );
+    // The app's path: `file` downloads, verifies, confirms and keeps it (encrypted in the store);
+    // the next read comes from the store, and the sender has its own copy already.
+    let author = alice.account;
+    assert_eq!(&*bob.core.file(&author, &id, 0).await.unwrap(), &photo);
+    assert!(bob.core.store.file(&author, &id, 0).unwrap().is_some());
+    assert_eq!(&*bob.core.file(&author, &id, 0).await.unwrap(), &photo);
+    assert_eq!(&*alice.core.file(&author, &id, 0).await.unwrap(), &photo);
+    // Its one recipient device confirmed it: the server deleted the object.
+    assert!(
+        songbird_app_core::attachments::download(bob.core.net(), pointer)
             .await
             .is_err()
     );

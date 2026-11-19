@@ -244,8 +244,14 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 - Evidence: `gate_a2::a_photo_goes_encrypted_and_arrives_verified` against RustFS and the real
   `api`: a 300,000-byte photo crosses five chunks, Bob's app-core downloads and verifies it
   byte for byte, and a pointer with a changed digest is refused.
-- Consequences: the app's attachment pickers and bubbles still need wiring (next); streaming
-  from disk for files above 256 MiB, thumbnails and blurhash come after.
+- Then (same day): the app's Photos and Document buttons use the system pickers in real chats;
+  photos show from their bytes, files save through the save dialog; received files are kept in
+  the SQLCipher store (schema 2, `files`), never as plaintext files on disk. Auto-download
+  follows Settings (phones follow the mobile choice: NSH cannot tell Wi-Fi from mobile data);
+  "HD uploads" off scales photos to 1,600 px. The gate test reads files through
+  `Messenger::file`, and shows the object deleted once its one recipient device confirmed it.
+- Consequences: streaming from disk for files above 256 MiB, thumbnails and blurhash, voice
+  notes (the microphone needs a native module) and video playback come after.
 
 ## D-0140 — Nothing mocked: profiles, photos and username links made real
 

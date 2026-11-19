@@ -25,7 +25,7 @@ use crate::session::{Local, Prekeys, Session, Sessions};
 use crate::{Error, Result};
 
 /// The schema version this code writes.
-pub const SCHEMA: i64 = 1;
+pub const SCHEMA: i64 = 2;
 
 /// Outgoing message status, as the UI shows it (`crates/content`'s levels, plus the local ones).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -213,7 +213,44 @@ impl Store {
             ))?;
             db(tx.commit())?;
         }
+        if v < 2 {
+            // Attachments' plaintext, inside the encrypted file like everything else (D-0141).
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "CREATE TABLE files (author BLOB NOT NULL, id BLOB NOT NULL, idx INTEGER NOT NULL,
+                     bytes BLOB NOT NULL, PRIMARY KEY (author, id, idx));
+                 PRAGMA user_version = 2;",
+            ))?;
+            db(tx.commit())?;
+        }
         Ok(())
+    }
+
+    /// Keeps an attachment's plaintext (a message's `idx`-th file).
+    pub fn put_file(&self, author: &[u8; 16], id: &[u8; 16], idx: u32, bytes: &[u8]) -> Result<()> {
+        db(self.db.execute(
+            "INSERT OR REPLACE INTO files (author, id, idx, bytes) VALUES (?1, ?2, ?3, ?4)",
+            params![&author[..], &id[..], i64::from(idx), bytes],
+        ))
+        .map(|_| ())
+    }
+
+    /// An attachment's plaintext, if this device has it.
+    pub fn file(
+        &self,
+        author: &[u8; 16],
+        id: &[u8; 16],
+        idx: u32,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        db(self
+            .db
+            .query_row(
+                "SELECT bytes FROM files WHERE author = ?1 AND id = ?2 AND idx = ?3",
+                params![&author[..], &id[..], i64::from(idx)],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional())
+        .map(|v| v.map(Zeroizing::new))
     }
 
     fn put_meta(&self, key: &str, value: &[u8]) -> Result<()> {

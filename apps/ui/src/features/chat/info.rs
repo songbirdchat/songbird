@@ -61,12 +61,12 @@ fn media_tile(m: &Message, side: f32) -> AnyElement {
     let id = m.id;
     let (shot, label, video) = match &m.body {
         Body::Image { alt, w, h, .. } => (
-            portrait::photo(alt, id, *w, *h),
+            portrait::message_photo(alt, id, *w, *h),
             format!("Photo: {alt}"),
             false,
         ),
         Body::Video { caption, secs } => (
-            portrait::photo(&format!("video {caption}"), id, 16, 9),
+            portrait::message_photo(&format!("video {caption}"), id, 16, 9),
             format!("Video, {}", super::logic::duration(*secs)),
             true,
         ),
