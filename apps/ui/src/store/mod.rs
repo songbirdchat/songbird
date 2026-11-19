@@ -370,6 +370,9 @@ impl Store {
         self.push_message(id, None, Body::System(label));
     }
     pub fn set_draft(&self, id: ChatId, draft: String) {
+        if crate::backend::chat::owns(id) && self.settings.with_untracked(|x| x.typing_indicators) {
+            crate::backend::chat::typing(id, !draft.trim().is_empty());
+        }
         if self.chat(id).is_some_and(|c| c.draft != draft) {
             self.edit_chat(id, |c| c.draft = draft);
         }
@@ -389,16 +392,21 @@ impl Store {
         self.edit_chat(id, |c| c.request = false);
     }
     pub fn block(&self, contact: ContactId, blocked: bool) {
+        if crate::backend::chat::owns(contact) {
+            crate::backend::chat::block(*self, contact, blocked);
+        }
         self.contacts.update(|cs| {
             if let Some(c) = cs.iter_mut().find(|c| c.id == contact) {
                 c.blocked = blocked;
             }
         });
     }
-    /// Reports to Songbird: the last five messages of the chat are sent,
-    /// as the report flow says (mock: nothing leaves the device).
+    /// Reports to Songbird: the chat's newest five messages from the other
+    /// person, each with its franking proof (PROTOCOL §5.14).
     pub fn report(&self, chat: ChatId) {
-        let _ = chat;
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::report(chat);
+        }
     }
     pub fn verify(&self, contact: ContactId, verified: bool) {
         self.contacts.update(|cs| {

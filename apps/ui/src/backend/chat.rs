@@ -140,7 +140,7 @@ impl Net for AppNet {
         path: &str,
         body: Vec<u8>,
     ) -> songbird_app_core::Result<(u16, Vec<u8>)> {
-        let has_body = method != "GET" && method != "DELETE";
+        let has_body = !body.is_empty();
         let json = body.first() == Some(&b'{');
         super::signed(method, path, has_body.then_some(body), json)
             .await
@@ -172,6 +172,18 @@ impl Net for AppNet {
         super::unsigned("POST", path)
             .await
             .map(|(s, _)| s)
+            .map_err(|_| songbird_app_core::Error::Network)
+    }
+
+    async fn ephemeral(
+        &self,
+        device: DeviceIdBytes,
+        payload: Vec<u8>,
+    ) -> songbird_app_core::Result<()> {
+        let client = super::ws::client().ok_or(songbird_app_core::Error::Network)?;
+        client
+            .ephemeral(DeviceId::from_bytes(device), payload.into())
+            .await
             .map_err(|_| songbird_app_core::Error::Network)
     }
 
@@ -828,6 +840,103 @@ pub fn mark_read(chat: ChatId) {
                 let me = m.local().account;
                 let _ = m.store.mark_read(&account, &me);
             }
+        }
+        Ok(())
+    });
+}
+
+/// Blocks (or unblocks) a real contact. Blocking tells the server, rotates
+/// the profile key (republished, and shared with every other contact by
+/// app-core) so the blocked account's old access key stops working, and
+/// drops anything it still sends (PROTOCOL §5.11).
+pub fn block(s: Store, contact: ContactId, blocked: bool) {
+    let Some(account) = account_of(contact) else {
+        return;
+    };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        if blocked {
+            let key = super::profile::rotate();
+            m.block(&account, &key)
+                .await
+                .map_err(|_| super::problem("The block couldn't be saved. Try again."))?;
+            drop(guard);
+            super::profile::publish(s);
+        } else {
+            m.unblock(&account).await.map_err(|e| {
+                super::problem(match e {
+                    songbird_app_core::Error::Server(403) => "Only your main phone can unblock.",
+                    _ => "The unblock couldn't be saved. Try again.",
+                })
+            })?;
+        }
+        Ok(())
+    });
+}
+
+/// Reports a real chat: its newest five messages, each with the proof the
+/// server checks (PROTOCOL §5.14). Nothing else about the chat leaves.
+pub fn report(chat: ChatId) {
+    let Some(account) = account_of(chat) else {
+        return;
+    };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        let n = m
+            .report(&account, 5, 5)
+            .await
+            .map_err(|_| super::problem("The report couldn't be sent. Try again."))?;
+        drop(guard);
+        crate::ui::toast(if n == 0 {
+            "There's nothing from them to report yet.".to_string()
+        } else {
+            format!(
+                "Reported {n} message{}. Thank you.",
+                if n == 1 { "" } else { "s" }
+            )
+        });
+        Ok(())
+    });
+}
+
+thread_local! {
+    /// The last typing state sent per chat and when (ms).
+    static TYPING: RefCell<HashMap<ChatId, (bool, f64)>> = RefCell::new(HashMap::new());
+}
+
+/// Tells a real chat the user is (or stopped) typing: "started" at most
+/// every 10 s, "stopped" once. Only with Typing indicators on.
+pub fn typing(chat: ChatId, started: bool) {
+    let Some(account) = account_of(chat) else {
+        return;
+    };
+    let now = nsh_core::time::unix_ms();
+    let due = TYPING.with_borrow_mut(|t| {
+        let due = match t.get(&chat) {
+            Some((was, at)) => *was != started || (started && now - at > 10_000.0),
+            None => started,
+        };
+        if due {
+            t.insert(chat, (started, now));
+        }
+        due
+    });
+    if !due {
+        return;
+    }
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        if let Some(m) = guard.as_mut() {
+            let _ = m.typing(&account, started).await;
         }
         Ok(())
     });

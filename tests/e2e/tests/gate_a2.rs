@@ -66,7 +66,7 @@ impl Net for TestNet {
         path: &str,
         body: Vec<u8>,
     ) -> songbird_app_core::Result<(u16, Vec<u8>)> {
-        let has_body = method != "GET" && method != "DELETE";
+        let has_body = !body.is_empty();
         let (authz, hash) = self
             .api
             .sign(method, path, has_body.then_some(body.as_slice()));
@@ -117,6 +117,17 @@ impl Net for TestNet {
         songbird_api::client::unsigned_body(self.addr, API, "POST", path, &[], Bytes::new())
             .await
             .map(|(s, _)| s)
+            .map_err(|_| songbird_app_core::Error::Network)
+    }
+
+    async fn ephemeral(
+        &self,
+        device: DeviceIdBytes,
+        payload: Vec<u8>,
+    ) -> songbird_app_core::Result<()> {
+        self.ws
+            .ephemeral(DeviceId::from_bytes(device), Bytes::from(payload))
+            .await
             .map_err(|_| songbird_app_core::Error::Network)
     }
 
@@ -271,12 +282,15 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
     // The production send policy: franking stamps and the contact gate (requests, access keys).
     let secret = random32();
     let limits = songbird_send::RequestLimits::default();
+    // One gate key for the send gate, blocks and reports, as a deployment has.
+    let keys = songbird_send::GateKeys::from_cluster_secret(&random32()).unwrap();
+    let moderation = songbird_keys::provisioning::ProvisioningKey::generate().unwrap();
     let gate: Arc<dyn songbird_send::Gate> = Arc::new(songbird_send::RegistryGate::new(
         Arc::clone(&registry),
         songbird_valkey::ValkeyConn::connect(redis::Client::open(hot.as_str()).unwrap())
             .await
             .unwrap(),
-        songbird_send::GateKeys::from_cluster_secret(&random32()).unwrap(),
+        keys.clone(),
         limits,
     ));
     let policy = || songbird_send::Policy {
@@ -344,8 +358,26 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
     };
     let app = Arc::new(App {
         plans: songbird_api::plans::Plans::default(),
-        requests: None,
-        reports: None,
+        requests: Some(songbird_api::requests::Requests::new(
+            keys.clone(),
+            songbird_api::requests::RequestsMetrics::default(),
+        )),
+        reports: Some(songbird_api::reports::Reports::new(
+            songbird_send::Frankers {
+                current: songbird_send::Franker::from_secret(&secret).unwrap(),
+                previous: Vec::new(),
+            },
+            keys.clone(),
+            moderation.public(),
+            songbird_api::config::ReportSettings {
+                moderation_key: hex::encode(moderation.public()),
+                retention_days: 30,
+                window_days: 30,
+                per_hour: 100,
+                burst: 20,
+            },
+            songbird_api::reports::ReportMetrics::default(),
+        )),
         support: None,
         calls: None,
         server_name: API.into(),
@@ -775,4 +807,81 @@ async fn reactions_edits_and_deletes_reach_the_other_side() {
         bob.core.store.reactions(&alice.account, &id).unwrap().len(),
         0
     );
+}
+
+/// The next ephemeral event for `p`, through its app-core.
+async fn next_ephemeral(p: &mut Person) -> Received {
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), p.events.recv())
+            .await
+            .expect("an event within 10 s")
+            .expect("events open");
+        if let Event::Ephemeral { payload } = ev {
+            return p.core.receive(&payload).await.unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn typing_reports_and_blocks_work_for_real() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    // A conversation first (sessions both ways, profile keys exchanged).
+    alice.core.send_text(&bob.account, "hello").await.unwrap();
+    assert!(matches!(pump(&mut bob).await, Received::Message(_)));
+    assert!(matches!(pump(&mut alice).await, Received::Status { .. }));
+    bob.core.send_text(&alice.account, "hi").await.unwrap();
+    assert!(matches!(pump(&mut alice).await, Received::Message(_)));
+    assert!(matches!(pump(&mut bob).await, Received::Status { .. }));
+
+    // Typing goes on the ephemeral lane, end-to-end encrypted.
+    alice.core.typing(&bob.account, true).await.unwrap();
+    assert_eq!(
+        next_ephemeral(&mut bob).await,
+        Received::Typing {
+            account: alice.account,
+            started: true
+        }
+    );
+
+    // Bob reports Alice's message: the server verifies the franking proof and accepts it once.
+    assert_eq!(bob.core.report(&alice.account, 2, 5).await.unwrap(), 1);
+    assert_eq!(
+        bob.core.report(&alice.account, 2, 5).await.unwrap(),
+        1,
+        "a repeat is 409, counted"
+    );
+
+    // Bob blocks Alice: the server records it; Alice's later messages never reach Bob's chat.
+    let new_key = [0x42u8; 32];
+    bob.core.block(&alice.account, &new_key).await.unwrap();
+    assert!(bob.core.store.is_blocked(&alice.account).unwrap());
+    let _ = alice.core.send_text(&bob.account, "are you there?").await;
+    let before = bob
+        .core
+        .store
+        .messages(&alice.account, None, 50)
+        .unwrap()
+        .len();
+    // Whatever reaches Bob's device from Alice is dropped there.
+    if let Ok(Some(Event::Deliver { seq, envelope })) =
+        tokio::time::timeout(Duration::from_secs(2), bob.events.recv()).await
+    {
+        assert_eq!(
+            bob.core.receive(&envelope).await.unwrap(),
+            Received::Nothing
+        );
+        bob.core.net().ws.ack(seq).await.unwrap();
+    }
+    assert_eq!(
+        bob.core
+            .store
+            .messages(&alice.account, None, 50)
+            .unwrap()
+            .len(),
+        before
+    );
+    bob.core.unblock(&alice.account).await.unwrap();
+    assert!(!bob.core.store.is_blocked(&alice.account).unwrap());
 }

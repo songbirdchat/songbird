@@ -199,6 +199,28 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0144 — Block, report and typing through app-core
+
+- Date: 2026-11-19
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision:
+  1. **Block** (§5.11): `PUT /v1/blocks`; the device keeps its own block list (store schema 4)
+     and drops anything a blocked account still sends; the profile key is rotated, the profile
+     republished, and the new key shared with every remaining contact as a silent
+     `ProfileChanged`, so the blocked account's old access key fails. Unblock:
+     `DELETE /v1/blocks` (the primary only). A block of an account never met leaves no fake
+     identity: an empty key is "not pinned yet".
+  2. **Report** (§5.14): every franked message from another account is kept with its stamp,
+     franking key and content exactly as received (`franks`); "Report" sends the newest five
+     from that person, each verified by the server; a repeat counts as reported.
+  3. **Typing** (§5.7): sealed per device on the ephemeral lane, only to devices with a session
+     (typing never starts one); "started" at most every 10 s; shown for 15 s. With "Typing
+     indicators" off nothing is sent or shown. Signed `api` requests now cover any request with a
+     body, `DELETE` included (unblock carries one).
+- Evidence: `gate_a2::typing_reports_and_blocks_work_for_real` against the real stack with the
+  production send gate and the reports service (six gate tests pass).
+
 ## D-0143 — Reactions, edits and deletes for everyone through app-core
 
 - Date: 2026-11-19

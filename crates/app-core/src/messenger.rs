@@ -70,6 +70,8 @@ pub trait Net {
     async fn fetch(&self, path_or_url: &str) -> Result<(u16, Vec<u8>, Option<String>)>;
     /// An unsigned `POST` with no body (a download's confirmation).
     async fn fetch_post(&self, path: &str) -> Result<u16>;
+    /// An ephemeral event to one device (typing): never stored, dropped first under pressure.
+    async fn ephemeral(&self, device: DeviceIdBytes, payload: Vec<u8>) -> Result<()>;
     /// A `Send` over the delivery connection (or `PUT /v1/messages`).
     async fn send(
         &self,
@@ -120,6 +122,13 @@ pub enum Received {
         author: [u8; 16],
         /// The message.
         id: [u8; 16],
+    },
+    /// Someone started or stopped typing (an ephemeral event, never stored).
+    Typing {
+        /// Who.
+        account: [u8; 16],
+        /// Started (else stopped).
+        started: bool,
     },
     /// A system notice was handled (prekeys refilled, the device list refreshed).
     System,
@@ -717,6 +726,97 @@ impl<N: Net> Messenger<N> {
         self.send_event(chat, data_message::Kind::Delete(d)).await
     }
 
+    /// Blocks an account (PROTOCOL §5.11): the server drops its requests and sends to an open
+    /// account; this device drops what it still sends; and the profile key is rotated, the new
+    /// one shared with every remaining contact, so the old access key stops working. `new_key` is
+    /// the rotated profile key, already published with the profile.
+    pub async fn block(&mut self, account: &[u8; 16], new_key: &[u8; 32]) -> Result<()> {
+        let body = serde_json::json!({ "account": hex(account) })
+            .to_string()
+            .into_bytes();
+        let (status, _) = self.net.api("PUT", "/v1/blocks", body).await?;
+        if status != 204 && status != 200 {
+            return Err(Error::Server(status));
+        }
+        self.store.set_blocked(account, true)?;
+        self.store.put_secret("profile_key", new_key)?;
+        for contact in self.store.contacts()? {
+            if contact == *account || contact == self.local.account {
+                continue;
+            }
+            let Ok(devices) = self.devices_of(&contact, false).await else {
+                continue;
+            };
+            let changed = songbird_content::profile::ProfileChanged { version: 0 };
+            let _ = self
+                .send_silent_with(&contact, &devices, Body::ProfileChanged(changed), true)
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Unblocks an account (`DELETE /v1/blocks`, the primary only).
+    pub async fn unblock(&mut self, account: &[u8; 16]) -> Result<()> {
+        let body = serde_json::json!({ "account": hex(account) })
+            .to_string()
+            .into_bytes();
+        let (status, _) = self.net.api("DELETE", "/v1/blocks", body).await?;
+        if status != 204 && status != 200 {
+            return Err(Error::Server(status));
+        }
+        self.store.set_blocked(account, false)
+    }
+
+    /// Reports the newest `n` messages from `author` (PROTOCOL §5.14), each with its proof: the
+    /// server learns those messages and who sent them, nothing else. Answers how many it took.
+    pub async fn report(&mut self, author: &[u8; 16], reason: u8, n: u32) -> Result<usize> {
+        let mut sent = 0;
+        for (stamp, fk, content) in self.store.franks(author, n)? {
+            let mut body = vec![1, reason];
+            body.extend_from_slice(&stamp);
+            body.extend_from_slice(author);
+            body.extend_from_slice(&fk);
+            body.extend_from_slice(
+                &u32::try_from(content.len())
+                    .map_err(|_| Error::Malformed)?
+                    .to_be_bytes(),
+            );
+            body.extend_from_slice(&content);
+            let (status, _) = self.net.api("POST", "/v1/reports", body).await?;
+            match status {
+                204 | 409 => sent += 1,
+                s => return Err(Error::Server(s)),
+            }
+        }
+        Ok(sent)
+    }
+
+    /// Tells a 1:1 chat's devices this account started or stopped typing (ephemeral, §5.7).
+    /// Only devices with a session hear it: typing never starts a session.
+    pub async fn typing(&mut self, to: &[u8; 16], started: bool) -> Result<()> {
+        let content = Content {
+            version: songbird_content::VERSION,
+            required_version: 1,
+            message_id: random::<16>()?.to_vec(),
+            sent_at_ms: now_ms(),
+            body: Some(Body::Typing(schema::TypingMessage {
+                started,
+                group_id: Vec::new(),
+            })),
+        };
+        let (padded, _) = songbird_content::seal(&content, None).map_err(|_| Error::Malformed)?;
+        for (d, _) in self.store.devices(to)? {
+            let addr = (*to, d);
+            if !self.sessions.has(&addr) {
+                continue;
+            }
+            let env = self.sessions.encrypt(&self.local, &addr, &padded)?;
+            self.store.save_sessions(&self.sessions, &addr)?;
+            let _ = self.net.ephemeral(d, env).await;
+        }
+        Ok(())
+    }
+
     /// Sends a location the user picked on the map (PROTOCOL §5.4 `LocationPin`).
     pub async fn send_location(
         &mut self,
@@ -1000,6 +1100,10 @@ impl<N: Net> Messenger<N> {
             return Ok(Received::Nothing);
         };
         let (account, device) = (inner.account, inner.device);
+        // A blocked account's messages are dropped here too (sealed senders, old access keys).
+        if account != self.local.account && self.store.is_blocked(&account)? {
+            return Ok(Received::Nothing);
+        }
         let mut identity = self
             .store
             .devices(&account)?
@@ -1107,11 +1211,25 @@ impl<N: Net> Messenger<N> {
                 if !self.store.insert_message(&row, true)? {
                     return Ok(Received::Nothing);
                 }
+                // What reporting it needs, exactly as received (§5.14).
+                if let (Some(st), Some(fk)) = (stamp, opened.franking_key) {
+                    let mut b = Vec::with_capacity(80);
+                    b.extend_from_slice(&st.key_id);
+                    b.extend_from_slice(&st.commitment);
+                    b.extend_from_slice(&st.stamped_at_ms.to_be_bytes());
+                    b.extend_from_slice(&st.tag);
+                    self.store
+                        .put_frank(&account, &row.id, &b, &fk, &opened.content_bytes)?;
+                }
                 let _ = self
                     .send_receipt(&account, &[row.id], receipt_message::Kind::Delivered)
                     .await;
                 Ok(Received::Message(row))
             }
+            Some(Body::Typing(t)) if account != self.local.account => Ok(Received::Typing {
+                account,
+                started: t.started,
+            }),
             Some(Body::Receipt(r)) => {
                 let status = match receipt_message::Kind::try_from(r.kind) {
                     Ok(receipt_message::Kind::Delivered) => Status::Delivered,

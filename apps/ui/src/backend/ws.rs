@@ -108,6 +108,10 @@ pub fn connect() {
                             live().update(|l| l.waiting += 1);
                         }
                     }
+                    // Typing and other ephemeral events: decrypted, never stored or acknowledged.
+                    Event::Ephemeral { payload } => {
+                        let _ = super::chat::receive(&payload).await;
+                    }
                     Event::Disconnected { .. } => live().update(|l| l.link = Link::Retrying),
                     Event::Failed { code } => {
                         live().update(|l| {

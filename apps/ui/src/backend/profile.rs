@@ -97,8 +97,8 @@ pub fn profile_key() -> [u8; 32] {
     rotate()
 }
 
-/// A new profile key (after narrowing who sees a field).
-fn rotate() -> [u8; 32] {
+/// A new profile key (after narrowing who sees a field, or a block).
+pub(crate) fn rotate() -> [u8; 32] {
     let k: [u8; 32] = wire::random();
     if let Err(e) = Storage::set_item(K_KEY, wire::hex(&k)) {
         log::warn!("profile storage: {e}");

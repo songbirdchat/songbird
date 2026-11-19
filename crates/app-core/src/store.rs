@@ -25,7 +25,7 @@ use crate::session::{Local, Prekeys, Session, Sessions};
 use crate::{Error, Result};
 
 /// The schema version this code writes.
-pub const SCHEMA: i64 = 3;
+pub const SCHEMA: i64 = 4;
 
 /// Outgoing message status, as the UI shows it (`crates/content`'s levels, plus the local ones).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -233,7 +233,84 @@ impl Store {
             ))?;
             db(tx.commit())?;
         }
+        if v < 4 {
+            // Blocks (PROTOCOL §5.11) and the proof each received message can be reported with
+            // (§5.14: the stamp, the franking key and the content exactly as received).
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "ALTER TABLE accounts ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0;
+                 CREATE TABLE franks (rowid INTEGER PRIMARY KEY, author BLOB NOT NULL, id BLOB NOT NULL,
+                     stamp BLOB NOT NULL, franking_key BLOB NOT NULL, content BLOB NOT NULL,
+                     UNIQUE (author, id));
+                 PRAGMA user_version = 4;",
+            ))?;
+            db(tx.commit())?;
+        }
         Ok(())
+    }
+
+    /// Blocks or unblocks an account here (the server is told by the messenger).
+    pub fn set_blocked(&self, account: &[u8; 16], blocked: bool) -> Result<()> {
+        db(self.db.execute(
+            "INSERT INTO accounts (account, identity_key, blocked) VALUES (?1, x'', ?2)
+             ON CONFLICT (account) DO UPDATE SET blocked = ?2",
+            params![&account[..], i64::from(blocked)],
+        ))
+        .map(|_| ())
+    }
+
+    /// Whether this account blocked `account`.
+    pub fn is_blocked(&self, account: &[u8; 16]) -> Result<bool> {
+        let v: Option<i64> = db(self
+            .db
+            .query_row(
+                "SELECT blocked FROM accounts WHERE account = ?1",
+                [&account[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(v == Some(1))
+    }
+
+    /// Contacts this account shares its profile key with: accounts whose profile key it holds,
+    /// not blocked.
+    pub fn contacts(&self) -> Result<Vec<[u8; 16]>> {
+        let mut st = db(self.db.prepare(
+            "SELECT account FROM accounts WHERE profile_key IS NOT NULL AND blocked = 0",
+        ))?;
+        let rows = db(st.query_map([], |r| r.get::<_, Vec<u8>>(0)))?;
+        rows.map(|r| arr16(&db(r)?)).collect()
+    }
+
+    /// Keeps what reporting a received message needs.
+    pub fn put_frank(
+        &self,
+        author: &[u8; 16],
+        id: &[u8; 16],
+        stamp: &[u8],
+        franking_key: &[u8; 32],
+        content: &[u8],
+    ) -> Result<()> {
+        db(self.db.execute(
+            "INSERT OR IGNORE INTO franks (author, id, stamp, franking_key, content) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![&author[..], &id[..], stamp, &franking_key[..], content],
+        ))
+        .map(|_| ())
+    }
+
+    /// The newest `n` reportable messages from `author`: (stamp, franking key, content).
+    pub fn franks(&self, author: &[u8; 16], n: u32) -> Result<Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>> {
+        let mut st = db(self.db.prepare(
+            "SELECT stamp, franking_key, content FROM franks WHERE author = ?1 ORDER BY rowid DESC LIMIT ?2",
+        ))?;
+        let rows = db(st.query_map(params![&author[..], i64::from(n)], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        }))?;
+        rows.map(|r| db(r)).collect()
     }
 
     /// Records `reactor`'s reaction to a message (empty `emoji`: removed), if `counter` is newer
@@ -459,6 +536,14 @@ impl Store {
                 ))?;
                 Ok(true)
             }
+            // A row made by a block before any key was seen: pin now.
+            Some(k) if k.is_empty() => {
+                db(self.db.execute(
+                    "UPDATE accounts SET identity_key = ?2 WHERE account = ?1",
+                    params![&account[..], &key[..]],
+                ))?;
+                Ok(true)
+            }
             Some(k) => Ok(crate::crypto::ct_eq(&k, key)),
         }
     }
@@ -485,7 +570,8 @@ impl Store {
                 |r| r.get(0),
             )
             .optional())?;
-        v.map(|k| k.as_slice().try_into().map_err(|_| Error::Storage))
+        v.filter(|k| !k.is_empty())
+            .map(|k| k.as_slice().try_into().map_err(|_| Error::Storage))
             .transpose()
     }
 
@@ -1033,5 +1119,25 @@ mod tests {
         assert_eq!(s.outbox().unwrap().len(), 1);
         s.outbox_done(&[1; 16]).unwrap();
         assert_eq!(s.outbox().unwrap().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    #![allow(clippy::unwrap_used, reason = "tests")]
+    use super::*;
+
+    #[test]
+    fn a_block_before_any_key_does_not_fake_an_identity_change() {
+        let s = Store::memory(&[1; 32]).unwrap();
+        let a = [9u8; 16];
+        s.set_blocked(&a, true).unwrap();
+        assert!(s.is_blocked(&a).unwrap());
+        assert_eq!(s.account_key(&a).unwrap(), None);
+        assert!(s.pin_account(&a, &[3; 32]).unwrap());
+        assert!(s.pin_account(&a, &[3; 32]).unwrap());
+        assert!(s.is_blocked(&a).unwrap());
+        s.set_blocked(&a, false).unwrap();
+        assert!(!s.is_blocked(&a).unwrap());
     }
 }
