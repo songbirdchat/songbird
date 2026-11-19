@@ -23,19 +23,15 @@ Status: ☐ open · ☑ done (with the commit).
 - ☑ Invite links are the real PROTOCOL §14.10 card everywhere; the system share sheet (76d9a1f)
 - ☑ Profile photo: system picker, encrypted avatar object, in the encrypted profile; contacts' real names and photos from their profiles; illustrated stand-ins only in fixtures (D-0140)
 - ☑ Username change for real; the username link encrypted, reset and opened (D-0140)
+- ☑ Account report saved; account deletion erases this device; linked devices real (D-0140)
+- ☑ Wallpaper, status expiry, recovery sheet, keep-archived, chat export, Songbird's own tones
+- ☑ Attachments in app-core: encrypted upload, verified download, end to end (D-0141)
+- ☑ Location: self-hosted OpenStreetMap tiles, the map picker, real places sent and shown (D-0142)
 - ☑ 1:1 text chats through app-core: send, receive, ticks, read receipts, new chat by username (675bfff)
 
 ## Open, by what they need
 
 **a (app only, or an existing endpoint):**
-- account page export and delete (reuse the working Settings versions)
-- linked devices: the real list and removal
-- message tone and ringtone (NSH sounds)
-- recovery sheet saved through the save dialog
-- export chat (save dialog)
-- wallpaper
-- keep chats archived
-- status expiry on the real clock
 - GIF picker (`/v1/gifs/*`)
 - proxy for HTTP requests too
 - installed sticker packs in the picker
@@ -62,7 +58,7 @@ Status: ☐ open · ☑ done (with the commit).
 **M5 groups and communities (b, c):** create, members, roles, invite links, join requests, change log,
 permissions enforced.
 
-**M6 attachments (a, b, c):** photos, documents, voice notes (microphone, e), location (e), view-once,
+**M6 attachments (a, b, c):** photos, documents, voice notes (microphone, e), the user's own GPS position (e; picking on the map is done), view-once,
 download, save, HD, auto-download.
 
 **Calls (b, c, e):** LiveKit client media, devices, screen share, call links, verification symbols.

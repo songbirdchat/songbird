@@ -985,6 +985,25 @@ impl<N: Net> Messenger<N> {
     }
 }
 
+/// The place a stored message's content shares, if it is a location:
+/// (latitude, longitude, name).
+#[must_use]
+pub fn location_of(content: &[u8]) -> Option<(f64, f64, String)> {
+    let c = Content::decode(content).ok()?;
+    let Some(Body::Data(d)) = c.body else {
+        return None;
+    };
+    let Some(data_message::Kind::Message(m)) = d.kind else {
+        return None;
+    };
+    let l = m.location?;
+    Some((
+        f64::from(l.latitude_e7) / 1e7,
+        f64::from(l.longitude_e7) / 1e7,
+        l.name,
+    ))
+}
+
 /// How an attachment reads in a list ("Photo", "Voice message", the file's name).
 #[must_use]
 pub fn attachment_label(p: &schema::AttachmentPointer) -> String {

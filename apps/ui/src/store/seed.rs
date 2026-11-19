@@ -412,6 +412,7 @@ pub fn seed() -> Seed {
             Body::Location {
                 label: "Piața Unirii, Cluj-Napoca".into(),
                 live: false,
+                at: Some((46.7697, 23.5896)),
             },
         );
         t.add(

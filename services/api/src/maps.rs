@@ -1,5 +1,5 @@
-//! Map tiles (D-0142): OpenStreetMap vector tiles (the OpenMapTiles schema, built with Planetiler
-//! and loaded into RustFS by `tools/maps-import`), served from Songbird's own EU storage so no
+//! Map tiles (D-0142): `OpenStreetMap` vector tiles (the `OpenMapTiles` schema, built with Planetiler
+//! and loaded into `RustFS` by `tools/maps-import`), served from Songbird's own EU storage so no
 //! map company learns where anyone looks.
 //!
 //! `GET /v1/maps/v1/<z>/<x>/<y>`, unsigned like attachment downloads (D-0079): a tile request
@@ -41,6 +41,7 @@ pub fn parse(rest: &str) -> Option<(u8, u32, u32)> {
     (x < n && y < n).then_some((z, x, y))
 }
 
+#[allow(clippy::many_single_char_names, reason = "the tile grid's z, x and y")]
 pub(crate) async fn route(
     app: &Arc<App>,
     req: Request<Incoming>,

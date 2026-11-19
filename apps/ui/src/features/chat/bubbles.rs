@@ -1796,8 +1796,12 @@ fn map_image(seed: u64, w: f32, h: f32) -> ImageSrc {
 fn location_body(cv: Conv, item: ItemMemo) -> AnyElement {
     let _ = cv;
     let info = sel(item, |i| match &i.m.body {
-        Body::Location { label, live } => (label.clone(), *live),
+        Body::Location { label, live, .. } => (label.clone(), *live),
         _ => Default::default(),
+    });
+    let at = sel(item, |i| match &i.m.body {
+        Body::Location { at, .. } => *at,
+        _ => None,
     });
     let id = sel(item, |i| i.m.id);
     let (w, h) = (if is_desktop() { 280.0 } else { 240.0 }, 140.0);
@@ -1813,12 +1817,18 @@ fn location_body(cv: Conv, item: ItemMemo) -> AnyElement {
                 .bg(AdaptiveColor::rgb(0xEEEAE1, 0xEEEAE1))
                 .role(AccessibilityRole::Image)
                 .label(move || info.with(|i| format!("Map of {}", i.0)))
-                .child(
-                    image(move || map_image(id.get(), w, h))
+                // The real map of the place (self-hosted OSM tiles, D-0142).
+                .child(dynamic(move || match at.get() {
+                    Some(p) => crate::features::maps::map(signal(p), signal(15.0), false)
                         .absolute()
                         .inset_0()
-                        .object_fit(ResizeMode::Cover),
-                )
+                        .into_element(),
+                    None => image(move || map_image(id.get(), w, h))
+                        .absolute()
+                        .inset_0()
+                        .object_fit(ResizeMode::Cover)
+                        .into_element(),
+                }))
                 // The pin: its tip on the centre, the whole of it inside.
                 .child(
                     view()

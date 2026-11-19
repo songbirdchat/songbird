@@ -359,12 +359,13 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
         return;
     }
     let from = (!mine).then_some(chat);
+    let body = body_of(row);
     s.messages.update(|m| {
         m.entry(chat).or_default().push(crate::store::Message {
             id,
             chat,
             from,
-            body: Body::Text(row.text.clone()),
+            body,
             at: minutes(row.sent_ms),
             status: tick(row.status),
             reply_to: None,
@@ -386,6 +387,23 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
             preview: row.text.clone(),
         });
     }
+}
+
+/// What a stored message shows as: its text, or a real place on the map.
+fn body_of(row: &MessageRow) -> Body {
+    if let Some((lat, lon, name)) = songbird_app_core::messenger::location_of(&row.content) {
+        let label = if name.is_empty() {
+            format!("{lat:.5}, {lon:.5}")
+        } else {
+            name
+        };
+        return Body::Location {
+            label,
+            live: false,
+            at: Some((lat, lon)),
+        };
+    }
+    Body::Text(row.text.clone())
 }
 
 fn show_all(s: Store, m: &Core) {
@@ -453,6 +471,42 @@ fn set_status(s: Store, core_id: &[u8; 16], status: Status) {
 /// already shows as Sending).
 pub fn send(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
     let Some(to) = account_of(chat) else { return };
+    if let Body::Location {
+        label,
+        at: Some((lat, lon)),
+        ..
+    } = body
+    {
+        let (lat, lon, label) = (*lat, *lon, label.clone());
+        super::run(async move {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let m = guard
+                .as_mut()
+                .ok_or_else(|| super::problem("Not connected yet."))?;
+            let r = m.send_location(&to, lat, lon, &label).await;
+            let st = r.as_ref().ok().and_then(|id| {
+                m.store
+                    .message(&m.local().account, id)
+                    .ok()
+                    .flatten()
+                    .map(|row| (*id, row.status))
+            });
+            drop(guard);
+            match st {
+                Some((id, status)) => {
+                    OUTGOING.with_borrow_mut(|o| o.insert(ui_msg, id));
+                    set_status(s, &id, status);
+                    Ok(())
+                }
+                None => {
+                    s.fail(chat, ui_msg);
+                    Err(super::problem("The location couldn't be sent."))
+                }
+            }
+        });
+        return;
+    }
     let text = match body {
         Body::Text(t) => t.clone(),
         Body::Link { text, .. } => text.clone(),

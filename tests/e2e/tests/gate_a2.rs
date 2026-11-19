@@ -620,3 +620,65 @@ async fn a_photo_goes_encrypted_and_arrives_verified() {
             .is_err()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn map_tiles_come_from_our_storage_and_decode_on_the_device() {
+    use prost::Message as _;
+    use songbird_app_core::maps::{Class, Feature, Layer, Tile, Value, shapes};
+    let Some((app, alice, _bob, _stop)) = stack().await else {
+        return;
+    };
+    // What `tools/maps-import` stores: a raw vector tile at maps/v1/z/x/y.mvt.
+    let tile = Tile {
+        layers: vec![Layer {
+            name: "water".into(),
+            features: vec![Feature {
+                tags: vec![0, 0],
+                r#type: Some(3),
+                geometry: vec![9, 0, 0, 18, 4096, 0, 0, 4096, 15],
+            }],
+            keys: vec!["class".into()],
+            values: vec![Value {
+                string_value: Some("lake".into()),
+                int_value: None,
+                uint_value: None,
+            }],
+            extent: Some(4096),
+        }],
+    }
+    .encode_to_vec();
+    app.s3
+        .put_object_bytes(
+            &songbird_api::maps::object_name(12, 2316, 1440),
+            Bytes::from(tile),
+        )
+        .await
+        .unwrap();
+    let net = alice.core.net();
+    let (status, body, _) = net.fetch("/v1/maps/v1/12/2316/1440").await.unwrap();
+    assert_eq!(status, 200);
+    let s = shapes(&body, 12).unwrap();
+    assert_eq!(s[0].class, Class::Water);
+    // An empty tile is 204; outside the grid is 404. No account is named in any of it.
+    assert_eq!(net.fetch("/v1/maps/v1/12/2316/1441").await.unwrap().0, 204);
+    assert_eq!(net.fetch("/v1/maps/v1/12/9999/1440").await.unwrap().0, 404);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_picked_place_arrives_as_that_place() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    let id = alice
+        .core
+        .send_location(&bob.account, 46.769_7, 23.589_6, "Piața Unirii")
+        .await
+        .unwrap();
+    let Received::Message(m) = pump(&mut bob).await else {
+        panic!("a message")
+    };
+    assert_eq!((m.id, m.text.as_str()), (id, "Location"));
+    let (lat, lon, name) = songbird_app_core::messenger::location_of(&m.content).unwrap();
+    assert!((lat - 46.769_7).abs() < 1e-7 && (lon - 23.589_6).abs() < 1e-7);
+    assert_eq!(name, "Piața Unirii");
+}

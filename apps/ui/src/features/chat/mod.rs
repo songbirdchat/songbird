@@ -202,6 +202,7 @@ pub(crate) struct Conv {
     pub event_open: Signal<bool>,
     pub contact_open: Signal<bool>,
     pub sticker_open: Signal<bool>,
+    pub location_open: Signal<bool>,
     /// The camera sheet (a photo to send).
     pub camera_open: Signal<bool>,
     pub timer_open: Signal<bool>,
@@ -262,6 +263,7 @@ impl Conv {
             event_open: signal(false),
             contact_open: signal(false),
             sticker_open: signal(false),
+            location_open: signal(false),
             camera_open: signal(false),
             timer_open: signal(false),
             searching: signal(false),

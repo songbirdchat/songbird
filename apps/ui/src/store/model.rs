@@ -247,6 +247,8 @@ pub enum Body {
     Location {
         label: String,
         live: bool,
+        /// Latitude and longitude, when the place is real (a map shows it).
+        at: Option<(f64, f64)>,
     },
     Sticker {
         emoji: String,
@@ -282,7 +284,7 @@ impl Body {
             Body::Poll { question, .. } => format!("Poll: {question}"),
             Body::Event { title, .. } => format!("Event: {title}"),
             Body::Contact { name, .. } => format!("Contact: {name}"),
-            Body::Location { label, live } => {
+            Body::Location { label, live, .. } => {
                 if *live {
                     format!("Live location · {label}")
                 } else {

@@ -19,6 +19,16 @@ pub(crate) fn all(cv: Conv) -> AnyElement {
         .child(event_sheet(cv))
         .child(contact_sheet(cv))
         .child(sticker_sheet(cv))
+        .child(crate::features::maps::pick(
+            cv.location_open,
+            move |lat, lon| {
+                cv.send_body(Body::Location {
+                    label: format!("{lat:.5}, {lon:.5}"),
+                    live: false,
+                    at: Some((lat, lon)),
+                });
+            },
+        ))
         .child(camera_sheet(cv))
         .child(forward_sheet(cv))
         .child(delete_sheet(cv))
@@ -171,16 +181,11 @@ fn attach_sheet(cv: Conv) -> AnyElement {
                     })
                 }),
             ),
-            // mock: the location permission and a map picker.
+            // The map picker on self-hosted OSM tiles (D-0142).
             tile(
                 Icon::MapPin,
                 "Location",
-                then(|cv| {
-                    cv.send_body(Body::Location {
-                        label: "Your current location · Cluj-Napoca".into(),
-                        live: false,
-                    })
-                }),
+                then(|cv| cv.location_open.set(true)),
             ),
             tile(
                 Icon::Contact,
