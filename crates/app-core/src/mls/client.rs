@@ -34,7 +34,7 @@ use crate::{Error, Result};
 /// KeyPackages kept on the server (single use).
 pub const KEY_PACKAGES: usize = 20;
 
-fn caps() -> Capabilities {
+pub(crate) fn caps() -> Capabilities {
     Capabilities::new(
         None,
         Some(&[GROUP_CIPHERSUITE]),
@@ -44,7 +44,7 @@ fn caps() -> Capabilities {
     )
 }
 
-fn context_extensions(roles: &Roles, ds: &[u8; 32]) -> Result<Extensions<GroupContext>> {
+pub(crate) fn context_extensions(roles: &Roles, ds: &[u8; 32]) -> Result<Extensions<GroupContext>> {
     Extensions::from_vec(vec![
         Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
             &[ExtensionType::Unknown(ROLES_EXTENSION)],
@@ -57,14 +57,14 @@ fn context_extensions(roles: &Roles, ds: &[u8; 32]) -> Result<Extensions<GroupCo
     .map_err(|_| Error::Malformed)
 }
 
-fn join_config() -> MlsGroupJoinConfig {
+pub(crate) fn join_config() -> MlsGroupJoinConfig {
     MlsGroupJoinConfig::builder()
         .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
         .max_past_epochs(1)
         .build()
 }
 
-fn tls<T: tls_codec::Serialize>(v: &T) -> Result<Vec<u8>> {
+pub(crate) fn tls<T: tls_codec::Serialize>(v: &T) -> Result<Vec<u8>> {
     v.tls_serialize_detached().map_err(|_| Error::Malformed)
 }
 
@@ -76,7 +76,7 @@ impl<N: Net> Messenger<N> {
         }
     }
 
-    fn save_mls(&self) -> Result<()> {
+    pub(crate) fn save_mls(&self) -> Result<()> {
         self.store.put_secret("mls_state", &self.mls.snapshot()?)
     }
 
@@ -129,7 +129,7 @@ impl<N: Net> Messenger<N> {
     }
 
     /// The delivery service's external-sender key (`POST /v1/groups/ds`), pinned on first use.
-    async fn ds_key(&mut self) -> Result<[u8; 32]> {
+    pub(crate) async fn ds_key(&mut self) -> Result<[u8; 32]> {
         if let Some(k) = self.store.secret("ds_key")?
             && let Ok(k) = <[u8; 32]>::try_from(k.as_slice())
         {
@@ -289,7 +289,7 @@ impl<N: Net> Messenger<N> {
         self.commit(gid, Vec::new(), Vec::new()).await
     }
 
-    fn load_group(&self, gid: &[u8; 16]) -> Result<MlsGroup> {
+    pub(crate) fn load_group(&self, gid: &[u8; 16]) -> Result<MlsGroup> {
         MlsGroup::load(self.mls.storage(), &GroupId::from_slice(gid))
             .map_err(|_| Error::Storage)?
             .ok_or(Error::NoSession)
@@ -302,11 +302,29 @@ impl<N: Net> Messenger<N> {
         adds: Vec<KeyPackage>,
         removes: Vec<LeafNodeIndex>,
     ) -> Result<()> {
+        self.commit_with(gid, adds, removes, None).await
+    }
+
+    /// [`Self::commit`], also changing the group's context extensions (roles, link keys).
+    pub(crate) async fn commit_with(
+        &mut self,
+        gid: &[u8; 16],
+        adds: Vec<KeyPackage>,
+        removes: Vec<LeafNodeIndex>,
+        exts: Option<Extensions<GroupContext>>,
+    ) -> Result<()> {
         let mut group = self.load_group(gid)?;
-        let (commit, welcome, info) = group
+        let builder = group
             .commit_builder()
             .propose_adds(adds)
-            .propose_removals(removes)
+            .propose_removals(removes);
+        let builder = match exts {
+            Some(e) => builder
+                .propose_group_context_extensions(e)
+                .map_err(|_| Error::Malformed)?,
+            None => builder,
+        };
+        let (commit, welcome, info) = builder
             .load_psks(self.mls.storage())
             .map_err(|_| Error::Malformed)?
             .create_group_info(true)
@@ -562,7 +580,10 @@ impl<N: Net> Messenger<N> {
         Ok(Received::Joined { group: gid })
     }
 
-    #[allow(clippy::too_many_lines, reason = "one match over the MLS message kinds, read top to bottom")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one match over the MLS message kinds, read top to bottom"
+    )]
     async fn process(&mut self, msg: ProtocolMessage, stamp: Option<Stamp>) -> Result<Received> {
         let gid: [u8; 16] = msg
             .group_id()
@@ -574,12 +595,19 @@ impl<N: Net> Messenger<N> {
         else {
             return Ok(Received::Nothing);
         };
+        let from_epoch = group.epoch().as_u64();
         let Ok(processed) = group.process_message(&self.mls, msg) else {
             return Ok(Received::Nothing);
         };
         let sender_device = Some(processed.credential().serialized_content().to_vec());
+        let join = matches!(processed.sender(), Sender::NewMemberCommit);
+        let aad = processed.aad().to_vec();
         match processed.into_content() {
             ProcessedMessageContent::StagedCommitMessage(staged) => {
+                // A join by link (an external commit): the rule and the link proof (§6.8).
+                if join && !Self::join_allowed(&group, &staged, &aad, from_epoch) {
+                    return Ok(Received::Nothing);
+                }
                 let ds = self
                     .store
                     .secret("ds_key")?
@@ -596,6 +624,12 @@ impl<N: Net> Messenger<N> {
                     let _ = group.delete(self.mls.storage());
                     self.save_mls()?;
                     return Ok(Received::RemovedFromGroup { group: gid });
+                }
+                if join {
+                    return Ok(Received::GroupUpdated {
+                        group: gid,
+                        title: String::new(),
+                    });
                 }
                 Ok(Received::System)
             }

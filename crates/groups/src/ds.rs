@@ -174,9 +174,15 @@ pub fn ds_external_senders(key: &[u8; 32]) -> ExternalSendersExtension {
 /// delivery service's `external_senders` may be in a group's context.
 #[must_use]
 pub fn extensions_allowed(ctx: &GroupContext, ds: Option<&[u8; 32]>) -> bool {
+    context_extensions_allowed(ctx.extensions(), ds)
+}
+
+/// [`extensions_allowed`] on the context's extensions (what a client holds for a group it is in).
+#[must_use]
+pub fn context_extensions_allowed(exts: &Extensions<GroupContext>, ds: Option<&[u8; 32]>) -> bool {
     let mut required = false;
     let mut external = false;
-    ctx.extensions().iter().all(|e| match e {
+    exts.iter().all(|e| match e {
         Extension::Unknown(t, _) => *t == ROLES_EXTENSION,
         // Exactly Songbird's: every member supports the roles extension, `SelfRemove` and basic
         // credentials. A member cannot drop it to let in clients that ignore roles (D-0074).

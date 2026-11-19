@@ -7,6 +7,7 @@
 
 pub mod client;
 pub mod crypto;
+pub mod links;
 
 use openmls_memory_storage::MemoryStorage;
 use openmls_traits::OpenMlsProvider;

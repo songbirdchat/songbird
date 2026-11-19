@@ -199,6 +199,28 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0148 — Group invite links and join requests
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision: links are `https://songbird.chat/g#<base64url(handle ‖ secret)>`
+  (`songbird_proto::group_link`); `auth` and the `proof` key come from the secret by HKDF
+  (salt `songbird.v1/group-link`). Making a link commits its proof key into the roles, then
+  registers `SHA-256(auth)` with the server; revoking withdraws both. Opening a link joins by
+  external commit whose authenticated data carries the link proof, or, where joins need
+  approval, asks to join; admins list, approve (an ordinary add) and decline requests. Members
+  follow an external commit only if it passes the structural rule (D-0078) and carries a valid
+  proof under a key the group published, unless it only replaces the joiner's own old leaf. The
+  group's context check gained `context_extensions_allowed` (the same rule on extensions a
+  client holds). The app's invite page makes or reads the real link, resets it, shares it with
+  the system sheet; join requests and pasted group links are real.
+- Evidence: `gate_a2::invite_links_and_join_requests` against the real stack: a link joins Bob
+  with a proof Alice's device checks, a revoked link opens nothing, an approval link files a
+  request Alice lists and approves (nine gate tests pass). The test raises the commit and link
+  budgets, which `gate_p05` tests; a real burst of group changes meets 429 (retrying is the
+  app's follow-up).
+
 ## D-0147 — Groups: removing, leaving, adding later, media
 
 - Date: 2026-11-20

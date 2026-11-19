@@ -27,6 +27,7 @@ Status: ☐ open · ☑ done (with the commit).
 - ☑ Wallpaper, status expiry, recovery sheet, keep-archived, chat export, Songbird's own tones
 - ☑ Attachments in app-core: encrypted upload, verified download, end to end (D-0141)
 - ☑ Photos and documents in real chats: system pickers, sent through app-core, shown and saved; received files kept encrypted in the store; auto-download for photos honoured; HD uploads keep full size (D-0141)
+- ☑ Groups: remove, leave, add later, photos and files (D-0147); invite links, join requests (D-0148)
 - ☑ Groups: an OpenMLS provider on aws-lc-rs (D-0145); creating a group of real contacts, joining by Welcome, group messages both ways (D-0146)
 - ☑ Block (server, local drop, profile-key rotation), report with franking proofs, typing indicators (D-0144)
 - ☑ Reactions, edits and delete for everyone in real chats, end to end; reactions kept in the store (schema 3); the read-receipts setting honoured (D-0143)
@@ -57,8 +58,7 @@ Status: ☐ open · ☑ done (with the commit).
 - network usage counted
 - storage per chat
 
-**Groups, the rest (b, c):** removing and leaving, roles enforced on received commits, invite
-links and join requests, the change log, new devices joining by external commit, communities and
+**Groups, the rest (b, c):** roles enforced on received commits (needs a device-to-account map), the change log, new devices joining by external commit, communities and
 channels, media in groups.
 
 **M6 attachments, the rest (a, b, c):** voice notes (microphone, e), video playback, view-once, the user's own GPS position (e; picking on the map is done), view-once,

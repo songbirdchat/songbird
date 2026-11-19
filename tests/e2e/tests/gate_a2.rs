@@ -377,10 +377,18 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
         group_send_burst: 200,
         rate_key: songbird_api::messages::rate_key(&random32()).unwrap(),
         metrics: metrics.send.clone(),
-        groups: Some(
-            songbird_api::groups::Groups::new(&random32(), songbird_groups::Limits::default())
-                .unwrap(),
-        ),
+        groups: Some({
+            let mut g =
+                songbird_api::groups::Groups::new(&random32(), songbird_groups::Limits::default())
+                    .unwrap();
+            // A test does in a second what people do over minutes; the budgets themselves are
+            // `gate_p05`'s.
+            g.commits_per_sec = 1_000;
+            g.commit_burst = 1_000;
+            g.links_per_sec = 1_000;
+            g.link_burst = 1_000;
+            g
+        }),
     };
     let app = Arc::new(App {
         plans: songbird_api::plans::Plans::default(),
@@ -1045,4 +1053,51 @@ async fn group_photos_removals_and_leaving() {
         matches!(pump_app(&mut alice).await, Received::GroupUpdated { group, .. } if group == gid2)
     );
     assert_eq!(alice.core.group_devices(&gid2).unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invite_links_and_join_requests() {
+    use songbird_app_core::mls::links::Opened;
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    // A link anyone may use: its proof key goes into the roles first, then Bob joins with it
+    // by external commit, carrying the proof; Alice's device checks the proof and follows.
+    let gid = alice.core.create_group("Open club", &[]).await.unwrap();
+    let url = alice.core.create_link(&gid, false).await.unwrap();
+    assert!(url.starts_with("https://songbird.chat/g#"));
+    assert_eq!(bob.core.open_link(&url).await.unwrap(), Opened::Joined(gid));
+    assert!(
+        matches!(pump_app(&mut alice).await, Received::GroupUpdated { group, .. } if group == gid)
+    );
+    assert_eq!(alice.core.group_devices(&gid).unwrap().len(), 2);
+    let id = bob
+        .core
+        .send_group_text(&gid, "Thanks for the link")
+        .await
+        .unwrap();
+    let Received::Message(m) = pump_app(&mut alice).await else {
+        panic!("a message")
+    };
+    assert_eq!((m.id, m.chat), (id, gid));
+    // A revoked link opens nothing.
+    alice.core.revoke_link(&gid, &url).await.unwrap();
+    assert!(bob.core.open_link(&url).await.is_err());
+
+    // A link that needs approval: Bob asks; Alice sees the request and approves (adds him).
+    let gid2 = alice.core.create_group("Private club", &[]).await.unwrap();
+    let url2 = alice.core.create_link(&gid2, true).await.unwrap();
+    assert_eq!(bob.core.open_link(&url2).await.unwrap(), Opened::Requested);
+    let waiting = alice.core.join_requests(&gid2).await.unwrap();
+    assert_eq!(
+        waiting.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+        vec![bob.account]
+    );
+    alice
+        .core
+        .approve_request(&gid2, &bob.account)
+        .await
+        .unwrap();
+    assert_eq!(pump_app(&mut bob).await, Received::Joined { group: gid2 });
+    assert_eq!(alice.core.join_requests(&gid2).await.unwrap().len(), 0);
 }

@@ -33,6 +33,7 @@ pub mod devices;
 pub mod envelope;
 pub mod ephemeral;
 pub mod frame;
+pub mod group_link;
 pub mod invite_link;
 pub mod keys;
 pub mod media;

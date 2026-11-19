@@ -208,6 +208,103 @@ pub fn remove_from_group(chat: ChatId, contact: ContactId) {
     );
 }
 
+/// The invite link of a real group: this device's, else a new one (the proof key committed
+/// into the roles first, D-0148). Shown in the chat once made.
+pub fn ensure_link(s: Store, chat: ChatId, fresh: bool) {
+    let Some(gid) = group_of(chat) else { return };
+    let approval = s.chat(chat).is_some_and(|c| c.permissions.approve_joins);
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        let current = m.group_link(&gid).ok().flatten().filter(|l| !l.is_empty());
+        let url = match (current, fresh) {
+            (Some(url), false) => url,
+            (old, _) => {
+                if let Some(old) = old {
+                    let _ = m.revoke_link(&gid, &old).await;
+                }
+                m.create_link(&gid, approval).await.map_err(|_| {
+                    super::problem("The link couldn't be made. Only admins can manage it.")
+                })?
+            }
+        };
+        drop(guard);
+        s.edit_chat(chat, |c| c.invite_link = url);
+        Ok(())
+    });
+}
+
+/// Loads a real group's pending join requests into its chat (admins).
+pub fn refresh_requests(s: Store, chat: ChatId) {
+    let Some(gid) = group_of(chat) else { return };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        let waiting = m.join_requests(&gid).await.unwrap_or_default();
+        drop(guard);
+        let ids: Vec<ContactId> = waiting
+            .iter()
+            .map(|(a, _)| ensure_chat(s, *a, None))
+            .collect();
+        s.edit_chat(chat, |c| c.join_requests = ids);
+        Ok(())
+    });
+}
+
+/// Approves (adds) or declines a request to join a real group.
+pub fn answer_request(chat: ChatId, contact: ContactId, approve: bool) {
+    let Some(account) = account_of(contact) else {
+        return;
+    };
+    group_op(
+        chat,
+        "The request couldn't be answered. Try again.",
+        move |m, gid| {
+            Box::pin(async move {
+                if approve {
+                    m.approve_request(&gid, &account).await
+                } else {
+                    m.decline_request(&gid, &account).await
+                }
+            })
+        },
+    );
+}
+
+/// Opens a group invite link someone shared: joins, or asks to join.
+pub async fn open_group_link(url: &str) -> Result<Option<ChatId>, super::Problem> {
+    let lock = core();
+    let mut guard = lock.lock().await;
+    let m = guard
+        .as_mut()
+        .ok_or_else(|| super::problem("Not connected yet."))?;
+    match m.open_link(url).await {
+        Ok(songbird_app_core::mls::links::Opened::Joined(gid)) => {
+            let title = m.group_title(&gid).unwrap_or_default();
+            drop(guard);
+            let s = crate::store::store();
+            let chat = ensure_group(s, gid, &title);
+            s.push_message(
+                chat,
+                None,
+                Body::System("You joined with an invite link".into()),
+            );
+            Ok(Some(chat))
+        }
+        Ok(songbird_app_core::mls::links::Opened::Requested) => {
+            toast("Request sent. An admin will let you in.");
+            Ok(None)
+        }
+        Err(_) => Err(super::problem("This invite link doesn't work any more.")),
+    }
+}
+
 /// Creates a real group with real contacts: the chat shows at once; app-core creates it on the
 /// server, adds every member's devices and sends the title (D-0146).
 pub fn create_group(s: Store, title: String, members: Vec<ContactId>) -> ChatId {
@@ -1238,6 +1335,11 @@ fn edit_shown(s: Store, msg: MsgId, f: impl Fn(&mut crate::store::Message)) {
 /// Starts (or opens) a chat with the account that holds `username`
 /// (`POST /v1/username/lookup`: only the username's hash leaves the device).
 pub async fn start_with_username(username: &str) -> Result<ChatId, super::Problem> {
+    if username.trim().starts_with("https://songbird.chat/g#") {
+        return open_group_link(username)
+            .await?
+            .ok_or_else(|| super::problem("Waiting for an admin to let you in."));
+    }
     if username.trim().starts_with("https://songbird.chat/u#") {
         let (name, handle) = super::username::open(username).await?;
         return start_with(&name, Some(handle)).await;

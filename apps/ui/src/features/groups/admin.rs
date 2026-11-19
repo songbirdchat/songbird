@@ -152,6 +152,10 @@ fn role_line(glyph: Icon, title: &'static str, what: &'static str) -> AnyElement
 pub fn invite_link_page(chat: ChatId) {
     nav::push(format!("invite:{chat}"), move || {
         let s = store();
+        // A real group's link is made (or read) by app-core (D-0148).
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::ensure_link(s, chat, false);
+        }
         let ch = computed(move || s.chat(chat));
         let manage = move || ch.with(|c| c.as_ref().is_some_and(can_manage));
         let link = move || {
@@ -168,7 +172,11 @@ pub fn invite_link_page(chat: ChatId) {
                 "The current link stops working at once. Anyone who has it will need the new one.",
                 "Reset link",
                 move || {
-                    s.reset_invite(chat);
+                    if crate::backend::chat::owns(chat) {
+                        crate::backend::chat::ensure_link(s, chat, true);
+                    } else {
+                        s.reset_invite(chat);
+                    }
                     toast("New link made");
                 },
             );
@@ -210,11 +218,7 @@ pub fn invite_link_page(chat: ChatId) {
                             .build(),
                         Row::new("Share link…")
                             .icon(Icon::Share)
-                            .on_press(move || {
-                                // mock: the platform share sheet; until then the link is copied.
-                                set_clipboard(link());
-                                toast("Link copied. Paste it in any app to share.");
-                            })
+                            .on_press(move || share_text(link()))
                             .build(),
                         view()
                             .style_when(move || !manage(), |st| st.hidden())
@@ -298,6 +302,9 @@ fn disabled_unless(enabled: impl Fn() -> bool + Copy + 'static, control: impl In
 
 /// Join requests, with Approve and Reject for each person.
 pub fn join_requests_page(chat: ChatId) {
+    if crate::backend::chat::owns(chat) {
+        crate::backend::chat::refresh_requests(store(), chat);
+    }
     nav::push(format!("requests:{chat}"), move || {
         let s = store();
         let requests = computed(move || s.chat(chat).map(|c| c.join_requests).unwrap_or_default());

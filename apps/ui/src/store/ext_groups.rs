@@ -564,6 +564,9 @@ impl Store {
 
     /// Approves or rejects a join request.
     pub fn answer_request(&self, chat: ChatId, contact: ContactId, approve: bool) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::answer_request(chat, contact, approve);
+        }
         let name = self.contact_name(Some(contact));
         self.answer_join_request(chat, contact, approve);
         if approve {
