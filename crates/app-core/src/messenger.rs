@@ -1343,6 +1343,11 @@ impl<N: Net> Messenger<N> {
             songbird_proto::system::Kind::PrekeysLow => {
                 let _ = self.publish_keys(false).await;
             }
+            songbird_proto::system::Kind::KeyPackagesLow => {
+                let _ = self
+                    .publish_key_packages(crate::mls::client::KEY_PACKAGES, false)
+                    .await;
+            }
             songbird_proto::system::Kind::DeviceListChanged => {
                 let me = self.local.account;
                 let _ = self.devices_of(&me, true).await;

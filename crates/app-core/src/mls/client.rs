@@ -184,8 +184,19 @@ impl<N: Net> Messenger<N> {
 
     /// Creates a group with `members` (other accounts), titled `title`. Answers the group ID.
     pub async fn create_group(&mut self, title: &str, members: &[[u8; 16]]) -> Result<[u8; 16]> {
-        let ds = self.ds_key().await?;
         let gid = *random::<16>()?;
+        self.create_group_with_id(gid, title, members).await
+    }
+
+    /// [`Self::create_group`] with an ID the caller drew (16 random bytes), so a UI can name the
+    /// chat before the server answers.
+    pub async fn create_group_with_id(
+        &mut self,
+        gid: [u8; 16],
+        title: &str,
+        members: &[[u8; 16]],
+    ) -> Result<[u8; 16]> {
+        let ds = self.ds_key().await?;
         let roles = Roles::new(AccountId::from_bytes(self.local.account), Policy::GROUP);
         let cfg = MlsGroupCreateConfig::builder()
             .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)

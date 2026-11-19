@@ -119,9 +119,80 @@ pub fn ui_id(bytes: &[u8; 16]) -> u64 {
     u64::from_be_bytes(b) | (1 << 63)
 }
 
-/// Whether `chat` is a real chat app-core owns.
+thread_local! {
+    /// Real groups by UI chat ID (D-0146).
+    static GROUPS: RefCell<HashMap<ChatId, [u8; 16]>> = RefCell::new(HashMap::new());
+}
+
+/// Whether `chat` is a real chat (1:1 or group) app-core owns.
 pub fn owns(chat: ChatId) -> bool {
-    ACCOUNTS.with_borrow(|a| a.contains_key(&chat))
+    ACCOUNTS.with_borrow(|a| a.contains_key(&chat)) || GROUPS.with_borrow(|g| g.contains_key(&chat))
+}
+
+fn group_of(chat: ChatId) -> Option<[u8; 16]> {
+    GROUPS.with_borrow(|g| g.get(&chat).copied())
+}
+
+/// Whether every one of `contacts` is a real account (a group can be made of them).
+pub fn all_real(contacts: &[ContactId]) -> bool {
+    !contacts.is_empty()
+        && contacts
+            .iter()
+            .all(|c| ACCOUNTS.with_borrow(|a| a.contains_key(c)))
+}
+
+/// The UI chat for a real group, created on first sight.
+fn ensure_group(s: Store, gid: [u8; 16], title: &str) -> ChatId {
+    let id = ui_id(&gid);
+    GROUPS.with_borrow_mut(|g| g.insert(id, gid));
+    if s.chat(id).is_none() {
+        let name = if title.is_empty() {
+            "Group".to_string()
+        } else {
+            title.to_owned()
+        };
+        s.chats.update(|cs| {
+            cs.push(crate::store::seed::chat(id, ChatKind::Group, &name));
+        });
+    } else if !title.is_empty() {
+        s.edit_chat(id, |c| c.title = title.to_owned());
+    }
+    id
+}
+
+/// Creates a real group with real contacts: the chat shows at once; app-core creates it on the
+/// server, adds every member's devices and sends the title (D-0146).
+pub fn create_group(s: Store, title: String, members: Vec<ContactId>) -> ChatId {
+    let gid: [u8; 16] = wire::random();
+    let chat = ensure_group(s, gid, &title);
+    let accounts: Vec<[u8; 16]> = members.iter().filter_map(|c| account_of(*c)).collect();
+    s.edit_chat(chat, |c| {
+        c.members = std::iter::once(crate::store::Member {
+            contact: None,
+            role: crate::store::Role::Owner,
+        })
+        .chain(members.iter().map(|&m| crate::store::Member {
+            contact: Some(m),
+            role: crate::store::Role::Member,
+        }))
+        .collect();
+    });
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        m.create_group_with_id(gid, &title, &accounts)
+            .await
+            .map_err(|_| {
+                super::problem(
+                    "The group couldn't be created. Check your connection and try again.",
+                )
+            })?;
+        Ok(())
+    });
+    chat
 }
 
 fn account_of(chat: ChatId) -> Option<[u8; 16]> {
@@ -294,6 +365,10 @@ pub async fn start() -> Result<(), super::Problem> {
         m.publish_keys(true)
             .await
             .map_err(|_| super::problem("This device's keys couldn't be published."))?;
+        // Groups (D-0146): KeyPackages others add this device with.
+        let _ = m
+            .publish_key_packages(songbird_app_core::mls::client::KEY_PACKAGES, true)
+            .await;
         // The primary signs the account's device list with the account key.
         if let Some(key) = Storage::get_item("sb.identity_seed")
             .and_then(|h| wire::unhex(&h))
@@ -386,15 +461,30 @@ fn ensure_chat(s: Store, account: [u8; 16], name: Option<&str>) -> ChatId {
 }
 
 fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
-    let chat = ensure_chat(s, row.chat, None);
+    let in_group = GROUPS.with_borrow(|g| g.values().any(|x| *x == row.chat));
+    let chat = if in_group {
+        ui_id(&row.chat)
+    } else {
+        ensure_chat(s, row.chat, None)
+    };
     let mine = row.author == *me;
+    // In a group the sender is a contact of their own.
+    let sender = if in_group && !mine {
+        Some(ensure_chat(s, row.author, None))
+    } else {
+        None
+    };
     let id = ui_id(&row.id);
     if s.message(chat, id).is_some()
         || OUTGOING.with_borrow(|o| o.iter().any(|(_, v)| *v == row.id))
     {
         return;
     }
-    let from = (!mine).then_some(chat);
+    let from = if mine {
+        None
+    } else {
+        Some(sender.unwrap_or(chat))
+    };
     let body = body_of(row);
     IDS.with_borrow_mut(|m| m.insert(id, (row.author, row.id)));
     let media = matches!(body, Body::Image { .. } | Body::File { .. });
@@ -644,7 +734,11 @@ fn body_of(row: &MessageRow) -> Body {
 fn show_all(s: Store, m: &Core) {
     let me = m.local().account;
     for c in m.store.chats().unwrap_or_default() {
-        let chat = ensure_chat(s, c.id, None);
+        let chat = if c.group {
+            ensure_group(s, c.id, &m.group_title(&c.id).unwrap_or_default())
+        } else {
+            ensure_chat(s, c.id, None)
+        };
         for row in m.store.messages(&c.id, None, 200).unwrap_or_default() {
             show(s, &me, &row, false);
             if let Some(msg) = ui_of(&row.author, &row.id) {
@@ -742,6 +836,40 @@ fn set_status(s: Store, core_id: &[u8; 16], status: Status) {
 /// Sends what the user wrote in a real chat (`ui_id` is the message the UI
 /// already shows as Sending).
 pub fn send(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
+    if let Some(gid) = group_of(chat) {
+        let text = match body {
+            Body::Text(t) => t.clone(),
+            Body::Link { text, .. } => text.clone(),
+            _ => {
+                s.fail(chat, ui_msg);
+                toast("Only text can be sent in groups for now.");
+                return;
+            }
+        };
+        super::run(async move {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let m = guard
+                .as_mut()
+                .ok_or_else(|| super::problem("Not connected yet."))?;
+            let me = m.local().account;
+            match m.send_group_text(&gid, &text).await {
+                Ok(id) => {
+                    drop(guard);
+                    OUTGOING.with_borrow_mut(|o| o.insert(ui_msg, id));
+                    IDS.with_borrow_mut(|x| x.insert(ui_msg, (me, id)));
+                    s.advance(chat, ui_msg, Tick::Sent);
+                    Ok(())
+                }
+                Err(_) => {
+                    drop(guard);
+                    s.fail(chat, ui_msg);
+                    Err(super::problem("The message couldn't be sent to the group."))
+                }
+            }
+        });
+        return;
+    }
     let Some(to) = account_of(chat) else { return };
     if let Body::Location {
         label,

@@ -755,6 +755,16 @@ impl Store {
 
     /// Creates a group the user owns and returns it.
     pub fn create_group(&self, title: String, members: Vec<ContactId>) -> ChatId {
+        // Real contacts: a real MLS group (D-0146).
+        if crate::backend::chat::all_real(&members) {
+            let id = crate::backend::chat::create_group(*self, title.clone(), members);
+            self.push_message(
+                id,
+                None,
+                Body::System(format!("You created the group “{title}”")),
+            );
+            return id;
+        }
         let id = self.id();
         let mut chat = seed::chat(id, ChatKind::Group, &title);
         chat.members = std::iter::once(Member {
