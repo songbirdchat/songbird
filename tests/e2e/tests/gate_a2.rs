@@ -406,7 +406,7 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
             .unwrap();
             Some(songbird_api::calls::CallsApi {
                 calls: Arc::new(calls),
-                metrics: songbird_api::ApiMetrics::default().calls.clone(),
+                metrics: ApiMetrics::default().calls.clone(),
             })
         },
         requests: Some(songbird_api::requests::Requests::new(
