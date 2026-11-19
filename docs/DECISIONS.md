@@ -199,6 +199,32 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0146 — The group client: create, join, commit and talk over the delivery service
+
+- Date: 2026-11-19
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision (`songbird_app_core::mls::client`, on D-0145's provider):
+  1. KeyPackages with the capabilities every Songbird leaf has, the device ID as credential,
+     single use plus one last resort (`PUT /v1/keypackages`); the private halves saved first.
+  2. Creating: epoch 0, the roles extension (this account owner), the delivery service pinned
+     from `POST /v1/groups/ds` as the one external sender; `POST /v1/groups`; then one commit
+     adding every device of each member, each KeyPackage validated in full and its device on
+     the account's verified list (`POST /v1/groups/commit`, merged only on 200).
+  3. Group messages: `account ‖ padded Content` in a `PrivateMessage`, shared body, franked.
+     The receiver accepts it only if the MLS sender device is on that account's verified list
+     (fetched when unknown) and the franking stamp opens.
+  4. Receiving: a Welcome joins with the server's tree, only if the group names exactly the
+     pinned service key; commits merge only under the same rule; group state saved after each.
+  5. Titles travel as `GroupUpdate` data messages (members' devices only).
+- Evidence: `gate_a2::a_group_is_created_joined_and_talked_in` against the real `api` (groups
+  service, rosters) and `delivery`: the server validates the group and commit, the Welcome
+  reaches Bob, the title and messages cross both ways (seven gate tests pass).
+- Consequences: not yet: the roles rule on received commits (`songbird_groups::roles::authorize`;
+  the server enforces it today), server-proposed removals, removing members and leaving,
+  invite links and join requests, external commits for a member's new devices, the stale-epoch
+  retry, communities and channels. The app's group screens are next.
+
 ## D-0145 — Groups on the device: an OpenMLS provider on aws-lc-rs; the third `unsafe` exception
 
 - Date: 2026-11-19

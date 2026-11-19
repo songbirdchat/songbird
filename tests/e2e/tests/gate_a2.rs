@@ -120,6 +120,25 @@ impl Net for TestNet {
             .map_err(|_| songbird_app_core::Error::Network)
     }
 
+    async fn send_group(
+        &self,
+        idempotency_key: [u8; 16],
+        hints: SendHints,
+        body: Vec<u8>,
+    ) -> songbird_app_core::Result<SendStatus> {
+        self.ws
+            .send_with(
+                idempotency_key,
+                hints,
+                songbird_proto::frame::SendPayload::Shared {
+                    devices: Vec::new(),
+                    body: Bytes::from(body),
+                },
+            )
+            .await
+            .map_err(|_| songbird_app_core::Error::Network)
+    }
+
     async fn ephemeral(
         &self,
         device: DeviceIdBytes,
@@ -213,6 +232,7 @@ async fn person(r: Registered, api: std::net::SocketAddr, ws: std::net::SocketAd
     let mut core =
         Messenger::create(store, net, local, Some(songbird_send_system_public())).unwrap();
     core.publish_keys(true).await.unwrap();
+    core.publish_key_packages(5, true).await.unwrap();
     core.publish_device_list(&r.account_key, |_, _| false)
         .await
         .unwrap();
@@ -297,7 +317,10 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
         franking: Some(songbird_send::Franker::from_secret(&secret).unwrap()),
         gate: Some(Arc::clone(&gate)),
         max_broadcast_accounts: limits.max_broadcast_accounts,
-        rosters: None,
+        rosters: Some(Arc::new(songbird_send::RegistryRosters::new(
+            Arc::clone(&registry),
+            songbird_send::groups::ROSTER_TTL,
+        ))),
         channels: Arc::default(),
         standings: None,
     };
@@ -354,7 +377,10 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
         group_send_burst: 200,
         rate_key: songbird_api::messages::rate_key(&random32()).unwrap(),
         metrics: metrics.send.clone(),
-        groups: None,
+        groups: Some(
+            songbird_api::groups::Groups::new(&random32(), songbird_groups::Limits::default())
+                .unwrap(),
+        ),
     };
     let app = Arc::new(App {
         plans: songbird_api::plans::Plans::default(),
@@ -884,4 +910,70 @@ async fn typing_reports_and_blocks_work_for_real() {
     );
     bob.core.unblock(&alice.account).await.unwrap();
     assert!(!bob.core.store.is_blocked(&alice.account).unwrap());
+}
+
+/// The next envelope that is not a system notice (prekeys or KeyPackages low).
+async fn pump_app(p: &mut Person) -> Received {
+    loop {
+        let r = pump(p).await;
+        if r != Received::System {
+            return r;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_is_created_joined_and_talked_in() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    // Alice creates "Hiking" with Bob: the server validates the group and the commit, and fans
+    // the Welcome out to Bob's device.
+    let gid = alice
+        .core
+        .create_group("Hiking", &[bob.account])
+        .await
+        .unwrap();
+    assert_eq!(alice.core.group_devices(&gid).unwrap().len(), 2);
+    assert_eq!(pump_app(&mut bob).await, Received::Joined { group: gid });
+    assert_eq!(bob.core.group_devices(&gid).unwrap().len(), 2);
+    // The title arrives as an encrypted group update.
+    assert_eq!(
+        pump_app(&mut bob).await,
+        Received::GroupUpdated {
+            group: gid,
+            title: "Hiking".into()
+        }
+    );
+    assert_eq!(bob.core.group_title(&gid).unwrap(), "Hiking");
+    // Messages both ways, one shared body each, stored under the group.
+    let id = alice
+        .core
+        .send_group_text(&gid, "Saturday at 8?")
+        .await
+        .unwrap();
+    let Received::Message(m) = pump_app(&mut bob).await else {
+        panic!("a group message")
+    };
+    assert_eq!(
+        (m.chat, m.author, m.id, m.text.as_str()),
+        (gid, alice.account, id, "Saturday at 8?")
+    );
+    let id = bob.core.send_group_text(&gid, "Count me in").await.unwrap();
+    let Received::Message(m) = pump_app(&mut alice).await else {
+        panic!("a group message")
+    };
+    assert_eq!(
+        (m.chat, m.author, m.id, m.text.as_str()),
+        (gid, bob.account, id, "Count me in")
+    );
+    assert!(
+        alice
+            .core
+            .store
+            .chats()
+            .unwrap()
+            .iter()
+            .any(|c| c.id == gid && c.group)
+    );
 }

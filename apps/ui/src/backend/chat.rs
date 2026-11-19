@@ -175,6 +175,26 @@ impl Net for AppNet {
             .map_err(|_| songbird_app_core::Error::Network)
     }
 
+    async fn send_group(
+        &self,
+        idempotency_key: [u8; 16],
+        hints: SendHints,
+        body: Vec<u8>,
+    ) -> songbird_app_core::Result<SendStatus> {
+        let client = super::ws::client().ok_or(songbird_app_core::Error::Network)?;
+        client
+            .send_with(
+                idempotency_key,
+                hints,
+                songbird_proto::frame::SendPayload::Shared {
+                    devices: Vec::new(),
+                    body: body.into(),
+                },
+            )
+            .await
+            .map_err(|_| songbird_app_core::Error::Network)
+    }
+
     async fn ephemeral(
         &self,
         device: DeviceIdBytes,

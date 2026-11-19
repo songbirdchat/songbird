@@ -204,7 +204,10 @@ fn xwing_decaps(sk: &[u8], ct: &[u8]) -> Result<Zeroizing<Vec<u8>>, CryptoError>
     Ok(combiner(ss_m.as_ref(), ss_x.as_ref(), ct_x, &e.pk_x))
 }
 
-#[allow(clippy::needless_pass_by_value, reason = "OpenMLS passes the config by value")]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "OpenMLS passes the config by value"
+)]
 fn check_config(c: HpkeConfig) -> Result<(), CryptoError> {
     match c {
         HpkeConfig(

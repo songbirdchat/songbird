@@ -24,6 +24,9 @@ openmls = { version = "=0.9.2", default-features = false, features = ["draft-iet
 openmls_traits = { version = "=0.6.0", features = ["draft-ietf-mls-pq-ciphersuites"] }
 openmls_memory_storage = "=0.6.0"
 tls_codec = "0.5"
+# The group wire formats and rules the server checks (Bundle, roles, DS key): shared, not copied.
+songbird-groups.workspace = true
+songbird-types.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

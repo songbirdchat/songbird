@@ -72,6 +72,13 @@ pub trait Net {
     async fn fetch_post(&self, path: &str) -> Result<u16>;
     /// An ephemeral event to one device (typing): never stored, dropped first under pressure.
     async fn ephemeral(&self, device: DeviceIdBytes, payload: Vec<u8>) -> Result<()>;
+    /// A group message: one shared body the server fans out to the group's roster (§6.5).
+    async fn send_group(
+        &self,
+        idempotency_key: [u8; 16],
+        hints: SendHints,
+        body: Vec<u8>,
+    ) -> Result<SendStatus>;
     /// A `Send` over the delivery connection (or `PUT /v1/messages`).
     async fn send(
         &self,
@@ -130,6 +137,18 @@ pub enum Received {
         /// Started (else stopped).
         started: bool,
     },
+    /// This device joined a group (a Welcome).
+    Joined {
+        /// The group.
+        group: [u8; 16],
+    },
+    /// A group's title or membership changed.
+    GroupUpdated {
+        /// The group.
+        group: [u8; 16],
+        /// Its title, when it changed.
+        title: String,
+    },
     /// A system notice was handled (prekeys refilled, the device list refreshed).
     System,
     /// Nothing to show (a duplicate, a dropped or unreadable envelope).
@@ -141,21 +160,24 @@ pub enum Received {
 pub struct Messenger<N> {
     /// The store.
     pub store: Store,
-    local: Local,
+    pub(crate) local: Local,
     prekeys: Prekeys,
-    sessions: Sessions,
-    net: N,
+    pub(crate) sessions: Sessions,
+    pub(crate) net: N,
     /// The server's system-notice key (PROTOCOL §3.9), when pinned.
     system_key: Option<[u8; 32]>,
+    /// Groups (D-0145): OpenMLS state and this device's group signing key.
+    pub(crate) mls: crate::mls::DeviceProvider,
+    pub(crate) mls_signer: crate::mls::crypto::DeviceSigner,
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     use std::fmt::Write as _;
     b.iter()
         .fold(String::with_capacity(b.len() * 2), |mut s, x| {
@@ -164,7 +186,7 @@ fn hex(b: &[u8]) -> String {
         })
 }
 
-fn unhex<const N: usize>(s: &str) -> Result<[u8; N]> {
+pub(crate) fn unhex<const N: usize>(s: &str) -> Result<[u8; N]> {
     if s.len() != N * 2 {
         return Err(Error::Malformed);
     }
@@ -176,7 +198,7 @@ fn unhex<const N: usize>(s: &str) -> Result<[u8; N]> {
     Ok(out)
 }
 
-fn json(body: &[u8]) -> Result<serde_json::Value> {
+pub(crate) fn json(body: &[u8]) -> Result<serde_json::Value> {
     serde_json::from_slice(body).map_err(|_| Error::Malformed)
 }
 
@@ -258,6 +280,17 @@ impl<N: Net> Messenger<N> {
         let local = store.local()?.ok_or(Error::NoSession)?;
         let prekeys = store.prekeys()?;
         let sessions = store.sessions()?;
+        let mls = match store.secret("mls_state")? {
+            Some(b) => crate::mls::DeviceProvider::restore(&b)?,
+            None => crate::mls::DeviceProvider::default(),
+        };
+        let mls_signer = if let Some(seed) = store.secret("mls_signer")? {
+            crate::mls::crypto::DeviceSigner::from_seed(&seed).map_err(|_| Error::Storage)?
+        } else {
+            let s = crate::mls::crypto::DeviceSigner::generate().map_err(|_| Error::Random)?;
+            store.put_secret("mls_signer", s.seed())?;
+            s
+        };
         Ok(Self {
             store,
             local,
@@ -265,6 +298,8 @@ impl<N: Net> Messenger<N> {
             sessions,
             net,
             system_key,
+            mls,
+            mls_signer,
         })
     }
 
@@ -1096,6 +1131,11 @@ impl<N: Net> Messenger<N> {
             }
             Err(_) => (None, envelope),
         };
+        // MLS (commits, Welcomes, group messages) are `MLSMessage`s, version mls10 (0x0001):
+        // they begin with a zero byte, which no sealed envelope does.
+        if envelope.first() == Some(&0) {
+            return self.receive_mls(envelope, stamp).await;
+        }
         let Ok(inner) = Sessions::open(&self.local, envelope) else {
             return Ok(Received::Nothing);
         };
@@ -1369,7 +1409,7 @@ pub fn attachment_label(p: &schema::AttachmentPointer) -> String {
     }
 }
 
-fn data_row(
+pub(crate) fn data_row(
     content: &Content,
     data: &DataMessage,
     chat: [u8; 16],

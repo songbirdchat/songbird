@@ -5,6 +5,7 @@
 //!   which the messenger persists into the `SQLCipher` store after every group operation
 //!   ([`DeviceProvider::snapshot`], [`DeviceProvider::restore`]).
 
+pub mod client;
 pub mod crypto;
 
 use openmls_memory_storage::MemoryStorage;
