@@ -1,0 +1,42 @@
+[package]
+name = "songbird-aws-lc-ext"
+description = "Two aws-lc operations aws-lc-rs does not expose, for app-core's MLS provider (D-0145): deterministic ML-KEM-768 key generation from a 64-byte seed (FIPS 203 KeyGen_internal) and SHAKE256. The workspace's third unsafe exception: FFI calls into the same aws-lc build aws-lc-rs links. Never linked by a service."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+# The same aws-lc build aws-lc-rs links (one `links` per build): the version in the lockfile.
+aws-lc-sys = "=0.47.0"
+
+# Its own lint table: the workspace's, except that `unsafe_code` is denied (allowed on the FFI
+# module only) instead of forbidden (D-0145).
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Selected restriction lints (constitution: pedantic plus selected restriction lints).
+allow_attributes_without_reason = "warn"
+as_conversions = "warn"
+dbg_macro = "warn"
+exit = "warn"
+expect_used = "warn"
+get_unwrap = "warn"
+indexing_slicing = "warn"
+mem_forget = "warn"
+panic = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"
+# Pedantic lints we do not want.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"

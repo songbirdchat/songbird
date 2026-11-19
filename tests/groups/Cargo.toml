@@ -20,6 +20,8 @@ openmls_basic_credential = "=0.6.0"
 openmls_traits = { version = "=0.6.0", features = ["draft-ietf-mls-pq-ciphersuites"] }
 
 [dev-dependencies]
+# Songbird's own device provider, checked against OpenMLS's RustCrypto one (D-0145).
+songbird-app-core.workspace = true
 songbird-keys.workspace = true
 # Group calls derive their media keys from the MLS exporter (Prompt 7, D-0086).
 songbird-content.workspace = true

@@ -21,6 +21,7 @@ pub mod blob;
 pub mod crypto;
 pub mod maps;
 pub mod messenger;
+pub mod mls;
 pub mod session;
 pub mod store;
 pub mod username_link;

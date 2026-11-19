@@ -5006,15 +5006,27 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "bytes",
+ "openmls",
+ "openmls_memory_storage",
+ "openmls_traits",
  "proptest",
  "prost",
  "rusqlite",
  "serde_json",
+ "songbird-aws-lc-ext",
  "songbird-content",
  "songbird-keys",
  "songbird-proto",
  "thiserror 2.0.21",
+ "tls_codec",
  "zeroize",
+]
+
+[[package]]
+name = "songbird-aws-lc-ext"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-sys",
 ]
 
 [[package]]
@@ -5300,6 +5312,7 @@ dependencies = [
  "openmls_rust_crypto",
  "openmls_traits",
  "proptest",
+ "songbird-app-core",
  "songbird-content",
  "songbird-groups",
  "songbird-keys",

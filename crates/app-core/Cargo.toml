@@ -18,6 +18,12 @@ prost.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+songbird-aws-lc-ext.workspace = true
+# Groups (D-0145): OpenMLS core with Songbird's own aws-lc-rs provider (no RustCrypto backend).
+openmls = { version = "=0.9.2", default-features = false, features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_traits = { version = "=0.6.0", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_memory_storage = "=0.6.0"
+tls_codec = "0.5"
 
 [dev-dependencies]
 proptest.workspace = true

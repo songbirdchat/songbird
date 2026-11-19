@@ -29,6 +29,7 @@ members = [
     "crates/entitlements",
     "crates/tokens",
     "crates/app-core",
+    "crates/aws-lc-ext",
     "services/delivery",
     "services/api",
     "services/push",
@@ -85,6 +86,7 @@ songbird-backup-storage = { path = "crates/backup-storage" }
 songbird-entitlements = { path = "crates/entitlements" }
 songbird-tokens = { path = "crates/tokens" }
 songbird-app-core = { path = "crates/app-core" }
+songbird-aws-lc-ext = { path = "crates/aws-lc-ext" }
 songbird-calls = { path = "services/calls" }
 
 anyhow = "1.0.104"

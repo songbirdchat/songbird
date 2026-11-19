@@ -199,6 +199,38 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0145 — Groups on the device: an OpenMLS provider on aws-lc-rs; the third `unsafe` exception
+
+- Date: 2026-11-19
+- Status: accepted (owner, 2026-11-19: "aws-lc-rs provider", over shipping OpenMLS's RustCrypto
+  provider with `hpke-rs` (MPL-2.0) and its `crypto-bigint` advisory); the `unsafe` exception
+  is proposed, for the owner's review
+- Decided by: owner (the provider); agent (its construction)
+- Context: groups need a full MLS provider on the device (the server's only verifies). aws-lc-rs
+  does not expose seeded ML-KEM key generation (X-Wing derives node keys from path secrets) or
+  SHAKE256.
+- Decision:
+  1. `songbird-aws-lc-ext`: two FFI calls into the aws-lc build aws-lc-rs already links
+     (`EVP_PKEY_keygen_deterministic` for ML-KEM-768 from `d ‖ z`; SHAKE256), each object freed
+     by a guard, each buffer owned and sized by Rust. `unsafe` is denied in the crate and allowed
+     only on its FFI module (as D-0033, D-0118). Tests: SHAKE256 against FIPS 202's empty-input
+     vector; seeded keys deterministic, the expanded key embedding its public key.
+  2. `songbird_app_core::mls::crypto::DeviceCrypto`: X-Wing (draft-06: SHAKE256 expansion,
+     `SHA3-256(ss_M ‖ ss_X ‖ ct_X ‖ pk_X ‖ label)`), HPKE base mode (RFC 9180) with X-Wing's
+     HPKE code point `0x647a` in the suite ID, HKDF-SHA256 and AES-128-GCM, the exporter;
+     AEAD, HKDF, HMAC, SHA-2 and Ed25519 from aws-lc-rs. Only
+     `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519`.
+  3. `DeviceProvider`: that crypto, aws-lc-rs randomness, OpenMLS's in-memory storage (MIT),
+     snapshotted into the SQLCipher store.
+- Evidence: `tests/groups/tests/device_provider.rs` against OpenMLS's RustCrypto provider
+  (libcrux, `x-wing`, `hpke-rs`): identical X-Wing keys from the same path secrets; HPKE
+  ciphertexts opened in both directions; equal exporter secrets; a whole group with one member
+  on each provider exchanging messages, the aws-lc-rs member's state restored from its snapshot
+  in between. The first cross-check failed twice and found the suite-ID code point (OpenMLS's
+  `0x004D` is not HPKE's `0x647a`) — the reason the cross-check exists. `cargo deny`: ok.
+- Consequences: the group client over `/v1/groups…` (next) uses this provider; the provider and
+  the FFI crate join the external audit's scope.
+
 ## D-0144 — Block, report and typing through app-core
 
 - Date: 2026-11-19
