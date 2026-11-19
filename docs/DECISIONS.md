@@ -199,6 +199,32 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0137 — A2 app-core, milestone 2: the SQLCipher store
+
+- Date: 2026-11-19
+- Status: accepted (owner chose SQLCipher, 2026-11-19); the non-Apple `libcrypto` build is to
+  be wired in the platform builds
+- Decided by: owner (SQLCipher over column sealing); agent (how it is built and keyed)
+- Context: A0 asks for SQLCipher; the locked stack names aws-lc-rs; `deny.toml` bans the
+  `openssl` crates; OpenMLS already pins `rusqlite 0.37` (one `libsqlite3-sys` per build).
+- Options considered: `bundled-sqlcipher-vendored-openssl` (pulls `openssl-sys`, banned);
+  `bundled-sqlcipher` with the platform's crypto (chosen); a custom SQLCipher build against
+  aws-lc-sys's prefixed symbols (possible later, more build code).
+- Evidence: `cargo test -p songbird-app-core` 27 tests, among them: the database file holds no
+  plaintext and does not start with SQLite's header; a wrong key is refused (`Locked`); messages
+  are stored once per (author, id); status never moves back; receipts from a group take the
+  lowest level over the whole audience; device lists never roll back; FTS5 search folds
+  diacritics ("buna" finds "Bună") and never parses user input as query syntax. `cargo deny
+  check bans licenses`: ok.
+- Decision: `rusqlite =0.37.0` with `bundled-sqlcipher` only. Apple: CommonCrypto (the OS's own
+  library). Android, Windows, Linux: SQLCipher's OpenSSL provider linked against an AWS-LC
+  `libcrypto` built for the target (`OPENSSL_LIB_DIR`/`OPENSSL_INCLUDE_DIR`), so no second
+  crypto library ships. A raw 32-byte key (no password KDF), wrapped by the Secure Enclave or
+  Android Keystore by the host; `cipher_memory_security`, `secure_delete`, WAL; schema by
+  `user_version`. FTS5 lives inside the encrypted file.
+- Consequences: the Android, Windows and Linux app builds need the AWS-LC `libcrypto` step (to
+  be added to the app's build scripts with the platform hosts).
+
 ## D-0136 — A2 app-core, milestone 1: 1:1 sessions implemented from the specifications
 
 - Date: 2026-11-19

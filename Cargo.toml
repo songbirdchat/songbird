@@ -153,6 +153,11 @@ curve25519-dalek = { version = "=5.0.0", default-features = false }
 # through OpenMLS's crypto provider and exempted in cargo-vet; no default features.
 chacha20poly1305 = { version = "=0.10.1", default-features = false }
 
+# app-core's on-device store (A2, D-0137): SQLCipher through rusqlite's bundled build. No
+# vendored OpenSSL: CommonCrypto on Apple, a libcrypto (AWS-LC) linked at build time elsewhere;
+# the `openssl` crates stay banned. MIT.
+rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher"] }
+
 # Test-only
 proptest = "1.12.0"
 tempfile = "3.27.0"

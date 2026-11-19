@@ -46,7 +46,7 @@ as follows.
 | | Scope | Status |
 | --- | --- | --- |
 | M1 | `crates/app-core` crypto: X25519/ML-KEM/HKDF/AES-GCM on aws-lc-rs; PQXDH; the post-quantum Double Ratchet; the sealed per-device envelope; safety numbers; sessions per device, prekey generation in the server's upload format | **done** (21 tests, clippy clean) |
-| M2 | The SQLCipher store: identity, prekeys, sessions, chats, messages, receipts; versioned migrations; FTS5 search | next |
+| M2 | The SQLCipher store: identity, prekeys, sessions, chats, messages, receipts; versioned migrations; FTS5 search | **done** (D-0137) |
 | M3 | The pipeline: key upload and refill (`PrekeysLow`), bundle fetch, device lists, `Send` with device-mismatch retries, receive → decrypt → store → `Ack`; content encode/decode with padding and franking; the status machine; receipts | |
 | M4 | App wiring: `apps/ui` stores read and write app-core for 1:1 chats; two-client end-to-end test against the in-process server | |
 | M5 | Groups: OpenMLS client over the delivery service | |

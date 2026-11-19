@@ -11,12 +11,14 @@
 //!   ([`crypto::safety`]).
 //! - [`session`]: one session per remote device, the prekey store, and encrypting and decrypting
 //!   whole envelopes.
+//! - [`store`]: the `SQLCipher` store (D-0137).
 //!
 //! No service links this crate (the server never decrypts).
 #![forbid(unsafe_code)]
 
 pub mod crypto;
 pub mod session;
+pub mod store;
 
 /// Errors the core reports. Decryption failures are deliberately coarse: which check failed is
 /// never told to a peer, and the UI shows one plain message.
@@ -43,6 +45,12 @@ pub enum Error {
     /// A one-time or signed prekey the message names is not held (used or replaced).
     #[error("unknown prekey")]
     UnknownPrekey,
+    /// The on-device store failed (no detail: it could carry content).
+    #[error("storage")]
+    Storage,
+    /// The store's key is wrong (or the file is not a Songbird store).
+    #[error("locked")]
+    Locked,
 }
 
 /// Result alias.

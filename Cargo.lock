@@ -4965,6 +4965,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "proptest",
+ "rusqlite",
  "songbird-content",
  "songbird-keys",
  "songbird-proto",
