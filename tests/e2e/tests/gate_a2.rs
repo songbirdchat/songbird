@@ -1,0 +1,520 @@
+//! A2's gate, first part (D-0138): two app-cores exchange end-to-end encrypted 1:1 messages and
+//! receipts through the real `api` and `delivery`, against the real registry (SurrealDB) and
+//! `valkey-hot`. Each side has its own `SQLCipher` store; keys, the signed device list and the
+//! account identity key go through the endpoints the app uses. Runs when the compose stack is
+//! configured, like `send_api`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::too_many_lines,
+    clippy::large_futures,
+    reason = "tests"
+)]
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair as _};
+use bytes::Bytes;
+use songbird_accounts::{Db, NewAccount, Registry};
+use songbird_api::client::ApiClient;
+use songbird_api::messages::{Messages, SendStack};
+use songbird_api::{ApiMetrics, App};
+use songbird_app_core::crypto::X25519Pair;
+use songbird_app_core::messenger::{DeviceIdBytes, Messenger, Net, Received};
+use songbird_app_core::session::Local;
+use songbird_app_core::store::{Status, Store};
+use songbird_client::{Client, ClientConfig, DeviceKey, Event, ResumeState, State};
+use songbird_delivery::{DeliveryMetrics, Directory, Shared, server};
+use songbird_e2e::{SERVER_NAME, settings, test_mailbox};
+use songbird_proto::frame::{Recipient, SendHints, SendStatus};
+use songbird_router::LocalRouter;
+use songbird_types::{AccountId, DeviceId, Secret};
+use tokio::sync::{mpsc, watch};
+
+const API: &str = "api.test";
+const SYSTEM_SEED: [u8; 32] = [0x51; 32];
+
+fn env(name: &str) -> Option<String> {
+    let v = std::env::var(name).ok();
+    assert!(
+        v.is_some() || std::env::var("SONGBIRD_REQUIRE_STACK").is_err(),
+        "SONGBIRD_REQUIRE_STACK is set but {name} is not"
+    );
+    v
+}
+
+fn random32() -> [u8; 32] {
+    let mut k = [0u8; 32];
+    aws_lc_rs::rand::fill(&mut k).unwrap();
+    k
+}
+
+/// The network for one app-core: signed `api` requests and the delivery client.
+struct TestNet {
+    api: ApiClient,
+    ws: Arc<Client>,
+}
+
+impl Net for TestNet {
+    async fn api(
+        &self,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> songbird_app_core::Result<(u16, Vec<u8>)> {
+        let has_body = method != "GET" && method != "DELETE";
+        let (authz, hash) = self
+            .api
+            .sign(method, path, has_body.then_some(body.as_slice()));
+        let mut req = hyper::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", API)
+            .header(songbird_api::auth::AUTHORIZATION, authz);
+        if let Some(h) = hash {
+            req = req.header(songbird_api::auth::CONTENT_SHA256, h);
+        }
+        let (status, b) = self
+            .api
+            .raw(req, Bytes::from(body))
+            .await
+            .map_err(|_| songbird_app_core::Error::Network)?;
+        Ok((status, b.to_vec()))
+    }
+
+    async fn send(
+        &self,
+        idempotency_key: [u8; 16],
+        hints: SendHints,
+        recipients: Vec<(DeviceIdBytes, Vec<u8>)>,
+    ) -> songbird_app_core::Result<SendStatus> {
+        let r = recipients
+            .into_iter()
+            .map(|(d, e)| Recipient {
+                device: DeviceId::from_bytes(d),
+                envelope: Bytes::from(e),
+            })
+            .collect();
+        self.ws
+            .send_hinted(idempotency_key, hints, r)
+            .await
+            .map_err(|_| songbird_app_core::Error::Network)
+    }
+}
+
+/// One person: an account with one device, its app-core and its delivery events.
+struct Person {
+    account: [u8; 16],
+    account_key: Ed25519KeyPair,
+    core: Messenger<TestNet>,
+    events: mpsc::Receiver<Event>,
+}
+
+struct Registered {
+    n: NewAccount,
+    account_key: Ed25519KeyPair,
+    auth_seed: [u8; 32],
+}
+
+async fn register(registry: &Registry) -> Registered {
+    let account_key = Ed25519KeyPair::generate().unwrap();
+    let device = DeviceId::random().unwrap();
+    let (_, auth_seed) = DeviceKey::generate(device).unwrap();
+    let auth = DeviceKey::from_seed(device, &auth_seed).unwrap();
+    let n = NewAccount {
+        account: AccountId::random().unwrap(),
+        identity: account_key.public_key().as_ref().try_into().unwrap(),
+        device,
+        auth_key: auth.public_key(),
+        allowance: 3,
+    };
+    registry.register(&n, None).await.unwrap();
+    Registered {
+        n,
+        account_key,
+        auth_seed,
+    }
+}
+
+async fn person(r: Registered, api: std::net::SocketAddr, ws: std::net::SocketAddr) -> Person {
+    let mut c = ClientConfig::new(ws.to_string(), SERVER_NAME);
+    c.backoff.initial = Duration::from_millis(20);
+    let (mut client, events) = Client::start(
+        c,
+        DeviceKey::from_seed(r.n.device, &r.auth_seed).unwrap(),
+        ResumeState::default(),
+    );
+    client.wait_for(State::Connected).await;
+    let net = TestNet {
+        api: ApiClient::new(
+            api,
+            API,
+            r.n.device,
+            Ed25519KeyPair::from_seed_unchecked(&r.auth_seed).unwrap(),
+        ),
+        ws: Arc::new(client),
+    };
+    let local = Local {
+        account: *r.n.account.as_bytes(),
+        device: *r.n.device.as_bytes(),
+        identity: X25519Pair::generate().unwrap(),
+    };
+    let store = Store::memory(&random32()).unwrap();
+    let mut core =
+        Messenger::create(store, net, local, Some(songbird_send_system_public())).unwrap();
+    core.publish_keys(true).await.unwrap();
+    core.publish_device_list(&r.account_key, |_, _| false)
+        .await
+        .unwrap();
+    // Every app publishes a profile with its access key at registration (PROTOCOL §5.10).
+    core.publish_profile(&songbird_content::profile::ProfilePlain::default(), false)
+        .await
+        .unwrap();
+    Person {
+        account: *r.n.account.as_bytes(),
+        account_key: r.account_key,
+        core,
+        events,
+    }
+}
+
+fn songbird_send_system_public() -> [u8; 32] {
+    Ed25519KeyPair::from_seed_unchecked(&SYSTEM_SEED)
+        .unwrap()
+        .public_key()
+        .as_ref()
+        .try_into()
+        .unwrap()
+}
+
+/// Delivers the next envelope to `p`'s app-core, then acknowledges it.
+async fn pump(p: &mut Person) -> Received {
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), p.events.recv())
+            .await
+            .expect("an event within 10 s")
+            .expect("events open");
+        if let Event::Deliver { seq, envelope } = ev {
+            let r = p.core.receive(&envelope).await.unwrap();
+            p.core.net().ws.ack(seq).await.unwrap();
+            return r;
+        }
+    }
+}
+
+async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
+    let surreal = env("SONGBIRD_TEST_SURREALDB")?;
+    let hot = env("SONGBIRD_TEST_VALKEY")?;
+    let db = Db::connect(songbird_surreal::Config {
+        addr: surreal,
+        host: "localhost".into(),
+        tls: None,
+        user: std::env::var("SONGBIRD_TEST_SURREALDB_USER").unwrap_or_else(|_| "root".into()),
+        pass: std::env::var("SONGBIRD_TEST_SURREALDB_PASS").unwrap(),
+        namespace: "test".into(),
+        database: format!("gatea2_{}", DeviceId::random().unwrap().to_hex_unredacted()),
+        timeout: Duration::from_secs(30),
+        max_message_bytes: 16 << 20,
+    })
+    .await
+    .unwrap();
+    let registry = Arc::new(Registry::connect(db).await.unwrap());
+    let (alice, bob) = (register(&registry).await, register(&registry).await);
+    // The production send policy: franking stamps and the contact gate (requests, access keys).
+    let secret = random32();
+    let limits = songbird_send::RequestLimits::default();
+    let gate: Arc<dyn songbird_send::Gate> = Arc::new(songbird_send::RegistryGate::new(
+        Arc::clone(&registry),
+        songbird_valkey::ValkeyConn::connect(redis::Client::open(hot.as_str()).unwrap())
+            .await
+            .unwrap(),
+        songbird_send::GateKeys::from_cluster_secret(&random32()).unwrap(),
+        limits,
+    ));
+    let policy = || songbird_send::Policy {
+        franking: Some(songbird_send::Franker::from_secret(&secret).unwrap()),
+        gate: Some(Arc::clone(&gate)),
+        max_broadcast_accounts: limits.max_broadcast_accounts,
+        rosters: None,
+        channels: Arc::default(),
+        standings: None,
+    };
+
+    let mailbox = Arc::new(test_mailbox().await);
+    let router = Arc::new(LocalRouter::new());
+    let mut cfg = settings();
+    cfg.listen = "127.0.0.1:0".parse().unwrap();
+    let listener = tokio::net::TcpListener::bind(cfg.listen).await.unwrap();
+    let ws_addr = listener.local_addr().unwrap();
+    let shared = Arc::new(
+        Shared::new(
+            cfg,
+            Directory::from_registry(&registry).await.unwrap(),
+            Arc::clone(&mailbox),
+            Arc::clone(&router),
+            DeliveryMetrics::default(),
+        )
+        .with_policy(policy()),
+    );
+    let (stop, stop_rx) = watch::channel(false);
+    tokio::spawn(server::serve(
+        listener,
+        None,
+        Arc::clone(&shared),
+        stop_rx.clone(),
+    ));
+    // Profiles (access keys) reach the directory snapshot as a deployment's do.
+    tokio::spawn(songbird_delivery::directory::follow_registry(
+        Arc::clone(&registry),
+        Arc::clone(&shared.directory),
+        Arc::clone(&shared.generation),
+        registry.directory_version().await.unwrap(),
+        Duration::from_millis(50),
+        stop_rx.clone(),
+    ));
+
+    let metrics = ApiMetrics::default();
+    let (push, _pushes) = songbird_send::Pusher::new(metrics.push.clone());
+    let hot_client = redis::Client::open(hot.as_str()).unwrap();
+    let messages = Messages {
+        path: Box::new(SendStack {
+            directory: Arc::clone(&shared.directory),
+            mailbox: Arc::clone(&mailbox),
+            router: Arc::clone(&router),
+            push,
+            metrics: metrics.send.clone(),
+            policy: policy(),
+        }),
+        limits: songbird_proto::Limits::DEFAULT,
+        sends_per_sec: 50,
+        send_burst: 200,
+        group_sends_per_sec: 50,
+        group_send_burst: 200,
+        rate_key: songbird_api::messages::rate_key(&random32()).unwrap(),
+        metrics: metrics.send.clone(),
+        groups: None,
+    };
+    let app = Arc::new(App {
+        plans: songbird_api::plans::Plans::default(),
+        requests: None,
+        reports: None,
+        support: None,
+        calls: None,
+        server_name: API.into(),
+        push_store: Arc::new(
+            songbird_accounts::PushStore::beside(&registry)
+                .await
+                .unwrap(),
+        ),
+        registry: Arc::clone(&registry),
+        s3: songbird_s3::Client::new(songbird_s3::Config::new(
+            "127.0.0.1:9".into(),
+            "unused".into(),
+            Secret::new("unused".into()),
+            Secret::new("unused-secret".into()),
+        ))
+        .unwrap(),
+        queue: Arc::new(
+            songbird_jobs::Queue::connect(
+                hot_client.clone(),
+                &[3; 32],
+                songbird_jobs::QueueConfig::new(format!(
+                    "gate-a2-{}",
+                    &hex::encode(random32())[..8]
+                )),
+            )
+            .await
+            .unwrap(),
+        ),
+        hot: songbird_valkey::ValkeyConn::connect(hot_client)
+            .await
+            .unwrap(),
+        push_public: [0; 32],
+        push_index_secret: [9; 32],
+        limits: songbird_api::config::AttachmentLimits::default(),
+        media: None,
+        metrics,
+        messages: Some(messages),
+        registration: None,
+        usernames: None,
+        keys: Some(
+            songbird_api::keys::KeyDirectory::new(
+                songbird_api::config::KeySettings {
+                    secret: songbird_types::SecretRef::Env("UNUSED".into()),
+                    system_key: None,
+                    max_stored: 200,
+                    refill_below: 10,
+                    throttle: songbird_api::config::KeyThrottle::default(),
+                    devices: songbird_api::config::DeviceSettings::default(),
+                },
+                &random32(),
+                Some(&SYSTEM_SEED),
+                songbird_api::keys::KeyMetrics::default(),
+            )
+            .unwrap(),
+        ),
+        storage: None,
+        vault: None,
+        kt: None,
+        profiles: Some(
+            songbird_api::profiles::Profiles::new(
+                songbird_api::config::ProfileSettings {
+                    secret: songbird_types::SecretRef::Env("UNUSED".into()),
+                    certificate_key: None,
+                    sealed_sender: false,
+                    certificate_hours: 24,
+                    fetches_per_hour: 600,
+                    fetch_burst: 120,
+                    sealed_per_hour: 3_600,
+                    sealed_per_account_hour: 3_600,
+                    sealed_burst: 200,
+                    presence_per_hour: 1_000_000,
+                    presence_burst: 20_000,
+                    policy_updates_per_hour: 120,
+                    policy_update_burst: 20,
+                    ipv4_prefix: 24,
+                    ipv6_prefix: 48,
+                },
+                &random32(),
+                None,
+                songbird_api::profiles::ProfileMetrics::default(),
+            )
+            .unwrap(),
+        ),
+        devices: Some(
+            songbird_api::devices::Devices::new(
+                songbird_api::config::DeviceSettings::default(),
+                &songbird_api::config::KeyThrottle::default(),
+                &random32(),
+                Some(&SYSTEM_SEED),
+                songbird_api::devices::DeviceMetrics::default(),
+            )
+            .unwrap(),
+        ),
+    });
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = api_listener.local_addr().unwrap();
+    tokio::spawn(songbird_api::server::serve(
+        api_listener,
+        None,
+        Arc::clone(&app),
+        64,
+        stop_rx,
+    ));
+    let alice = person(alice, api_addr, ws_addr).await;
+    let bob = person(bob, api_addr, ws_addr).await;
+    // Let the directory follower see both profiles.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    Some((app, alice, bob, stop))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_app_cores_exchange_messages_and_receipts_end_to_end() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    let _ = &alice.account_key;
+    // Alice writes first, as a message request (she has no access key of Bob's): she resolves
+    // Bob's identity and signed list, fetches his bundle, starts a session (PQXDH) and sends,
+    // franked; the server stamps and accepts it (one tick).
+    let id = alice
+        .core
+        .send_text(&bob.account, "Hello Bob, this is end-to-end")
+        .await
+        .unwrap();
+    let mine = alice
+        .core
+        .store
+        .message(&alice.account, &id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(mine.status, Status::Sent);
+
+    // Bob receives, decrypts, stores; his app-core sends a delivery receipt back.
+    let Received::Message(m) = pump(&mut bob).await else {
+        panic!("a message")
+    };
+    assert_eq!(m.text, "Hello Bob, this is end-to-end");
+    assert_eq!((m.chat, m.author, m.id), (alice.account, alice.account, id));
+    assert_eq!(bob.core.store.chats().unwrap()[0].unread, 1);
+
+    // Alice gets the receipt: two ticks.
+    assert_eq!(
+        pump(&mut alice).await,
+        Received::Status {
+            id,
+            status: Status::Delivered
+        }
+    );
+
+    // Bob reads the chat: a read receipt.
+    bob.core.mark_read(&alice.account).await.unwrap();
+    assert_eq!(
+        pump(&mut alice).await,
+        Received::Status {
+            id,
+            status: Status::Read
+        }
+    );
+    assert_eq!(
+        alice
+            .core
+            .store
+            .message(&alice.account, &id)
+            .unwrap()
+            .unwrap()
+            .status,
+        Status::Read
+    );
+
+    // Bob answers on the session Alice started (replying shares his profile key, accepting the
+    // request); from then on both send as contacts, with each other's access key.
+    for i in 0..3 {
+        let b = bob
+            .core
+            .send_text(&alice.account, &format!("reply {i}"))
+            .await
+            .unwrap();
+        let Received::Message(m) = pump(&mut alice).await else {
+            panic!("a reply")
+        };
+        assert_eq!((m.id, m.text.as_str()), (b, format!("reply {i}").as_str()));
+        assert!(matches!(
+            pump(&mut bob).await,
+            Received::Status {
+                status: Status::Delivered,
+                ..
+            }
+        ));
+        let a = alice
+            .core
+            .send_text(&bob.account, &format!("again {i}"))
+            .await
+            .unwrap();
+        let Received::Message(m) = pump(&mut bob).await else {
+            panic!("a message")
+        };
+        assert_eq!(m.id, a);
+        assert!(matches!(
+            pump(&mut alice).await,
+            Received::Status {
+                status: Status::Delivered,
+                ..
+            }
+        ));
+    }
+    // Search runs over the encrypted store.
+    assert_eq!(bob.core.store.search("end-to-end", 10).unwrap().len(), 1);
+    assert_eq!(
+        alice
+            .core
+            .store
+            .messages(&bob.account, None, 50)
+            .unwrap()
+            .len(),
+        7
+    );
+}

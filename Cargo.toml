@@ -83,6 +83,7 @@ songbird-backup-format = { path = "crates/backup-format" }
 songbird-backup-storage = { path = "crates/backup-storage" }
 songbird-entitlements = { path = "crates/entitlements" }
 songbird-tokens = { path = "crates/tokens" }
+songbird-app-core = { path = "crates/app-core" }
 songbird-calls = { path = "services/calls" }
 
 anyhow = "1.0.104"

@@ -43,6 +43,7 @@ zeroize.workspace = true
 songbird-send.workspace = true
 songbird-keys.workspace = true
 songbird-content.workspace = true
+songbird-app-core.workspace = true
 hyper.workspace = true
 songbird-worker = { path = "../../services/worker" }
 # A stand-in for delivery's device link in the Prompt 6 gate.

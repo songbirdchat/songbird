@@ -199,6 +199,47 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0138 — A2 app-core, milestone 3: the message pipeline; `POST /v1/devices/identity`
+
+- Date: 2026-11-19
+- Status: proposed (waiting for the owner, with the A2 report)
+- Decided by: agent (owner's request: fill the backend gaps the app needs)
+- Context: a client must verify a contact's signed device list (PROTOCOL §4.6) before encrypting
+  to their devices, which needs the account identity key that signs it. No endpoint served it:
+  the server stored it (registration) but only the account's own devices and recovery used it.
+  A backend gap, found while wiring app-core.
+- Options considered: put the key inside the device-list answer (changes a format clients
+  already parse); learn it in-band from links and QR codes only (a username lookup would then
+  give no way to verify a list); a separate endpoint (chosen).
+- Evidence: `tests/e2e/tests/gate_a2.rs` against SurrealDB and `valkey-hot`, the real `api` and
+  `delivery` with the production send policy (franking key, contact gate): two app-cores with
+  their own SQLCipher stores publish keys, signed device lists and profiles; Alice's first
+  message goes as a franked request through PQXDH; Bob decrypts, checks the franking stamp,
+  stores it, and sends a delivery receipt; a read receipt follows; Bob's reply accepts the request
+  and both then send as contacts with each other's access key; six more messages both ways;
+  search finds the first over the encrypted store. `cargo clippy -D warnings` clean for
+  `songbird-app-core`, `songbird-api` and the test.
+- Decision:
+  1. `POST /v1/devices/identity` `{"account"}` → `{"identity_key"}`, signed like every device
+     request, on the list-fetch budget. The key is public and already on the threat model's list;
+     clients pin it on first sight and prove it with a KT lookup (§4.9). A changed key is refused
+     (`IdentityChanged`) until the user accepts it.
+  2. `songbird_app_core::messenger`: the pipeline behind a `Net` trait (signed `api` requests and
+     `Send`), so the app and the tests share it. Sends: sealed content with a franking key, stored
+     as `Sending` with its idempotency key in the outbox before any network; the verified device
+     list; sessions from fetched bundles whose identity must equal the list's; `ACCESS` with the
+     contact's access key, else `REQUEST`; device mismatches refresh the list and retry with the
+     same key; retryable rejections stay in the outbox; a `SentTranscript` to the account's own
+     devices. Receives: franking stamp split and checked (an unfranked or mismatched visible
+     message from another account is dropped), system frames verified with the pinned system
+     key (`PrekeysLow` refills, `DeviceListChanged` refreshes), the sender's identity from their
+     verified list, everything stored before the caller acknowledges.
+  3. Writing to someone shares this account's profile key with them (a request is an invitation
+     to talk; a reply accepts theirs, §5.10); receipts and sync messages never carry it.
+- Consequences: the app's screens still read the mock store until M4 wires them to app-core.
+  KT proofs of the pinned key (`akd_core` verifiers on the device) are not yet checked: TOFU
+  until then, with the identity-change warning.
+
 ## D-0137 — A2 app-core, milestone 2: the SQLCipher store
 
 - Date: 2026-11-19

@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 pub mod crypto;
+pub mod messenger;
 pub mod session;
 pub mod store;
 
@@ -51,6 +52,15 @@ pub enum Error {
     /// The store's key is wrong (or the file is not a Songbird store).
     #[error("locked")]
     Locked,
+    /// The server answered an unexpected status.
+    #[error("server status {0}")]
+    Server(u16),
+    /// An account's identity key differs from the one pinned: the user must accept the change.
+    #[error("identity changed")]
+    IdentityChanged,
+    /// The network failed (retry later).
+    #[error("network")]
+    Network,
 }
 
 /// Result alias.

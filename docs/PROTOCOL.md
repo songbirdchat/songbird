@@ -623,6 +623,7 @@ link, and invites answer 403 `{"error": "pending"}` (lookups and reading links a
 | `GET /v1/devices` | none | 200 `{"devices": [{"device", "auth_key", "identity_key", "primary", "pending", "confirm"}], "list_version"}` |
 | `PUT /v1/devices/list` | list | 204; 400 `{"error": "list" \| "account" \| "limit" \| "signature"}`; 409 `{"error": "version" \| "devices" \| "identity"}` |
 | `POST /v1/devices/list/fetch` | `{"account": hex}` | 200 list; 404 (none stored); 429 |
+| `POST /v1/devices/identity` | `{"account": hex}` | 200 `{"identity_key": hex}` (the account identity key that signs the list; prove it with a KT lookup, §4.9; A2, D-0138); 404; 429 (the list-fetch budget) |
 | `DELETE /v1/devices/self` | none | 204; 409 `{"error": "primary"}` |
 
 Throttles (defaults), all as GCRA records in `valkey-hot` under keyed hashes:

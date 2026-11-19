@@ -1569,6 +1569,12 @@ impl App {
                 d.fetch_list(&self.registry, &self.hot, &account, &body)
                     .await
             }
+            (&Method::POST, "/v1/devices/identity", None) => {
+                let (device, body) = self.authenticate_json(req).await?;
+                let account = account_of(device).await?;
+                d.fetch_identity(&self.registry, &self.hot, &account, &body)
+                    .await
+            }
             (&Method::DELETE, "/v1/devices/self", None) => {
                 let (device, _) = self.authenticate_json(req).await?;
                 d.remove_self(&self.registry, &self.queue, self.messages.as_ref(), &device)

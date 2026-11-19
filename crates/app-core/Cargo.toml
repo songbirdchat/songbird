@@ -13,6 +13,9 @@ songbird-content.workspace = true
 songbird-proto.workspace = true
 aws-lc-rs.workspace = true
 rusqlite.workspace = true
+bytes.workspace = true
+prost.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 
