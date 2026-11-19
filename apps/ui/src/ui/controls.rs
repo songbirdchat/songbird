@@ -961,3 +961,19 @@ pub fn toast_layer() -> View {
                 ),
         )
 }
+
+/// Hands `text` to the system's share sheet (iOS, Android, macOS; NSH
+/// `share`). Where the platform has none (Windows, Linux), it is copied
+/// instead and the toast says so.
+pub fn share_text(text: impl Into<String>) {
+    let text = text.into();
+    Owner::detached().run(|| {
+        spawn(async move {
+            let request = nsh_core::share::ShareRequest::new().text(text.clone());
+            if !matches!(nsh_core::prelude::share(request).await, Ok(_)) {
+                set_clipboard(text);
+                toast("Copied. Paste it into any app to share it.");
+            }
+        })
+    });
+}

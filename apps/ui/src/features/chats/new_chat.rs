@@ -61,7 +61,6 @@ fn body() -> impl IntoElement {
             .with(|cs| s.contacts.with(|ct| model::contacts_az(cs, ct, &q)))
     });
     let browsing = move || query.with(|q| q.trim().is_empty());
-    let username = s.me.with_untracked(|m| m.username.clone());
     view()
         .flex_1()
         .child(
@@ -83,7 +82,6 @@ fn body() -> impl IntoElement {
             .header(
                 view()
                     .child(when(browsing, move || {
-                        let username = username.clone();
                         view()
                             .child(action(
                                 Icon::Users,
@@ -99,12 +97,11 @@ fn body() -> impl IntoElement {
                                 "New broadcast list",
                                 open_broadcast,
                             ))
-                            .child(action(Icon::Share, "Invite a friend", move || {
-                                // mock: app-core makes a one-time invite
-                                // (A10 invites); the link format is final.
-                                set_clipboard(format!("https://songbird.chat/invite/{username}"));
-                                toast("Invite link copied. Share it with a friend.");
-                            }))
+                            .child(action(
+                                Icon::Share,
+                                "Invite a friend",
+                                features::plans::invites::invite_friend,
+                            ))
                             .child(action(Icon::QrCode, "Scan QR code", open_scan))
                             .child(action(
                                 Icon::Contact,

@@ -479,13 +479,10 @@ impl Store {
         });
     }
 
-    /// Mock: a fresh invite link to share (app-core `create_invite`).
+    /// This account's personal invite link (PROTOCOL §14.10): its card in the
+    /// fragment, which no server sees. Empty before registration.
     pub fn invite_link(&self) -> String {
-        let me = self.me.with_untracked(|m| m.username.clone());
-        format!(
-            "https://songbird.chat/i/{:x}",
-            hash(&format!("invite-{me}")) & 0xffff_ffff
-        )
+        crate::backend::plans::my_invite_link().unwrap_or_default()
     }
 
     /// Mock: a new username link; the old one stops working.

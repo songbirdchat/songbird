@@ -5,7 +5,7 @@
 
 pub mod catalog;
 mod help;
-mod invites;
+pub(crate) mod invites;
 mod standing;
 
 use nsh_core::prelude::*;
