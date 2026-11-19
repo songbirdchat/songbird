@@ -199,6 +199,72 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0151 — Calls, part 2: call media on LiveKit's Rust SDK, end-to-end encrypted
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner); the SDK is the owner's choice (2026-11-20: "LiveKit
+  Rust SDK")
+- Decided by: owner (SDK); agent (the rest)
+- Context: part 1 (D-0150) gives each device a ticket and per-sender keys; something must carry
+  audio and video through the SFU with every frame encrypted under those keys, on macOS, iOS,
+  Android, Linux and Windows.
+- Decision (`apps/calls-media`, its own Cargo workspace so libwebrtc never enters the server's
+  build):
+  1. **`livekit` =0.12.0** over LiveKit's prebuilt **libwebrtc**, release `webrtc-a545de4`.
+     The SDK's build script would download it unverified, so `scripts/fetch-libwebrtc.sh`
+     fetches it, checks it against the SHA-256 pinned in `supply-chain/libwebrtc.sha256` (six
+     platforms, as GitHub recorded them at upload; macOS also checked by download) and hands it
+     to the build as `LK_CUSTOM_WEBRTC`. Apple targets link with `-ObjC`
+     (`apps/calls-media/.cargo/config.toml`; every binary linking the crate needs it), or
+     libwebrtc's Objective-C codec factories are dropped and the process aborts at start.
+  2. **Keys.** A `KeyProvider` per call, never shared-key mode: each identity's key comes from a
+     `KeySource` (app-core's `one_to_one_key` or `Messenger::group_call_key`) and is installed
+     for this device before connecting, for everyone already in the room on joining, and for
+     each newcomer when it connects, before its tracks are subscribed. `install_epoch` puts a new
+     epoch's keys in the ring for everyone at once; `send_with` moves this device's senders to
+     the new index (the app calls it a second later, §8.2). A (re)published track is put on the
+     current index at once (LiveKit starts every sender at 0).
+  3. **LiveKit's ratchet is off** (`ratchet_window_size = 0`): keys change only with epochs; a
+     ratcheted key is one no epoch secret produced. Frame keys are derived from sender keys with
+     LiveKit's default PBKDF2 and salt, so the web app interoperates.
+  4. **"Can't decrypt" is reported** (§8.3): with LiveKit's default tolerance (-1) a failing
+     frame is dropped silently; with 25 failed frames it reports the participant and marks the
+     key invalid. The room then installs the participant's current key again, so a burst of bad
+     frames never leaves a good key unused while a wrong key stays reported. Each change of
+     state is reported once.
+  5. **TLS on aws-lc-rs.** LiveKit's `rustls-tls-webpki-roots` feature turns on rustls's `ring`
+     provider; instead the crate takes `__rustls-tls` and asks tokio-tungstenite and reqwest for
+     Mozilla's roots directly, compiles rustls with aws-lc-rs only, and installs it as the
+     process default before connecting (reqwest without a provider needs one). `ring` and
+     `openssl-probe` are no longer in the shipped tree (`ring` remains only in `webrtc-sys-build`,
+     a build dependency that downloads nothing when `LK_CUSTOM_WEBRTC` is set). No OpenSSL
+     anywhere.
+  6. **Media:** the microphone and speaker through WebRTC's platform audio device module;
+     camera frames pushed by the app as I420 (VP8, simulcast); remote audio as PCM streams and
+     remote video as RGBA frames for the app's canvas (libyuv's `ABGR`, which is the bytes R, G,
+     B, A).
+- What is not ours to choose: the frame cryptor (AES-GCM) and DTLS-SRTP run on the BoringSSL
+  built into libwebrtc, not on aws-lc-rs (aws-lc descends from BoringSSL). Sender keys cross into
+  it as a `Vec` LiveKit's API takes by value, which is dropped without being wiped; the key
+  schedule's own copies are `Zeroizing`.
+- Licences: `zlib-rs` (Zlib), flate2's backend that LiveKit selects, gets a `deny.toml`
+  exception; libwebrtc's own `LICENSE.md` (BSD-3-Clause and its third-party notices) goes on
+  the app's licences page with it.
+- Evidence (`apps/calls-media/tests/media.rs`, against the compose LiveKit with rooms created as
+  the `calls` service creates them, keys from `songbird_content::call`):
+  - `audio_and_video_cross_encrypted`: B hears A's tone and sees A's grey frames; A's frames
+    decrypt.
+  - `a_wrong_key_is_never_played`: a participant under another secret is reported as failing
+    to decrypt, and nothing of it is heard.
+  - `a_new_epoch_locks_out_old_keys`: after a group epoch change, the members who installed it
+    still hear the sender at the new index; a removed device that kept the old epoch's keys is
+    reported failing and hears nothing.
+  - `tls_runs_on_aws_lc_rs` (unit). Clippy with the workspace's lints is clean; `cargo deny`
+    passes licences, bans and sources for the crate.
+- Consequences: the app's call screens are wired to this crate next (signalling from app-core,
+  media from here). Camera capture needs each platform's camera host (desktop through NSH's
+  camera, mobile through the native hosts, D-0117); until then a call can be audio-only.
+
 ## D-0150 — Calls, part 1: tickets, encrypted signalling and the key schedule
 
 - Date: 2026-11-20

@@ -41,6 +41,9 @@ exceptions = [
     # D-0117: the camera's pure-Rust JPEG encoder for desktop stills; its acknowledgement is on
     # the app's licences page.
     { allow = ["IJG"], crate = "jpeg-encoder" },
+    # D-0151: flate2's pure-Rust zlib backend, which LiveKit's SDK selects (call media,
+    # apps/calls-media); acknowledged on the app's licences page.
+    { allow = ["Zlib"], crate = "zlib-rs" },
 ]
 
 [licenses.private]

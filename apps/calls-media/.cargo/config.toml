@@ -1,0 +1,5 @@
+# libwebrtc's Objective-C code (codec factories, audio session) lives in categories inside a
+# static library; Apple's linker drops them unless told to load every Objective-C member.
+# Every binary linking this crate on Apple platforms needs the same flag (apps/ui too).
+[target.'cfg(target_vendor = "apple")']
+rustflags = ["-C", "link-arg=-ObjC"]

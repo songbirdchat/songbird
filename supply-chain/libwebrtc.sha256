@@ -1,0 +1,10 @@
+# libwebrtc prebuilt by LiveKit for the `livekit` Rust SDK (D-0151), release `webrtc-a545de4`
+# (the tag `webrtc-sys-build` 0.3.21 names). SHA-256 as GitHub recorded each asset at upload
+# (`gh api repos/livekit/rust-sdks/releases/tags/webrtc-a545de4`); the macOS one was also checked
+# by download on 2026-11-20. `scripts/fetch-libwebrtc.sh` refuses anything else.
+153a1f1a268b812b4a501deda6505037f29481691efec52be817f560ff09e206  webrtc-mac-arm64-release.zip
+a4297461202fabb4d024809a8f958068e0779e2df2502021032c37c5d86428a3  webrtc-ios-device-arm64-release.zip
+3a1e245f9aeb176c451b6f6a654e74b3d4ad7db3ee6e43d5ade1df077d8d240a  webrtc-ios-simulator-arm64-release.zip
+1e481a9bf70bf885464844e9ff53a5e62ca84619fe5ddf48531ddf3f5b5b68f3  webrtc-android-arm64-release.zip
+2ece73b9a72a2cacd73d0c62ac3a414e202f37885c3c8f49dddb43c1443ac0bd  webrtc-linux-x64-release.zip
+862403fcb248c7d8803487e4c22b8821c6130e89100cb9c69be95ef45ff46146  webrtc-win-x64-release.zip
