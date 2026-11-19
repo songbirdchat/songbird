@@ -55,6 +55,7 @@ fn random32() -> [u8; 32] {
 /// The network for one app-core: signed `api` requests and the delivery client.
 struct TestNet {
     api: ApiClient,
+    addr: std::net::SocketAddr,
     ws: Arc<Client>,
 }
 
@@ -83,6 +84,40 @@ impl Net for TestNet {
             .await
             .map_err(|_| songbird_app_core::Error::Network)?;
         Ok((status, b.to_vec()))
+    }
+
+    async fn upload(
+        &self,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> songbird_app_core::Result<(u16, Vec<u8>)> {
+        let len = body.len().to_string();
+        let (status, _, b) = self
+            .api
+            .upload_with(method, path, &[("content-length", len)], Bytes::from(body))
+            .await
+            .map_err(|_| songbird_app_core::Error::Network)?;
+        Ok((status, b.to_vec()))
+    }
+
+    async fn fetch(&self, path: &str) -> songbird_app_core::Result<(u16, Vec<u8>, Option<String>)> {
+        let (status, headers, body) =
+            songbird_api::client::unsigned_full(self.addr, API, "GET", path, &[])
+                .await
+                .map_err(|_| songbird_app_core::Error::Network)?;
+        let location = headers
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        Ok((status, body.to_vec(), location))
+    }
+
+    async fn fetch_post(&self, path: &str) -> songbird_app_core::Result<u16> {
+        songbird_api::client::unsigned_body(self.addr, API, "POST", path, &[], Bytes::new())
+            .await
+            .map(|(s, _)| s)
+            .map_err(|_| songbird_app_core::Error::Network)
     }
 
     async fn send(
@@ -149,6 +184,7 @@ async fn person(r: Registered, api: std::net::SocketAddr, ws: std::net::SocketAd
     );
     client.wait_for(State::Connected).await;
     let net = TestNet {
+        addr: api,
         api: ApiClient::new(
             api,
             API,
@@ -208,6 +244,15 @@ async fn pump(p: &mut Person) -> Received {
 async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
     let surreal = env("SONGBIRD_TEST_SURREALDB")?;
     let hot = env("SONGBIRD_TEST_VALKEY")?;
+    let s3_addr = env("SONGBIRD_TEST_RUSTFS")?;
+    let s3 = songbird_s3::Client::new(songbird_s3::Config::new(
+        s3_addr,
+        format!("gatea2-{}", &hex::encode(random32())[..12]),
+        Secret::new(env("SONGBIRD_TEST_RUSTFS_ACCESS_KEY")?),
+        Secret::new(env("SONGBIRD_TEST_RUSTFS_SECRET_KEY")?),
+    ))
+    .unwrap();
+    s3.create_bucket().await.unwrap();
     let db = Db::connect(songbird_surreal::Config {
         addr: surreal,
         host: "localhost".into(),
@@ -310,13 +355,7 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
                 .unwrap(),
         ),
         registry: Arc::clone(&registry),
-        s3: songbird_s3::Client::new(songbird_s3::Config::new(
-            "127.0.0.1:9".into(),
-            "unused".into(),
-            Secret::new("unused".into()),
-            Secret::new("unused-secret".into()),
-        ))
-        .unwrap(),
+        s3,
         queue: Arc::new(
             songbird_jobs::Queue::connect(
                 hot_client.clone(),
@@ -335,7 +374,19 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
         push_public: [0; 32],
         push_index_secret: [9; 32],
         limits: songbird_api::config::AttachmentLimits::default(),
-        media: None,
+        media: Some(songbird_api::media::Media::new(
+            songbird_api::config::MediaBudgets {
+                grants_per_hour: 10_000,
+                grant_burst: 1_000,
+                bytes_per_day: 1 << 34,
+            },
+            songbird_api::config::MediaDownloads {
+                per_hour: 100_000,
+                burst: 10_000,
+                ..songbird_api::config::MediaDownloads::default()
+            },
+            &random32(),
+        )),
         metrics,
         messages: Some(messages),
         registration: None,
@@ -516,5 +567,56 @@ async fn two_app_cores_exchange_messages_and_receipts_end_to_end() {
             .unwrap()
             .len(),
         7
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_photo_goes_encrypted_and_arrives_verified() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    // A file larger than one 64 KiB chunk, so the stream crosses chunks.
+    let photo: Vec<u8> = (0..300_000u32)
+        .map(|i| u8::try_from(i % 241).unwrap())
+        .collect();
+    let meta = songbird_app_core::attachments::FileMeta {
+        content_type: "image/jpeg".into(),
+        file_name: "IMG_0001.jpg".into(),
+        width: 1200,
+        height: 900,
+        ..Default::default()
+    };
+    let id = alice
+        .core
+        .send_files(&bob.account, vec![(photo.clone(), meta)], "")
+        .await
+        .unwrap();
+    let Received::Message(m) = pump(&mut bob).await else {
+        panic!("a message")
+    };
+    assert_eq!((m.id, m.text.as_str()), (id, "Photo"));
+    // Bob's app-core reads the pointer from the stored content and downloads the object.
+    let content =
+        <songbird_content::schema::Content as prost::Message>::decode(m.content.as_slice())
+            .unwrap();
+    let Some(songbird_content::schema::content::Body::Data(d)) = content.body else {
+        panic!("data")
+    };
+    let Some(songbird_content::schema::data_message::Kind::Message(msg)) = d.kind else {
+        panic!("message")
+    };
+    let pointer = &msg.attachments[0];
+    assert_eq!(pointer.size, 300_000);
+    let got = songbird_app_core::attachments::download(bob.core.net(), pointer)
+        .await
+        .unwrap();
+    assert_eq!(&*got, &photo);
+    // A changed digest is refused before any byte is trusted.
+    let mut forged = pointer.clone();
+    forged.digest[0] ^= 1;
+    assert!(
+        songbird_app_core::attachments::download(bob.core.net(), &forged)
+            .await
+            .is_err()
     );
 }

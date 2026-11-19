@@ -16,6 +16,7 @@
 //! No service links this crate (the server never decrypts).
 #![forbid(unsafe_code)]
 
+pub mod attachments;
 pub mod blob;
 pub mod crypto;
 pub mod messenger;

@@ -62,6 +62,14 @@ const LIST_CONTEXT: &[u8] = b"songbird.v1/device-list\0";
 pub trait Net {
     /// A signed `api` request: the status and body.
     async fn api(&self, method: &str, path: &str, body: Vec<u8>) -> Result<(u16, Vec<u8>)>;
+    /// A signed `api` request whose body is not covered by the signature (attachment uploads:
+    /// the client's own ciphertext, held only to its length, PROTOCOL §7.2).
+    async fn upload(&self, method: &str, path: &str, body: Vec<u8>) -> Result<(u16, Vec<u8>)>;
+    /// An unsigned `GET` of an `api` path or a URL the api gave (downloads carry no account,
+    /// §7.3): the status, body and any `Location`.
+    async fn fetch(&self, path_or_url: &str) -> Result<(u16, Vec<u8>, Option<String>)>;
+    /// An unsigned `POST` with no body (a download's confirmation).
+    async fn fetch_post(&self, path: &str) -> Result<u16>;
     /// A `Send` over the delivery connection (or `PUT /v1/messages`).
     async fn send(
         &self,
@@ -523,6 +531,50 @@ impl<N: Net> Messenger<N> {
         self.send_data(to, data, text).await
     }
 
+    /// Sends files (photos, documents, voice notes) to a 1:1 chat: each encrypted on this device,
+    /// uploaded for every recipient device and this account's other devices, and named by
+    /// pointers inside the encrypted message (D-0141). Answers the message ID.
+    pub async fn send_files(
+        &mut self,
+        to: &[u8; 16],
+        files: Vec<(Vec<u8>, crate::attachments::FileMeta)>,
+        text: &str,
+    ) -> Result<[u8; 16]> {
+        let theirs = self.devices_of(to, false).await?.len();
+        let me = self.local.account;
+        let mine = self.store.devices(&me)?.len().saturating_sub(1);
+        let mut pointers = Vec::with_capacity(files.len());
+        let mut preview = String::new();
+        for (bytes, meta) in &files {
+            let (mut p, ct) = crate::attachments::encrypt(bytes, meta)?;
+            let id = crate::attachments::upload(&self.net, &ct, theirs + mine).await?;
+            p.object_id = id.to_vec();
+            p.uploaded_at_ms = now_ms();
+            if preview.is_empty() {
+                preview = attachment_label(&p);
+            }
+            pointers.push(p);
+        }
+        let message = schema::Message {
+            text: (!text.is_empty()).then(|| Text {
+                body: text.into(),
+                spans: Vec::new(),
+            }),
+            attachments: pointers,
+            ..Default::default()
+        };
+        let data = DataMessage {
+            kind: Some(data_message::Kind::Message(message)),
+            ..Default::default()
+        };
+        let shown = if text.is_empty() {
+            preview
+        } else {
+            text.to_owned()
+        };
+        self.send_data(to, data, &shown).await
+    }
+
     /// Sends a visible message (franked) to a 1:1 chat.
     pub async fn send_data(
         &mut self,
@@ -909,6 +961,28 @@ impl<N: Net> Messenger<N> {
     }
 }
 
+/// How an attachment reads in a list ("Photo", "Voice message", the file's name).
+#[must_use]
+pub fn attachment_label(p: &schema::AttachmentPointer) -> String {
+    if p.flags & 1 != 0 {
+        "Voice message".into()
+    } else if p.content_type.starts_with("image/") {
+        if p.flags & 4 != 0 {
+            "GIF".into()
+        } else {
+            "Photo".into()
+        }
+    } else if p.content_type.starts_with("video/") {
+        "Video".into()
+    } else if p.content_type.starts_with("audio/") {
+        "Audio".into()
+    } else if p.file_name.is_empty() {
+        "File".into()
+    } else {
+        p.file_name.clone()
+    }
+}
+
 fn data_row(
     content: &Content,
     data: &DataMessage,
@@ -922,9 +996,13 @@ fn data_row(
         .try_into()
         .map_err(|_| Error::Malformed)?;
     let text = match &data.kind {
-        Some(data_message::Kind::Message(m)) => {
-            m.text.as_ref().map(|t| t.body.clone()).unwrap_or_default()
-        }
+        Some(data_message::Kind::Message(m)) => m
+            .text
+            .as_ref()
+            .map(|t| t.body.clone())
+            .filter(|t| !t.is_empty())
+            .or_else(|| m.attachments.first().map(attachment_label))
+            .unwrap_or_default(),
         _ => String::new(),
     };
     Ok(MessageRow {

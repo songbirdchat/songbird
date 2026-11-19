@@ -199,6 +199,25 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0141 — A2 app-core, milestone 6 (first part): attachments end to end
+
+- Date: 2026-11-19
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Context: every photo, document and voice note in the app was invented; the server's
+  attachment service (Prompt 6) and the format in `crates/content` existed but no client used them.
+- Decision: `songbird_app_core::attachments` encrypts with `songbird_content::attachment`
+  (AES-256-GCM STREAM, key-committing, Padmé-padded), takes a grant for every recipient device
+  plus this account's other devices, uploads in one `PUT` or in parts then `complete`, and puts
+  the pointer in the encrypted message; downloads follow the signed URL, verify every chunk, and
+  only then confirm `fetched`. `Net` gained `upload` (signed, body not covered, §7.2), `fetch`
+  and `fetch_post` (unsigned, §7.3). Held in memory up to 256 MiB per file for now.
+- Evidence: `gate_a2::a_photo_goes_encrypted_and_arrives_verified` against RustFS and the real
+  `api`: a 300,000-byte photo crosses five chunks, Bob's app-core downloads and verifies it
+  byte for byte, and a pointer with a changed digest is refused.
+- Consequences: the app's attachment pickers and bubbles still need wiring (next); streaming
+  from disk for files above 256 MiB, thumbnails and blurhash come after.
+
 ## D-0140 — Nothing mocked: profiles, photos and username links made real
 
 - Date: 2026-11-19

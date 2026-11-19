@@ -367,6 +367,46 @@ pub(crate) async fn signed(
     send(req).await
 }
 
+/// A request signed by this device whose body the signature does not cover
+/// (attachment uploads, PROTOCOL §7.2: the client's own ciphertext, held
+/// only to its length).
+pub(crate) async fn signed_upload(
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> Result<(u16, Vec<u8>), Problem> {
+    let ep = endpoint();
+    let (device, seed) =
+        device_key().ok_or_else(|| problem("This device isn't registered yet."))?;
+    let key = wire::ed25519(&seed).ok_or_else(|| problem("This device's key is damaged."))?;
+    let (auth, _) = wire::sign_request(
+        &key,
+        &device,
+        &ep.api_name,
+        method,
+        path,
+        unix_ms() as u64,
+        None,
+    );
+    let req = HttpRequest::new(method, format!("{}{path}", ep.api))
+        .header("authorization", auth)
+        .header("content-type", "application/octet-stream")
+        .header("content-length", body.len().to_string())
+        .body(body);
+    send(req).await
+}
+
+/// An unsigned request to an api path (downloads and their confirmations
+/// carry no account, PROTOCOL §7.3). Redirects are followed.
+pub(crate) async fn unsigned(method: &str, path: &str) -> Result<(u16, Vec<u8>), Problem> {
+    let url = if path.starts_with("http") {
+        path.to_owned()
+    } else {
+        format!("{}{path}", endpoint().api)
+    };
+    send(HttpRequest::new(method, url)).await
+}
+
 pub(crate) fn ok_json(status: u16, body: &[u8]) -> Result<Value, Problem> {
     if (200..300).contains(&status) {
         Ok(serde_json::from_slice(body).unwrap_or(Value::Null))

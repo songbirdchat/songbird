@@ -143,6 +143,34 @@ impl Net for AppNet {
             .map_err(|_| songbird_app_core::Error::Network)
     }
 
+    async fn upload(
+        &self,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> songbird_app_core::Result<(u16, Vec<u8>)> {
+        super::signed_upload(method, path, body)
+            .await
+            .map_err(|_| songbird_app_core::Error::Network)
+    }
+
+    async fn fetch(
+        &self,
+        path_or_url: &str,
+    ) -> songbird_app_core::Result<(u16, Vec<u8>, Option<String>)> {
+        super::unsigned("GET", path_or_url)
+            .await
+            .map(|(s, b)| (s, b, None))
+            .map_err(|_| songbird_app_core::Error::Network)
+    }
+
+    async fn fetch_post(&self, path: &str) -> songbird_app_core::Result<u16> {
+        super::unsigned("POST", path)
+            .await
+            .map(|(s, _)| s)
+            .map_err(|_| songbird_app_core::Error::Network)
+    }
+
     async fn send(
         &self,
         idempotency_key: [u8; 16],
