@@ -623,6 +623,33 @@ impl<N: Net> Messenger<N> {
         }
     }
 
+    /// Sends any content to a group (a call signal): one MLS message, not stored as a message.
+    pub(crate) async fn send_group_body(&mut self, gid: &[u8; 16], content: Content) -> Result<()> {
+        let (padded, _) = songbird_content::seal(&content, None).map_err(|_| Error::Malformed)?;
+        let mut payload = Zeroizing::new(Vec::with_capacity(16 + padded.len()));
+        payload.extend_from_slice(&self.local.account);
+        payload.extend_from_slice(&padded);
+        let mut group = self.load_group(gid)?;
+        let msg = group
+            .create_message(&self.mls, &self.mls_signer, &payload)
+            .map_err(|_| Error::Malformed)?;
+        self.save_mls()?;
+        let hints = SendHints {
+            group: Some(*gid),
+            ..SendHints::default()
+        };
+        if self
+            .net
+            .send_group(*random::<16>()?, hints, tls(&msg)?)
+            .await?
+            == SendStatus::Accepted
+        {
+            Ok(())
+        } else {
+            Err(Error::Server(0))
+        }
+    }
+
     /// Handles an MLS envelope: a Welcome, a commit or a group message.
     pub(crate) async fn receive_mls(
         &mut self,
@@ -778,10 +805,25 @@ impl<N: Net> Messenger<N> {
                 let Ok(opened) = songbird_content::open(padded) else {
                     return Ok(Received::Nothing);
                 };
+                let content = opened.content.clone();
+                // Call signals are not visible messages: not franked (§5.3).
+                if let Some(Body::Call(c)) = &content.body {
+                    return Ok(
+                        crate::calls::signal_of(c, content.sent_at_ms, now_ms()).map_or(
+                            Received::Nothing,
+                            |(call, signal)| Received::Call {
+                                account: *account,
+                                group: Some(gid),
+                                call,
+                                signal,
+                            },
+                        ),
+                    );
+                }
+                // Visible messages must be franked, and the stamp must open (§5.3).
                 if stamp.is_none_or(|s| !opened.franking_matches(&s.commitment)) {
                     return Ok(Received::Nothing);
                 }
-                let content = opened.content.clone();
                 let Ok(data) = content_data(&content) else {
                     return Ok(Received::Nothing);
                 };

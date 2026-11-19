@@ -130,6 +130,17 @@ pub enum Received {
         /// The message.
         id: [u8; 16],
     },
+    /// A call signal (§8.5): from `account`, in a group when `group` is set.
+    Call {
+        /// Who.
+        account: [u8; 16],
+        /// The group, for a group call's signal.
+        group: Option<[u8; 16]>,
+        /// The call.
+        call: [u8; 16],
+        /// What.
+        signal: crate::calls::Signal,
+    },
     /// Someone started or stopped typing (an ephemeral event, never stored).
     Typing {
         /// Who.
@@ -559,7 +570,7 @@ impl<N: Net> Messenger<N> {
         Ok(pairs)
     }
 
-    async fn ensure_sessions(
+    pub(crate) async fn ensure_sessions(
         &mut self,
         account: &[u8; 16],
         devices: &[([u8; 16], [u8; 32])],
@@ -995,7 +1006,7 @@ impl<N: Net> Messenger<N> {
         Ok(())
     }
 
-    fn save_sessions_of(
+    pub(crate) fn save_sessions_of(
         &mut self,
         account: &[u8; 16],
         devices: &[([u8; 16], [u8; 32])],
@@ -1270,6 +1281,21 @@ impl<N: Net> Messenger<N> {
                     .send_receipt(&account, &[row.id], receipt_message::Kind::Delivered)
                     .await;
                 Ok(Received::Message(row))
+            }
+            Some(Body::Call(c))
+                if account != self.local.account || dec.device != self.local.device =>
+            {
+                Ok(
+                    crate::calls::signal_of(c, content.sent_at_ms, now_ms()).map_or(
+                        Received::Nothing,
+                        |(call, signal)| Received::Call {
+                            account,
+                            group: None,
+                            call,
+                            signal,
+                        },
+                    ),
+                )
             }
             Some(Body::Typing(t)) if account != self.local.account => Ok(Received::Typing {
                 account,

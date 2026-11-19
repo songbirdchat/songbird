@@ -199,6 +199,23 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0150 — Calls, part 1: tickets, encrypted signalling and the key schedule
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner); the media stack is the owner's choice (2026-11-20:
+  "LiveKit Rust SDK"), built in part 2
+- Decided by: owner (media stack); agent (this part)
+- Decision (`songbird_app_core::calls`): tickets from `POST /v1/calls` (presenting the callee's
+  access key, so only a contact's call wakes anyone), `/v1/calls/group` and `/v1/calls/join`;
+  `Content.call` signals sealed per device with `EXPIRES` 60 s (1:1) or as MLS messages (groups,
+  not franked: not visible messages); offers ring no longer than `ring_left_ms` allows; sender
+  keys from `songbird_content::call` (1:1: the offer's secret; groups: the MLS exporter at the
+  current epoch). No key reaches a server.
+- Evidence: `gate_a2::calls_ring_answer_and_agree_on_keys` against the real `calls` service and
+  the compose LiveKit: a ticketed room, an offer that rings, an answer with a second identity,
+  the same per-sender keys on both sides (and different keys per sender), a hang-up, a group call
+  with exporter keys equal on both members (eleven gate tests pass).
+
 ## D-0149 — Communities and private channels on the device
 
 - Date: 2026-11-20

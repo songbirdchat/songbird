@@ -18,6 +18,7 @@
 
 pub mod attachments;
 pub mod blob;
+pub mod calls;
 pub mod crypto;
 pub mod maps;
 pub mod messenger;

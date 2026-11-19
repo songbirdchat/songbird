@@ -392,6 +392,23 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
     };
     let app = Arc::new(App {
         plans: songbird_api::plans::Plans::default(),
+        calls: {
+            let lk = env("SONGBIRD_TEST_LIVEKIT")?;
+            let calls = songbird_calls::Calls::new(
+                &random32(),
+                &env("SONGBIRD_TEST_LIVEKIT_KEY")?,
+                zeroize::Zeroizing::new(env("SONGBIRD_TEST_LIVEKIT_SECRET")?),
+                &lk.replacen("http", "ws", 1),
+                &lk,
+                None,
+                songbird_calls::CallLimits::default(),
+            )
+            .unwrap();
+            Some(songbird_api::calls::CallsApi {
+                calls: Arc::new(calls),
+                metrics: songbird_api::ApiMetrics::default().calls.clone(),
+            })
+        },
         requests: Some(songbird_api::requests::Requests::new(
             keys.clone(),
             songbird_api::requests::RequestsMetrics::default(),
@@ -413,7 +430,6 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
             songbird_api::reports::ReportMetrics::default(),
         )),
         support: None,
-        calls: None,
         server_name: API.into(),
         push_store: Arc::new(
             songbird_accounts::PushStore::beside(&registry)
@@ -1174,4 +1190,113 @@ async fn channels_and_communities() {
     );
     // A plain group is no community.
     assert_eq!(bob.core.community_groups(&garden).await.unwrap(), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn calls_ring_answer_and_agree_on_keys() {
+    use songbird_app_core::calls::{Signal, one_to_one_key};
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    // Contacts first (profile keys both ways), so the call may ring.
+    alice.core.send_text(&bob.account, "hi").await.unwrap();
+    assert!(matches!(pump_app(&mut bob).await, Received::Message(_)));
+    bob.core.send_text(&alice.account, "hi").await.unwrap();
+    assert!(matches!(
+        pump_app(&mut alice).await,
+        Received::Status { .. }
+    ));
+    assert!(matches!(pump_app(&mut alice).await, Received::Message(_)));
+    assert!(matches!(pump_app(&mut bob).await, Received::Status { .. }));
+
+    // Alice calls: a ticket for a LiveKit room, and an encrypted offer that rings Bob.
+    let (ticket, secret) = alice.core.start_call(&bob.account, true).await.unwrap();
+    assert!(ticket.url.starts_with("ws"));
+    let Received::Call {
+        account,
+        call,
+        signal:
+            Signal::Offer {
+                video,
+                secret: got,
+                group,
+                ..
+            },
+        ..
+    } = pump_app(&mut bob).await
+    else {
+        panic!("an offer")
+    };
+    assert_eq!(
+        (account, call, video, group),
+        (alice.account, ticket.call, true, None)
+    );
+    assert_eq!(got, secret.to_vec());
+    // Bob answers: his own ticket for the same room; Alice hears the answer.
+    let bt = bob
+        .core
+        .answer_call(&alice.account, &call, None)
+        .await
+        .unwrap();
+    assert_eq!(bt.call, ticket.call);
+    assert_ne!(bt.identity, ticket.identity, "one identity per device");
+    assert!(matches!(
+        pump_app(&mut alice).await,
+        Received::Call {
+            signal: Signal::Answer,
+            ..
+        }
+    ));
+    // Both derive the same media key for each sender, and different keys for different senders.
+    let a_on_a = one_to_one_key(&call, &secret[..], &ticket.identity).unwrap();
+    let a_on_b = one_to_one_key(&call, &got, &ticket.identity).unwrap();
+    assert_eq!((a_on_a.0, &*a_on_a.1), (a_on_b.0, &*a_on_b.1));
+    assert_ne!(
+        &*a_on_a.1,
+        &*one_to_one_key(&call, &got, &bt.identity).unwrap().1
+    );
+    // Hanging up reaches Bob.
+    alice.core.hang_up(&bob.account, &call).await.unwrap();
+    assert!(matches!(
+        pump_app(&mut bob).await,
+        Received::Call {
+            signal: Signal::Hangup,
+            ..
+        }
+    ));
+
+    // A group call: keys from the MLS exporter; both members compute the same.
+    let gid = alice
+        .core
+        .create_group("Call me", &[bob.account])
+        .await
+        .unwrap();
+    assert_eq!(pump_app(&mut bob).await, Received::Joined { group: gid });
+    assert!(matches!(
+        pump_app(&mut bob).await,
+        Received::GroupUpdated { .. }
+    ));
+    let gt = alice.core.start_group_call(&gid, false).await.unwrap();
+    let Received::Call {
+        group: Some(g),
+        call,
+        signal: Signal::Offer { .. },
+        ..
+    } = pump_app(&mut bob).await
+    else {
+        panic!("a group offer")
+    };
+    assert_eq!((g, call), (gid, gt.call));
+    let bt = bob
+        .core
+        .answer_call(&alice.account, &call, Some(&gid))
+        .await
+        .unwrap();
+    assert_eq!(bt.call, gt.call);
+    let a = alice
+        .core
+        .group_call_key(&gid, &call, &gt.identity)
+        .unwrap();
+    let b = bob.core.group_call_key(&gid, &call, &gt.identity).unwrap();
+    assert_eq!((a.0, &*a.1), (b.0, &*b.1));
 }
