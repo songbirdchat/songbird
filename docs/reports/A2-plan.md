@@ -48,7 +48,7 @@ as follows.
 | M1 | `crates/app-core` crypto: X25519/ML-KEM/HKDF/AES-GCM on aws-lc-rs; PQXDH; the post-quantum Double Ratchet; the sealed per-device envelope; safety numbers; sessions per device, prekey generation in the server's upload format | **done** (21 tests, clippy clean) |
 | M2 | The SQLCipher store: identity, prekeys, sessions, chats, messages, receipts; versioned migrations; FTS5 search | **done** (D-0137) |
 | M3 | The pipeline: key upload and refill (`PrekeysLow`), bundle fetch, device lists, `Send` with device-mismatch retries, receive → decrypt → store → `Ack`; content encode/decode with padding and franking; the status machine; receipts; requests and access keys; the backend gap `POST /v1/devices/identity` | **done** (D-0138; `tests/e2e/tests/gate_a2.rs` against the real stack) |
-| M4 | App wiring: `apps/ui` stores read and write app-core for 1:1 chats (the NSH `Net` over `HttpRequest` and the delivery client; device keys in the Keychain/Keystore) | next |
+| M4 | App wiring: `apps/ui` 1:1 chats on app-core (the NSH `Net`, deliveries stored then acknowledged, sends and read receipts, new chat by username) | **done** (D-0139); keystore modules and a two-app run still open |
 | M5 | Groups: OpenMLS client over the delivery service | |
 | M6 | Attachments: streaming encryption, grants, resumable transfers | |
 | Later | Calls media (LiveKit SDK), platform modules, push hosts (deferred by the owner), Prompt 12 (verification and the audit), Prompt 13 (certification), Prompt 14 (legal gate) | |

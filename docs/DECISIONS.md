@@ -199,6 +199,35 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0139 — A2 app-core, milestone 4: the app's 1:1 chats on app-core
+
+- Date: 2026-11-19
+- Status: proposed (waiting for the owner, with the A2 report)
+- Decided by: agent (owner: "Yes, do M4")
+- Context: the app's chat screens ran on the mock store (D-0092); the delivery reader counted
+  envelopes and never acknowledged them.
+- Decision: `apps/ui/src/backend/chat.rs` bridges the UI store and `songbird-app-core`:
+  1. With the real backend on and the device registered, app-core opens a SQLCipher file in the
+     app's data folder on connect; on its first run it publishes the device's keys, the signed
+     device list (the primary, with the account key) and the profile, whose key is the one the
+     app's profile code already publishes.
+  2. Each delivery is decrypted and stored by app-core, then acknowledged, in `seq` order; one
+     it cannot store stays on the server.
+  3. Sending in a real chat goes through app-core (no simulated ticks); ticks follow the server's
+     answer and the recipient's receipts; reading a real chat sends read receipts. Only text (and
+     text with a link) is sent; other kinds fail with a plain message until M5/M6.
+  4. New chat → "Message this username on Songbird": the username's hash is looked up and the
+     account's identity and devices are checked before the chat opens.
+  5. Real accounts and messages get UI IDs from their first 8 bytes with the top bit set, so they
+     never collide with the mock's small IDs and need no table on disk.
+- Evidence: `cargo build` and `cargo test --lib` (208 tests) in `apps/ui`; the pipeline itself is
+  proven by `tests/e2e/tests/gate_a2.rs` (D-0138). Not yet run: two app instances against
+  `scripts/dev-app-backend.sh` or the phone test environment (D-0135).
+- Consequences: the store key and the device identity seed sit in NSH app storage (marked
+  `mock:`) until the Keychain/Keystore modules exist. The mock's seeded chats still show beside
+  real ones; a live account should start empty (follow-up). Message times use real minutes
+  relative to the UI's "now".
+
 ## D-0138 — A2 app-core, milestone 3: the message pipeline; `POST /v1/devices/identity`
 
 - Date: 2026-11-19

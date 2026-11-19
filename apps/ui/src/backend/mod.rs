@@ -24,6 +24,7 @@
 
 pub mod account;
 pub mod backup;
+pub mod chat;
 pub mod link;
 pub mod lock;
 pub mod nudge;
@@ -197,6 +198,7 @@ pub fn set_endpoint(endpoint: Endpoint) {
 /// Forgets this device's account locally (the server keeps it).
 pub fn forget() {
     disconnect();
+    chat::stop();
     for k in [K_IDENTITY, K_DEVICE_SEED, K_ACCOUNT, K_DEVICE, K_USERNAME] {
         Storage::remove_item(k);
     }
@@ -233,12 +235,12 @@ impl std::fmt::Display for Problem {
     }
 }
 
-fn problem(s: impl Into<String>) -> Problem {
+pub(crate) fn problem(s: impl Into<String>) -> Problem {
     Problem(s.into())
 }
 
 /// The plain-language meaning of an api answer.
-fn explain(status: u16, body: &[u8]) -> Problem {
+pub(crate) fn explain(status: u16, body: &[u8]) -> Problem {
     let word = serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|v| v["error"].as_str().map(str::to_owned))
@@ -337,7 +339,7 @@ pub(crate) async fn signed(
     send(req).await
 }
 
-fn ok_json(status: u16, body: &[u8]) -> Result<Value, Problem> {
+pub(crate) fn ok_json(status: u16, body: &[u8]) -> Result<Value, Problem> {
     if (200..300).contains(&status) {
         Ok(serde_json::from_slice(body).unwrap_or(Value::Null))
     } else {

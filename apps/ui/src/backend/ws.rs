@@ -1,11 +1,11 @@
 //! The delivery connection (`crates/client`): authenticated with this
 //! device's key, reconnecting with backoff, its state shown live.
 //!
-//! Envelopes are end-to-end ciphertext that only app-core (A2) can open.
-//! Until it exists they are counted and **left on the server** (never
-//! acknowledged), so nothing is lost when the real client arrives.
+//! Envelopes are end-to-end ciphertext: app-core (`super::chat`, D-0139)
+//! decrypts and stores each one, in order, and only then is it acknowledged.
+//! One app-core can't store is left on the server and comes again.
 
-use std::cell::RefCell;
+use std::{cell::RefCell, rc::Rc};
 
 use nsh_core::prelude::*;
 use songbird_client::{Client, ClientConfig, DeviceKey, Event, ResumeState};
@@ -15,7 +15,7 @@ use super::{Link, device_key, live};
 
 thread_local! {
     /// The running client (dropping it stops it).
-    static CLIENT: RefCell<Option<Client>> = const { RefCell::new(None) };
+    static CLIENT: RefCell<Option<Rc<Client>>> = const { RefCell::new(None) };
     /// The task that starts the client and reads its events.
     static READER: RefCell<Option<Spawned<()>>> = const { RefCell::new(None) };
 }
@@ -86,15 +86,28 @@ pub fn connect() {
                 live().update(|l| l.link = Link::Off);
                 return;
             };
-            CLIENT.with_borrow_mut(|c| *c = Some(client));
+            CLIENT.with_borrow_mut(|c| *c = Some(Rc::new(client)));
             while let Some(event) = events.recv().await {
                 match event {
-                    Event::Connected { .. } => live().update(|l| {
-                        l.link = Link::Connected;
-                        l.problem = None;
-                    }),
-                    // mock: app-core decrypts, stores durably, then `ack`s.
-                    Event::Deliver { .. } => live().update(|l| l.waiting += 1),
+                    Event::Connected { .. } => {
+                        live().update(|l| {
+                            l.link = Link::Connected;
+                            l.problem = None;
+                        });
+                        if let Err(p) = super::chat::start().await {
+                            live().update(|l| l.problem = Some(p.0));
+                        }
+                    }
+                    // Stored by app-core, then acknowledged; in `seq` order.
+                    Event::Deliver { seq, envelope } => {
+                        if super::chat::receive(&envelope).await {
+                            if let Some(c) = self::client() {
+                                let _ = c.ack(seq).await;
+                            }
+                        } else {
+                            live().update(|l| l.waiting += 1);
+                        }
+                    }
                     Event::Disconnected { .. } => live().update(|l| l.link = Link::Retrying),
                     Event::Failed { code } => {
                         live().update(|l| {
@@ -122,6 +135,11 @@ fn is_loopback(addr: &str) -> bool {
         || host
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The running delivery client.
+pub(crate) fn client() -> Option<Rc<Client>> {
+    CLIENT.with_borrow(Clone::clone)
 }
 
 /// Closes the connection.

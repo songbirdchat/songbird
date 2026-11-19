@@ -112,6 +112,29 @@ fn body() -> impl IntoElement {
                                 features::contacts::open,
                             ))
                     }))
+                    // A real account by its exact username (the real backend on;
+                    // D-0139): only the name's hash leaves the device.
+                    .child(when(
+                        move || {
+                            !browsing() && crate::backend::is_live() && crate::backend::registered()
+                        },
+                        move || {
+                            action(
+                                Icon::Search,
+                                "Message this username on Songbird",
+                                move || {
+                                    let name = query.get_untracked();
+                                    crate::backend::run(async move {
+                                        let chat = crate::backend::chat::start_with_username(&name)
+                                            .await?;
+                                        nav::pop_to_root();
+                                        features::chat::open(chat);
+                                        Ok(())
+                                    });
+                                },
+                            )
+                        },
+                    ))
                     .child(section_title("Contacts on Songbird")),
             )
             .empty(empty_state(

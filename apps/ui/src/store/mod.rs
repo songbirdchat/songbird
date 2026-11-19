@@ -14,7 +14,7 @@ pub mod ext_groups;
 pub mod ext_onboarding;
 mod ext_settings;
 mod model;
-mod seed;
+pub(crate) mod seed;
 
 use std::{collections::HashMap, time::Duration};
 
@@ -315,6 +315,9 @@ impl Store {
     }
 
     pub fn mark_read(&self, id: ChatId) {
+        if crate::backend::chat::owns(id) && self.chat(id).is_some_and(|c| c.unread > 0) {
+            crate::backend::chat::mark_read(id);
+        }
         if self
             .chat(id)
             .is_some_and(|c| c.unread > 0 || c.marked_unread || c.mentions > 0)
@@ -497,8 +500,22 @@ impl Store {
             self.edit_message(chat, id, |m| m.reply_to = reply_to);
         }
         self.set_draft(chat, String::new());
-        self.simulate_delivery(chat, id);
+        if crate::backend::chat::owns(chat) {
+            // A real chat: app-core encrypts and sends it; ticks follow the
+            // server's answer and the recipient's receipts (D-0139).
+            let body = self.message(chat, id).map(|m| m.body);
+            if let Some(body) = body {
+                crate::backend::chat::send(*self, chat, id, &body);
+            }
+        } else {
+            self.simulate_delivery(chat, id);
+        }
         id
+    }
+
+    /// Marks one of the user's messages as failed to send.
+    pub fn fail(&self, chat: ChatId, id: MsgId) {
+        self.edit_message(chat, id, |m| m.status = Tick::Failed);
     }
 
     fn simulate_delivery(&self, chat: ChatId, id: MsgId) {

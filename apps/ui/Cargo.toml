@@ -31,6 +31,8 @@ songbird-backup-format = { path = "../../crates/backup-format" }
 songbird-backup-storage = { path = "../../crates/backup-storage" }
 # Plans (Prompt 11): anonymous tokens for the vault and plans (D-0128, D-0130).
 songbird-tokens = { path = "../../crates/tokens" }
+# app-core (A2, D-0136 to D-0139): sessions, the SQLCipher store and the message pipeline.
+songbird-app-core = { path = "../../crates/app-core" }
 async-trait = "0.1"
 tokio = { version = "1.54.1", default-features = false, features = ["net", "sync"] }
 zeroize = "1.9.1"
