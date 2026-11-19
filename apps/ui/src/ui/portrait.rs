@@ -44,7 +44,9 @@ fn mix(seed: u64, lane: u64) -> u64 {
 /// Whether this (mock) person has set a photo: most have, a few show
 /// initials, as in real life.
 pub fn has_photo(seed: u64) -> bool {
-    seed == ME_SEED || mix(seed, 7) % 6 != 0
+    // Illustrated stand-ins only in the demo fixtures; a real account shows
+    // real photos (`backend::avatar`) or initials.
+    crate::store::demo() && (seed == ME_SEED || mix(seed, 7) % 6 != 0)
 }
 
 /// The user's own seed (the mock store's `me.seed`): the user has set a

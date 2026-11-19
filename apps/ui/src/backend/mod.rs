@@ -23,6 +23,7 @@
 //!   devices and seals for them.
 
 pub mod account;
+pub mod avatar;
 pub mod backup;
 pub mod chat;
 pub mod link;
@@ -33,6 +34,7 @@ pub mod presence;
 pub mod profile;
 pub mod records;
 pub mod supervision;
+pub mod username;
 pub mod wire;
 mod ws;
 

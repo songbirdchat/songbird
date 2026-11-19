@@ -52,6 +52,56 @@ thread_local! {
     /// Real accounts by UI contact ID, and app-core message IDs by UI ID.
     static ACCOUNTS: RefCell<HashMap<ContactId, [u8; 16]>> = RefCell::new(HashMap::new());
     static OUTGOING: RefCell<HashMap<MsgId, [u8; 16]>> = RefCell::new(HashMap::new());
+    /// Accounts whose profile was fetched this run.
+    static PROFILED: RefCell<std::collections::HashSet<[u8; 16]>> = RefCell::new(std::collections::HashSet::new());
+}
+
+/// Fetches a contact's encrypted profile (`POST /v1/profile/fetch`) and opens it with the
+/// profile key they shared: their real name, about, status and photo.
+pub async fn refresh_profile(account: [u8; 16], key: [u8; 32]) {
+    PROFILED.with_borrow_mut(|p| p.insert(account));
+    let body = serde_json::json!({ "account": wire::hex(&account) })
+        .to_string()
+        .into_bytes();
+    let Ok((200, answer)) = super::signed("POST", "/v1/profile/fetch", Some(body), true).await
+    else {
+        return;
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&answer) else {
+        return;
+    };
+    let (Some(version), Some(blob)) = (
+        v["version"].as_u64(),
+        v["profile"].as_str().and_then(wire::unhex),
+    ) else {
+        return;
+    };
+    let Ok(p) = songbird_content::profile::open(&key, version, &blob) else {
+        return;
+    };
+    let id = ui_id(&account);
+    if let Some(s) = crate::store::try_store() {
+        let name = p.name.trim().to_owned();
+        s.contacts.update(|cs| {
+            if let Some(c) = cs.iter_mut().find(|c| c.id == id) {
+                if !name.is_empty() {
+                    c.name.clone_from(&name);
+                }
+                c.about.clone_from(&p.about);
+                c.status_line = p
+                    .status
+                    .as_ref()
+                    .map(|st| st.text.clone())
+                    .filter(|t| !t.is_empty());
+            }
+        });
+        if !name.is_empty() {
+            s.edit_chat(id, |c| c.title.clone_from(&name));
+        }
+    }
+    if let Some(a) = &p.avatar {
+        let _ = super::avatar::fetch(id, &a.id, &a.key).await;
+    }
 }
 
 fn core() -> Rc<tokio::sync::Mutex<Option<Core>>> {
@@ -198,7 +248,18 @@ pub async fn start() -> Result<(), super::Problem> {
     if let Some(s) = crate::store::try_store() {
         show_all(s, &m);
     }
+    let keyed: Vec<([u8; 16], [u8; 32])> = m
+        .store
+        .chats()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| Some((c.id, *m.store.profile_key(&c.id).ok().flatten()?)))
+        .collect();
     *guard = Some(m);
+    drop(guard);
+    for (account, key) in keyed {
+        refresh_profile(account, key).await;
+    }
     Ok(())
 }
 
@@ -320,8 +381,14 @@ pub async fn receive(envelope: &[u8]) -> bool {
     let me = m.local().account;
     match m.receive(envelope).await {
         Ok(Received::Message(row)) => {
+            let fresh = row.author != me && !PROFILED.with_borrow(|p| p.contains(&row.chat));
+            let key = m.store.profile_key(&row.chat).ok().flatten();
             if let Some(s) = crate::store::try_store() {
                 show(s, &me, &row, row.author != me);
+            }
+            drop(guard);
+            if let (true, Some(key)) = (fresh, key) {
+                refresh_profile(row.chat, *key).await;
             }
             true
         }
@@ -421,11 +488,21 @@ pub fn mark_read(chat: ChatId) {
 /// Starts (or opens) a chat with the account that holds `username`
 /// (`POST /v1/username/lookup`: only the username's hash leaves the device).
 pub async fn start_with_username(username: &str) -> Result<ChatId, super::Problem> {
+    if username.trim().starts_with("https://songbird.chat/u#") {
+        let (name, handle) = super::username::open(username).await?;
+        return start_with(&name, Some(handle)).await;
+    }
+    start_with(username, None).await
+}
+
+async fn start_with(username: &str, link: Option<[u8; 16]>) -> Result<ChatId, super::Problem> {
     let name = songbird_keys::username::Username::parse(username.trim().trim_start_matches('@'))
         .map_err(|_| super::problem("That isn't a username."))?;
-    let body = serde_json::json!({ "hash": wire::hex(&name.hash()) })
-        .to_string()
-        .into_bytes();
+    let mut q = serde_json::json!({ "hash": wire::hex(&name.hash()) });
+    if let Some(h) = link {
+        q["link"] = serde_json::Value::String(wire::hex(&h));
+    }
+    let body = q.to_string().into_bytes();
     let (status, answer) = super::signed("POST", "/v1/username/lookup", Some(body), true).await?;
     if status == 404 {
         return Err(super::problem("No one on Songbird has that username."));

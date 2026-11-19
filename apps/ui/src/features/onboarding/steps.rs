@@ -534,9 +534,9 @@ pub(super) fn profile(s: Store, f: Flow) -> View {
                                 .border_1()
                                 .border_color(move || c::border())
                                 .text_color(move || c::primary())
-                                .child(icon_btn(Icon::Camera, "Add a photo", || {
-                                    // mock: the photo picker and cropper (app-core encrypts the avatar).
-                                    toast("Choosing a photo isn't in this preview yet");
+                                // The system picker; encrypted and uploaded on this device.
+                                .child(icon_btn(Icon::Camera, "Add a photo", move || {
+                                    crate::backend::avatar::choose(crate::store::store())
                                 })),
                         ),
                 ),

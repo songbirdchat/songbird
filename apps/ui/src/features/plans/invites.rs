@@ -112,12 +112,7 @@ fn invites_page() -> Screen {
         .child(crate::features::settings::foot(
             "Songbird is invite-only while in beta, so we can grow carefully and keep it fast. You can see whether a code was used, but never who used it.",
         ));
-    page(
-        "Invites",
-        view()
-            .flex_1()
-            .child(page_scroll(body))
-    )
+    page("Invites", view().flex_1().child(page_scroll(body)))
 }
 
 /// The personal invite link page, pushed.
@@ -193,14 +188,8 @@ fn invite_link_page() -> Screen {
             })
             .text_center(),
         );
-    page(
-        "Invite a friend",
-        view()
-            .flex_1()
-            .child(page_scroll(body))
-    )
+    page("Invite a friend", view().flex_1().child(page_scroll(body)))
 }
-
 
 /// A grouped code on two lines, split between its middle groups, the
 /// hyphen kept at the end of the first ("K7P2-QX9M-AB3D-" over

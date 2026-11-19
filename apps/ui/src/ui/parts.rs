@@ -480,6 +480,14 @@ pub fn initials(name: &str) -> String {
 /// Decorative for screen readers: the row or header beside it names them.
 pub fn avatar(name: impl Into<SharedString>, seed: u64, size: f32) -> View {
     let name: SharedString = name.into();
+    if let Some(src) = crate::backend::avatar::photo(seed) {
+        return view()
+            .size(px(size))
+            .rounded_full()
+            .overflow_hidden()
+            .accessibility_elements_hidden(true)
+            .child(image(src).size(px(size)).object_fit(ResizeMode::Cover));
+    }
     avatar_of(
         name,
         seed,

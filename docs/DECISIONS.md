@@ -199,6 +199,35 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0140 — Nothing mocked: profiles, photos and username links made real
+
+- Date: 2026-11-19
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's rule (2026-11-19): "everything must be implemented. no
+  mock allowed or placeholder"
+- Context: the app's mocked layer (D-0092) included the seeded demo, fake invite and username
+  links, a photo button that only toasted, generated portraits on every avatar, and contacts
+  named "Songbird user …" because no one fetched their profiles.
+- Decision:
+  1. A real account starts empty on the real backend; the demo data serves only screenshot
+     fixtures and unit tests (`store::demo`).
+  2. Avatars: the system picker (NSH 0.6 `pick_images`, scaled to 640 px), sealed on the device
+     under a fresh key (`songbird_app_core::blob`: HKDF to an AES-256-GCM key, a random nonce,
+     context `songbird.v1/avatar`), uploaded with `PUT /v1/profile/avatar`, named with its key
+     inside the encrypted profile only when the photo's audience is not Nobody. Contacts' profiles
+     are fetched with the profile key they shared and opened on the device: real names, about,
+     status and photo.
+  3. Username links: `https://songbird.chat/u#<base64url(handle [16] || key [32])>`
+     (`songbird_proto::username_link`); the username sealed under the link key (same blob
+     construction, context `songbird.v1/username-link`); `PUT /v1/username/link` stores only the
+     ciphertext. Opening a link passes its handle to the lookup, so a link works when its owner
+     is not findable by username (§10.3). Changing the username claims it on the server and
+     makes a new link.
+  4. Invites use the real invite card (§14.10); sharing uses the system share sheet (NSH
+     `share`), copying where a platform has none.
+- Consequences: telling contacts a profile changed (`ProfileChanged`, sealed and silent) still
+  needs to be sent by app-core; the photo crop is the platform picker's.
+
 ## D-0139 — A2 app-core, milestone 4: the app's 1:1 chats on app-core
 
 - Date: 2026-11-19

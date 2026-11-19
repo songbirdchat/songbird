@@ -16,10 +16,12 @@
 //! No service links this crate (the server never decrypts).
 #![forbid(unsafe_code)]
 
+pub mod blob;
 pub mod crypto;
 pub mod messenger;
 pub mod session;
 pub mod store;
+pub mod username_link;
 
 /// Errors the core reports. Decryption failures are deliberately coarse: which check failed is
 /// never told to a peer, and the UI shows one plain message.

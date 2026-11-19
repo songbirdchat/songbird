@@ -96,6 +96,9 @@ pub fn App() -> impl IntoElement {
     backend::records::restore(s);
     camera::install_for_app();
     backend::restore();
+    backend::avatar::restore(
+        crate::store::try_store().map_or(42, |s| s.me.with_untracked(|m| m.seed)),
+    );
     backend::records::periodic(s);
     // Prompt 9, M6: the encrypted profile follows the user's edits, and
     // presence follows the app's lifecycle and the privacy settings.

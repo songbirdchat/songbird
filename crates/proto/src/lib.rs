@@ -43,6 +43,7 @@ pub mod report;
 pub mod storage;
 pub mod supervision;
 pub mod system;
+pub mod username_link;
 pub mod vault;
 
 pub use close::CloseCode;

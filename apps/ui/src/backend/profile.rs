@@ -74,8 +74,7 @@ pub fn plain(me: &Profile, s: &Settings, x: &SettingsExt) -> ProfilePlain {
             clip(me.about.trim(), MAX_ABOUT)
         },
         status,
-        // mock: the photo is an encrypted avatar object (A2's upload);
-        // left out until then, whatever the audience.
+        // Set by `publish` from `avatar::mine` (kept out of this pure function).
         avatar: None,
         links: x
             .links
@@ -131,7 +130,15 @@ pub fn publish(store: Store) {
     let p = {
         let s = store.settings.get_untracked();
         let x = store.ext().get_untracked();
-        store.me.with_untracked(|me| plain(me, &s, &x))
+        let mut p = store.me.with_untracked(|me| plain(me, &s, &x));
+        // The encrypted avatar object and its key, when the audience allows.
+        if s.photo != Audience::Nobody {
+            p.avatar = super::avatar::mine().map(|(id, key)| content::Avatar {
+                id: id.to_vec(),
+                key: key.to_vec(),
+            });
+        }
+        p
     };
     if !(super::is_live() && super::registered()) {
         return;
