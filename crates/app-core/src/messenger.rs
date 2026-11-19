@@ -575,6 +575,30 @@ impl<N: Net> Messenger<N> {
         self.send_data(to, data, &shown).await
     }
 
+    /// Sends a location the user picked on the map (PROTOCOL §5.4 `LocationPin`).
+    pub async fn send_location(
+        &mut self,
+        to: &[u8; 16],
+        lat: f64,
+        lon: f64,
+        name: &str,
+    ) -> Result<[u8; 16]> {
+        let message = schema::Message {
+            location: Some(schema::LocationPin {
+                latitude_e7: crate::maps::e7(lat, 90.0),
+                longitude_e7: crate::maps::e7(lon, 180.0),
+                name: name.into(),
+                address: String::new(),
+            }),
+            ..Default::default()
+        };
+        let data = DataMessage {
+            kind: Some(data_message::Kind::Message(message)),
+            ..Default::default()
+        };
+        self.send_data(to, data, "Location").await
+    }
+
     /// Sends a visible message (franked) to a 1:1 chat.
     pub async fn send_data(
         &mut self,
@@ -1002,6 +1026,7 @@ fn data_row(
             .map(|t| t.body.clone())
             .filter(|t| !t.is_empty())
             .or_else(|| m.attachments.first().map(attachment_label))
+            .or_else(|| m.location.as_ref().map(|_| "Location".to_owned()))
             .unwrap_or_default(),
         _ => String::new(),
     };

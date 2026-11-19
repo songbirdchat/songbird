@@ -19,6 +19,7 @@
 pub mod attachments;
 pub mod blob;
 pub mod crypto;
+pub mod maps;
 pub mod messenger;
 pub mod session;
 pub mod store;

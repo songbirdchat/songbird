@@ -45,6 +45,7 @@ pub mod gifs;
 pub mod groups;
 pub mod keys;
 pub mod kt;
+pub mod maps;
 pub mod media;
 pub mod messages;
 pub mod packs;
@@ -365,6 +366,9 @@ impl App {
         }
         if path.starts_with("/v1/gifs/") {
             return gifs::route(self, req).await;
+        }
+        if path.starts_with("/v1/maps/") {
+            return maps::route(self, req).await;
         }
         if path == "/v1/family" || path.starts_with("/v1/family/") {
             return self.family(req).await;

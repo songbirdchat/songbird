@@ -199,6 +199,35 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0142 — Maps from self-hosted OpenStreetMap vector tiles
+
+- Date: 2026-11-19
+- Status: accepted (owner, 2026-11-19: "Self-hosted OSM tiles"); the threat-model row below is
+  proposed, for the owner's approval
+- Decided by: owner (the source); agent (the design)
+- Context: sharing a location needs a map. Public OSM tile servers forbid app traffic and would
+  learn where every user looks; Apple's and Google's map SDKs would too.
+- Options considered: OSM's public tiles (policy, privacy), platform maps (Apple and Google see
+  every place shown), self-hosted vector tiles (chosen by the owner).
+- Decision:
+  1. **Data:** OpenStreetMap in the OpenMapTiles schema, built with Planetiler (Europe, z0–14),
+     loaded by `tools/maps-import` from an MBTiles file into RustFS as raw MVT objects
+     (`maps/v1/z/x/y.mvt`; TMS rows flipped; gzip removed so clients need no inflater). New
+     dependency for that tool only: `flate2` with its pure-Rust backend.
+  2. **Serving:** `GET /v1/maps/v1/<z>/<x>/<y>` on `api`, unsigned (no account, no device, like
+     attachment downloads), on the media serving budget per IP range (kind `t`); 204 for an empty
+     tile; publicly cacheable.
+  3. **Device:** `songbird_app_core::maps` decodes tiles (bounded: 4 MiB, 20,000 features,
+     400,000 points per tile), styles them (water, green, urban, buildings at z14, roads by class,
+     rail, rivers, borders, place names) and projects Web Mercator; the app draws them on an NSH
+     canvas. A picked place goes inside the end-to-end encrypted message as a `LocationPin`.
+     "© OpenStreetMap contributors" shows on every map (ODbL).
+  4. **Threat-model row (proposed):** the server sees which map tiles an IP address asks for
+     (an area being looked at), never which account; tile requests carry no identifier.
+- Consequences: the operator runs Planetiler and the import before maps work (a runbook entry);
+  the user's own GPS position needs a native location module (NSH has none), so picking on the
+  map comes first; live location stays out of scope (the prompt set).
+
 ## D-0141 — A2 app-core, milestone 6 (first part): attachments end to end
 
 - Date: 2026-11-19

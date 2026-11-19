@@ -38,6 +38,7 @@ members = [
     "services/proxy",
     "tools/loadgen",
     "tools/admin",
+    "tools/maps-import",
     "tests/e2e",
     "tests/groups",
     "xtask",
@@ -158,6 +159,10 @@ chacha20poly1305 = { version = "=0.10.1", default-features = false }
 # vendored OpenSSL: CommonCrypto on Apple, a libcrypto (AWS-LC) linked at build time elsewhere;
 # the `openssl` crates stay banned. MIT.
 rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher"] }
+
+# Map tiles import (D-0142): MBTiles store tiles gzipped; the operator tool inflates them so
+# clients need no inflater. Pure Rust (miniz_oxide). MIT OR Apache-2.0. Tools only.
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 
 # Test-only
 proptest = "1.12.0"

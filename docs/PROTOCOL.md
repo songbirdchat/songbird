@@ -1756,6 +1756,13 @@ travels only inside end-to-end encrypted content, is the capability.
 - **Forwarding** encrypts again under a fresh key and uploads a new object (§7.1). The server
   never copies an object, so two messages never share an ID.
 
+### 7.3a Map tiles (D-0142)
+
+`GET /v1/maps/v1/<z>/<x>/<y>` (z 0–14, x and y within the grid): the OpenStreetMap vector tile
+(Mapbox Vector Tile 2.1, OpenMapTiles schema), 200 `application/vnd.mapbox-vector-tile`; 204 for
+an empty tile; 404 outside the grid; 429 past the IP range's serving budget. Unsigned: no account
+or device is named. Clients over-zoom beyond 14 and show "© OpenStreetMap contributors".
+
 ### 7.4 Packs (M4, D-0083)
 
 One generic service carries sticker packs, chat scenes (IMVironments), sound stickers and

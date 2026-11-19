@@ -286,7 +286,8 @@ impl Media {
             hex::encode(ctx.sign().as_ref().get(..16).unwrap_or_default())
         );
         // Signed-URL requests (`v`: every range a player asks for) have a budget of their own.
-        let (per_hour, burst) = if kind == "v" {
+        // Map tiles (`t`, D-0142) share it: a map view asks for a few dozen tiles at once.
+        let (per_hour, burst) = if kind == "v" || kind == "t" {
             (d.serve_per_hour, d.serve_burst)
         } else {
             (d.per_hour, d.burst)
