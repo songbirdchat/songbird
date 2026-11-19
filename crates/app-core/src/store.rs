@@ -25,7 +25,7 @@ use crate::session::{Local, Prekeys, Session, Sessions};
 use crate::{Error, Result};
 
 /// The schema version this code writes.
-pub const SCHEMA: i64 = 2;
+pub const SCHEMA: i64 = 3;
 
 /// Outgoing message status, as the UI shows it (`crates/content`'s levels, plus the local ones).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -223,7 +223,68 @@ impl Store {
             ))?;
             db(tx.commit())?;
         }
+        if v < 3 {
+            // Reactions: one per reactor and message, the newest counter wins (PROTOCOL §5.5).
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "CREATE TABLE reactions (author BLOB NOT NULL, id BLOB NOT NULL, reactor BLOB NOT NULL,
+                     emoji TEXT NOT NULL, counter INTEGER NOT NULL, PRIMARY KEY (author, id, reactor));
+                 PRAGMA user_version = 3;",
+            ))?;
+            db(tx.commit())?;
+        }
         Ok(())
+    }
+
+    /// Records `reactor`'s reaction to a message (empty `emoji`: removed), if `counter` is newer
+    /// than the one held. Answers whether it changed.
+    pub fn react(
+        &self,
+        author: &[u8; 16],
+        id: &[u8; 16],
+        reactor: &[u8; 16],
+        emoji: &str,
+        counter: u64,
+    ) -> Result<bool> {
+        let n = db(self.db.execute(
+            "INSERT INTO reactions (author, id, reactor, emoji, counter) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (author, id, reactor) DO UPDATE SET emoji = ?4, counter = ?5 WHERE counter < ?5",
+            params![&author[..], &id[..], &reactor[..], emoji, sql_ms(counter)],
+        ))?;
+        Ok(n > 0)
+    }
+
+    /// A message's reactions: (reactor, emoji), removed ones left out.
+    pub fn reactions(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<Vec<([u8; 16], String)>> {
+        let mut st = db(self.db.prepare(
+            "SELECT reactor, emoji FROM reactions WHERE author = ?1 AND id = ?2 AND emoji != '' ORDER BY counter",
+        ))?;
+        let rows = db(st.query_map(params![&author[..], &id[..]], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
+        }))?;
+        rows.map(|r| {
+            let (a, e) = db(r)?;
+            Ok((arr16(&a)?, e))
+        })
+        .collect()
+    }
+
+    /// Deletes a message's content for everyone: the row stays as "deleted", with no text, no
+    /// content, no files and no reactions.
+    pub fn mark_deleted(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<()> {
+        db(self.db.execute(
+            "DELETE FROM files WHERE author = ?1 AND id = ?2",
+            params![&author[..], &id[..]],
+        ))?;
+        db(self.db.execute(
+            "DELETE FROM reactions WHERE author = ?1 AND id = ?2",
+            params![&author[..], &id[..]],
+        ))?;
+        db(self.db.execute(
+            "UPDATE messages SET text = '', content = x'' WHERE author = ?1 AND id = ?2",
+            params![&author[..], &id[..]],
+        ))
+        .map(|_| ())
     }
 
     /// Keeps an attachment's plaintext (a message's `idx`-th file).

@@ -691,3 +691,88 @@ async fn a_picked_place_arrives_as_that_place() {
     assert!((lat - 46.769_7).abs() < 1e-7 && (lon - 23.589_6).abs() < 1e-7);
     assert_eq!(name, "Piața Unirii");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reactions_edits_and_deletes_reach_the_other_side() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    let id = alice
+        .core
+        .send_text(&bob.account, "first draft")
+        .await
+        .unwrap();
+    assert!(matches!(pump(&mut bob).await, Received::Message(_)));
+    assert!(matches!(pump(&mut alice).await, Received::Status { .. }));
+    // Bob reacts; Alice sees it, and it is stored on both sides.
+    bob.core
+        .react(&alice.account, &alice.account, &id, "👍")
+        .await
+        .unwrap();
+    let r = pump(&mut alice).await;
+    assert_eq!(
+        r,
+        Received::Reaction {
+            author: alice.account,
+            id,
+            reactor: bob.account,
+            emoji: "👍".into()
+        }
+    );
+    assert_eq!(
+        alice.core.store.reactions(&alice.account, &id).unwrap(),
+        vec![(bob.account, "👍".to_owned())]
+    );
+    // Alice edits: Bob's copy changes.
+    alice
+        .core
+        .edit(&bob.account, &id, "final text")
+        .await
+        .unwrap();
+    assert_eq!(
+        pump(&mut bob).await,
+        Received::Edited {
+            author: alice.account,
+            id,
+            text: "final text".into()
+        }
+    );
+    assert_eq!(
+        bob.core
+            .store
+            .message(&alice.account, &id)
+            .unwrap()
+            .unwrap()
+            .text,
+        "final text"
+    );
+    // Bob cannot edit or delete Alice's message: only its author can.
+    bob.core
+        .delete_for_everyone(&alice.account, &id)
+        .await
+        .unwrap_err();
+    // Alice deletes it for everyone.
+    alice
+        .core
+        .delete_for_everyone(&bob.account, &id)
+        .await
+        .unwrap();
+    assert_eq!(
+        pump(&mut bob).await,
+        Received::Deleted {
+            author: alice.account,
+            id
+        }
+    );
+    let gone = bob
+        .core
+        .store
+        .message(&alice.account, &id)
+        .unwrap()
+        .unwrap();
+    assert!(gone.text.is_empty() && gone.content.is_empty());
+    assert_eq!(
+        bob.core.store.reactions(&alice.account, &id).unwrap().len(),
+        0
+    );
+}

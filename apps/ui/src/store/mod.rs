@@ -590,6 +590,14 @@ impl Store {
     /// Adds, changes or removes the user's reaction (one per message).
     pub fn react(&self, chat: ChatId, id: MsgId, emoji: &str) {
         let emoji = emoji.to_string();
+        if crate::backend::chat::owns(chat) {
+            let had = self.message(chat, id).is_some_and(|m| {
+                m.reactions
+                    .iter()
+                    .any(|r| r.emoji == emoji && r.by.contains(&None))
+            });
+            crate::backend::chat::react(chat, id, if had { String::new() } else { emoji.clone() });
+        }
         self.edit_message(chat, id, |m| {
             let had = m
                 .reactions
@@ -613,6 +621,9 @@ impl Store {
 
     /// Edits the user's own text within the edit window (15 minutes).
     pub fn edit_text(&self, chat: ChatId, id: MsgId, text: String) {
+        if crate::backend::chat::owns(chat) && self.message(chat, id).is_some_and(|m| m.mine()) {
+            crate::backend::chat::edit(chat, id, text.clone());
+        }
         self.edit_message(chat, id, |m| {
             if m.mine() {
                 m.body = Body::Text(text);
@@ -622,6 +633,9 @@ impl Store {
     }
 
     pub fn delete_for_everyone(&self, chat: ChatId, id: MsgId) {
+        if crate::backend::chat::owns(chat) && self.message(chat, id).is_some_and(|m| m.mine()) {
+            crate::backend::chat::delete_for_everyone(chat, id);
+        }
         self.edit_message(chat, id, |m| {
             m.body = Body::Deleted;
             m.reactions.clear();

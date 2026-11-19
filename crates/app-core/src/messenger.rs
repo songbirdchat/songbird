@@ -94,6 +94,33 @@ pub enum Received {
         /// Its new status.
         status: Status,
     },
+    /// Someone reacted to a message (empty `emoji`: removed).
+    Reaction {
+        /// The message's author.
+        author: [u8; 16],
+        /// The message.
+        id: [u8; 16],
+        /// Who reacted.
+        reactor: [u8; 16],
+        /// The emoji, empty when removed.
+        emoji: String,
+    },
+    /// A message's author edited it.
+    Edited {
+        /// The author.
+        author: [u8; 16],
+        /// The message.
+        id: [u8; 16],
+        /// Its new text.
+        text: String,
+    },
+    /// A message was deleted for everyone.
+    Deleted {
+        /// The author.
+        author: [u8; 16],
+        /// The message.
+        id: [u8; 16],
+    },
     /// A system notice was handled (prekeys refilled, the device list refreshed).
     System,
     /// Nothing to show (a duplicate, a dropped or unreadable envelope).
@@ -601,6 +628,95 @@ impl<N: Net> Messenger<N> {
         Ok(bytes)
     }
 
+    /// Sends an event about an earlier message (a reaction, an edit, a delete): franked like any
+    /// visible message, kept in the outbox until accepted, but not a message of its own.
+    async fn send_event(&mut self, to: &[u8; 16], kind: data_message::Kind) -> Result<()> {
+        let id = *random::<16>()?;
+        let sent_at = now_ms();
+        let content = Content {
+            version: songbird_content::VERSION,
+            required_version: 1,
+            message_id: id.to_vec(),
+            sent_at_ms: sent_at,
+            body: Some(Body::Data(DataMessage {
+                kind: Some(kind),
+                ..Default::default()
+            })),
+        };
+        let idem = *random::<16>()?;
+        self.store
+            .outbox_put(&idem, to, &id, &content.encode_to_vec(), sent_at)?;
+        self.deliver(idem, to, &id, &content).await
+    }
+
+    fn next_counter(&self, key: &str) -> Result<u64> {
+        let n = self
+            .store
+            .secret(key)?
+            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+            .map_or(0, u64::from_be_bytes)
+            .max(now_ms())
+            + 1;
+        self.store.put_secret(key, &n.to_be_bytes())?;
+        Ok(n)
+    }
+
+    /// Reacts to a message in a 1:1 chat (empty `emoji` removes this account's reaction).
+    pub async fn react(
+        &mut self,
+        chat: &[u8; 16],
+        author: &[u8; 16],
+        id: &[u8; 16],
+        emoji: &str,
+    ) -> Result<()> {
+        let counter = self.next_counter("reaction_counter")?;
+        let me = self.local.account;
+        self.store.react(author, id, &me, emoji, counter)?;
+        let r = schema::Reaction {
+            target: Some(schema::MessageRef {
+                author: author.to_vec(),
+                message_id: id.to_vec(),
+            }),
+            emoji: emoji.into(),
+            remove: emoji.is_empty(),
+            counter,
+        };
+        self.send_event(chat, data_message::Kind::Reaction(r)).await
+    }
+
+    /// Edits one of this account's messages.
+    pub async fn edit(&mut self, chat: &[u8; 16], id: &[u8; 16], text: &str) -> Result<()> {
+        let me = self.local.account;
+        self.store.message(&me, id)?.ok_or(Error::Malformed)?;
+        let revision =
+            u32::try_from(self.next_counter("edit_revision")? % u64::from(u32::MAX)).unwrap_or(1);
+        self.store.set_text(&me, id, text)?;
+        let e = schema::Edit {
+            target_message_id: id.to_vec(),
+            text: Some(Text {
+                body: text.into(),
+                spans: Vec::new(),
+            }),
+            revision,
+        };
+        self.send_event(chat, data_message::Kind::Edit(e)).await
+    }
+
+    /// Deletes one of this account's messages for everyone.
+    pub async fn delete_for_everyone(&mut self, chat: &[u8; 16], id: &[u8; 16]) -> Result<()> {
+        let me = self.local.account;
+        // Only this account's own messages (the recipient checks it too).
+        self.store.message(&me, id)?.ok_or(Error::Malformed)?;
+        self.store.mark_deleted(&me, id)?;
+        let d = schema::Delete {
+            target: Some(schema::MessageRef {
+                author: me.to_vec(),
+                message_id: id.to_vec(),
+            }),
+        };
+        self.send_event(chat, data_message::Kind::Delete(d)).await
+    }
+
     /// Sends a location the user picked on the map (PROTOCOL §5.4 `LocationPin`).
     pub async fn send_location(
         &mut self,
@@ -924,6 +1040,69 @@ impl<N: Net> Messenger<N> {
                 if account != self.local.account && !franked_ok {
                     return Ok(Received::Nothing);
                 }
+                match &data.kind {
+                    Some(data_message::Kind::Reaction(r)) => {
+                        let Some((author, id)) = r.target.as_ref().and_then(|t| {
+                            Some((
+                                <[u8; 16]>::try_from(t.author.as_slice()).ok()?,
+                                <[u8; 16]>::try_from(t.message_id.as_slice()).ok()?,
+                            ))
+                        }) else {
+                            return Ok(Received::Nothing);
+                        };
+                        let emoji = if r.remove {
+                            String::new()
+                        } else {
+                            r.emoji.clone()
+                        };
+                        if self
+                            .store
+                            .react(&author, &id, &account, &emoji, r.counter)?
+                        {
+                            return Ok(Received::Reaction {
+                                author,
+                                id,
+                                reactor: account,
+                                emoji,
+                            });
+                        }
+                        return Ok(Received::Nothing);
+                    }
+                    Some(data_message::Kind::Edit(e)) => {
+                        // Only the author edits, and only an existing message.
+                        let Ok(id) = <[u8; 16]>::try_from(e.target_message_id.as_slice()) else {
+                            return Ok(Received::Nothing);
+                        };
+                        let text = e.text.as_ref().map(|t| t.body.clone()).unwrap_or_default();
+                        if self.store.message(&account, &id)?.is_some() {
+                            self.store.set_text(&account, &id, &text)?;
+                            return Ok(Received::Edited {
+                                author: account,
+                                id,
+                                text,
+                            });
+                        }
+                        return Ok(Received::Nothing);
+                    }
+                    Some(data_message::Kind::Delete(d)) => {
+                        let Some(id) = d.target.as_ref().and_then(|t| {
+                            (t.author.as_slice() == account.as_slice())
+                                .then(|| <[u8; 16]>::try_from(t.message_id.as_slice()).ok())
+                                .flatten()
+                        }) else {
+                            return Ok(Received::Nothing);
+                        };
+                        if self.store.message(&account, &id)?.is_some() {
+                            self.store.mark_deleted(&account, &id)?;
+                            return Ok(Received::Deleted {
+                                author: account,
+                                id,
+                            });
+                        }
+                        return Ok(Received::Nothing);
+                    }
+                    _ => {}
+                }
                 let row = data_row(&content, data, account, account, Status::Delivered)?;
                 if !self.store.insert_message(&row, true)? {
                     return Ok(Received::Nothing);
@@ -965,6 +1144,11 @@ impl<N: Net> Messenger<N> {
                 let Some(Body::Data(data)) = &c.body else {
                     return Ok(Received::Nothing);
                 };
+                // Only messages become rows; events about them are applied by the sender's own
+                // copy already (reactions, edits and deletes are stored before they are sent).
+                if !matches!(data.kind, Some(data_message::Kind::Message(_))) {
+                    return Ok(Received::Nothing);
+                }
                 let Some(chat) = t
                     .chat
                     .as_ref()

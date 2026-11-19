@@ -52,6 +52,8 @@ thread_local! {
     /// Real accounts by UI contact ID, and app-core message IDs by UI ID.
     static ACCOUNTS: RefCell<HashMap<ContactId, [u8; 16]>> = RefCell::new(HashMap::new());
     static OUTGOING: RefCell<HashMap<MsgId, [u8; 16]>> = RefCell::new(HashMap::new());
+    /// Every real message shown: UI message → (author, app-core message ID).
+    static IDS: RefCell<HashMap<MsgId, ([u8; 16], [u8; 16])>> = RefCell::new(HashMap::new());
     /// Real media messages: UI message → (author, app-core message ID).
     static MEDIA: RefCell<HashMap<MsgId, ([u8; 16], [u8; 16])>> = RefCell::new(HashMap::new());
     /// Accounts whose profile was fetched this run.
@@ -362,6 +364,7 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
     }
     let from = (!mine).then_some(chat);
     let body = body_of(row);
+    IDS.with_borrow_mut(|m| m.insert(id, (row.author, row.id)));
     let media = matches!(body, Body::Image { .. } | Body::File { .. });
     if media {
         MEDIA.with_borrow_mut(|m| m.insert(id, (row.author, row.id)));
@@ -523,6 +526,7 @@ pub fn send_picked(s: Store, chat: ChatId, files: Vec<nsh_core::picker::PickedFi
             match st {
                 Some((id, status)) => {
                     OUTGOING.with_borrow_mut(|o| o.insert(ui, id));
+                    IDS.with_borrow_mut(|x| x.insert(ui, (me, id)));
                     MEDIA.with_borrow_mut(|x| x.insert(ui, (me, id)));
                     set_status(s, &id, status);
                     Ok(())
@@ -558,6 +562,9 @@ fn kind_of(mime: &str) -> String {
 
 /// What a stored message shows as: its text, or a real place on the map.
 fn body_of(row: &MessageRow) -> Body {
+    if row.content.is_empty() {
+        return Body::Deleted;
+    }
     if let Some(p) = songbird_app_core::messenger::attachments_of(&row.content)
         .into_iter()
         .next()
@@ -608,6 +615,13 @@ fn show_all(s: Store, m: &Core) {
         let chat = ensure_chat(s, c.id, None);
         for row in m.store.messages(&c.id, None, 200).unwrap_or_default() {
             show(s, &me, &row, false);
+            if let Some(msg) = ui_of(&row.author, &row.id) {
+                for (reactor, emoji) in m.store.reactions(&row.author, &row.id).unwrap_or_default()
+                {
+                    let by = (reactor != me).then(|| ui_id(&reactor));
+                    apply_reaction(s, msg, by, &emoji);
+                }
+            }
         }
         s.edit_chat(chat, |x| x.unread = c.unread);
     }
@@ -638,6 +652,36 @@ pub async fn receive(envelope: &[u8]) -> bool {
         Ok(Received::Status { id, status }) => {
             if let Some(s) = crate::store::try_store() {
                 set_status(s, &id, status);
+            }
+            true
+        }
+        Ok(Received::Reaction {
+            author,
+            id,
+            reactor,
+            emoji,
+        }) => {
+            if let (Some(s), Some(msg)) = (crate::store::try_store(), ui_of(&author, &id)) {
+                let by = (reactor != me).then(|| ui_id(&reactor));
+                apply_reaction(s, msg, by, &emoji);
+            }
+            true
+        }
+        Ok(Received::Edited { author, id, text }) => {
+            if let (Some(s), Some(msg)) = (crate::store::try_store(), ui_of(&author, &id)) {
+                edit_shown(s, msg, |m| {
+                    m.body = Body::Text(text.clone());
+                    m.edited = true;
+                });
+            }
+            true
+        }
+        Ok(Received::Deleted { author, id }) => {
+            if let (Some(s), Some(msg)) = (crate::store::try_store(), ui_of(&author, &id)) {
+                edit_shown(s, msg, |m| {
+                    m.body = Body::Deleted;
+                    m.reactions.clear();
+                });
             }
             true
         }
@@ -692,6 +736,7 @@ pub fn send(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
             match st {
                 Some((id, status)) => {
                     OUTGOING.with_borrow_mut(|o| o.insert(ui_msg, id));
+                    IDS.with_borrow_mut(|m| m.insert(ui_msg, (me_account(), id)));
                     set_status(s, &id, status);
                     Ok(())
                 }
@@ -722,6 +767,7 @@ pub fn send(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
         match m.send_text(&to, &text).await {
             Ok(id) => {
                 OUTGOING.with_borrow_mut(|o| o.insert(ui_msg, id));
+                IDS.with_borrow_mut(|m| m.insert(ui_msg, (me_account(), id)));
                 let status = m
                     .store
                     .message(&m.local().account, &id)
@@ -749,19 +795,131 @@ pub fn send(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
     });
 }
 
-/// Tells the authors of a real chat's unread messages that they were read.
+fn me_account() -> [u8; 16] {
+    live()
+        .with_untracked(|l| l.account.as_deref().and_then(hex16))
+        .unwrap_or([0; 16])
+}
+
+/// The UI message for (author, app-core ID), if shown.
+fn ui_of(author: &[u8; 16], id: &[u8; 16]) -> Option<MsgId> {
+    IDS.with_borrow(|m| {
+        m.iter()
+            .find(|(_, v)| v.0 == *author && v.1 == *id)
+            .map(|(k, _)| *k)
+    })
+}
+
+/// Marks a real chat read here and, when "Read receipts" is on, tells the
+/// authors (Settings → Privacy; off sends nothing, as Signal and WhatsApp do).
 pub fn mark_read(chat: ChatId) {
     let Some(account) = account_of(chat) else {
+        return;
+    };
+    let send =
+        crate::store::try_store().is_none_or(|s| s.settings.with_untracked(|x| x.read_receipts));
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        if let Some(m) = guard.as_mut() {
+            if send {
+                let _ = m.mark_read(&account).await;
+            } else {
+                let me = m.local().account;
+                let _ = m.store.mark_read(&account, &me);
+            }
+        }
+        Ok(())
+    });
+}
+
+fn target(chat: ChatId, msg: MsgId) -> Option<([u8; 16], [u8; 16], [u8; 16])> {
+    let peer = account_of(chat)?;
+    let (author, id) = IDS.with_borrow(|m| m.get(&msg).copied())?;
+    Some((peer, author, id))
+}
+
+/// Reacts in a real chat (empty: the user's reaction removed).
+pub fn react(chat: ChatId, msg: MsgId, emoji: String) {
+    let Some((peer, author, id)) = target(chat, msg) else {
         return;
     };
     super::run(async move {
         let lock = core();
         let mut guard = lock.lock().await;
-        if let Some(m) = guard.as_mut() {
-            let _ = m.mark_read(&account).await;
-        }
-        Ok(())
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        m.react(&peer, &author, &id, &emoji)
+            .await
+            .map_err(|_| super::problem("The reaction couldn't be sent."))
     });
+}
+
+/// Edits the user's own message in a real chat.
+pub fn edit(chat: ChatId, msg: MsgId, text: String) {
+    let Some((peer, _, id)) = target(chat, msg) else {
+        return;
+    };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        m.edit(&peer, &id, &text)
+            .await
+            .map_err(|_| super::problem("The edit couldn't be sent."))
+    });
+}
+
+/// Deletes the user's own message for everyone in a real chat.
+pub fn delete_for_everyone(chat: ChatId, msg: MsgId) {
+    let Some((peer, _, id)) = target(chat, msg) else {
+        return;
+    };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        m.delete_for_everyone(&peer, &id)
+            .await
+            .map_err(|_| super::problem("The message couldn't be deleted for everyone."))
+    });
+}
+
+fn apply_reaction(s: Store, msg: MsgId, by: Option<ContactId>, emoji: &str) {
+    edit_shown(s, msg, |m| {
+        for r in &mut m.reactions {
+            r.by.retain(|b| *b != by);
+        }
+        m.reactions.retain(|r| !r.by.is_empty());
+        if !emoji.is_empty() {
+            match m.reactions.iter_mut().find(|r| r.emoji == emoji) {
+                Some(r) => r.by.push(by),
+                None => m.reactions.push(crate::store::Reaction {
+                    emoji: emoji.to_owned(),
+                    by: vec![by],
+                }),
+            }
+        }
+    });
+}
+
+fn edit_shown(s: Store, msg: MsgId, f: impl Fn(&mut crate::store::Message)) {
+    let chats: Vec<ChatId> = ACCOUNTS.with_borrow(|a| a.keys().copied().collect());
+    for chat in chats {
+        s.messages.update(|all| {
+            if let Some(m) = all
+                .get_mut(&chat)
+                .and_then(|v| v.iter_mut().find(|x| x.id == msg))
+            {
+                f(m);
+            }
+        });
+    }
 }
 
 /// Starts (or opens) a chat with the account that holds `username`

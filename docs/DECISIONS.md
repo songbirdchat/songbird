@@ -199,6 +199,23 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0143 — Reactions, edits and deletes for everyone through app-core
+
+- Date: 2026-11-19
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision: reactions, edits and deletes travel as franked `DataMessage` events
+  (`Reaction`, `Edit`, `Delete`, PROTOCOL §5.4) through the outbox like messages, but are not
+  messages themselves. A reaction is one per reactor and message, the highest counter wins
+  (store schema 3, `reactions`); an edit or delete is applied only when its sender is the
+  message's author, on both sides (the sender refuses before sending); a deleted message keeps
+  its row with no text, content, files or reactions, shown as "deleted". With "Read receipts"
+  off, reading a chat marks it read on this device and sends nothing.
+- Evidence: `gate_a2::reactions_edits_and_deletes_reach_the_other_side` against the real stack
+  (five gate tests pass); `apps/ui` 211 tests.
+- Consequences: the 24-hour window for edits and deletes (D-0058) is not yet enforced on
+  receipt; edit history is not kept (only the newest text).
+
 ## D-0142 — Maps from self-hosted OpenStreetMap vector tiles
 
 - Date: 2026-11-19

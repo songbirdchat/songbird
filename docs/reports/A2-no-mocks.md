@@ -27,6 +27,7 @@ Status: ☐ open · ☑ done (with the commit).
 - ☑ Wallpaper, status expiry, recovery sheet, keep-archived, chat export, Songbird's own tones
 - ☑ Attachments in app-core: encrypted upload, verified download, end to end (D-0141)
 - ☑ Photos and documents in real chats: system pickers, sent through app-core, shown and saved; received files kept encrypted in the store; auto-download for photos honoured; HD uploads keep full size (D-0141)
+- ☑ Reactions, edits and delete for everyone in real chats, end to end; reactions kept in the store (schema 3); the read-receipts setting honoured (D-0143)
 - ☑ Location: self-hosted OpenStreetMap tiles, the map picker, real places sent and shown (D-0142)
 - ☑ 1:1 text chats through app-core: send, receive, ticks, read receipts, new chat by username (675bfff)
 
@@ -43,8 +44,8 @@ Status: ☐ open · ☑ done (with the commit).
 - lock chat unlocked with the app passcode
 
 **b (app-core):**
-- read receipts and typing indicators honour their settings
-- reactions, edits, deletes for everyone, pins and polls in real chats
+- typing indicators (ephemeral, §5.7)
+- pins and polls in real chats
 - disappearing timers (`TimerChange`, `EXPIRES`)
 - block (`/v1/blocks`) and report (`/v1/reports`)
 - mark all read
