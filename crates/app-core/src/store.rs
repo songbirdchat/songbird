@@ -114,6 +114,8 @@ pub struct MessageRow {
 
 /// An address and its sessions, as read back.
 type Grouped = Option<(([u8; 16], [u8; 16]), Vec<Session>)>;
+/// A kept franking proof: the stamp, the franking key, the content as received.
+pub type Frank = (Vec<u8>, Vec<u8>, Vec<u8>);
 /// An outbox entry: idempotency key, chat, message ID, content.
 pub type OutboxEntry = ([u8; 16], [u8; 16], [u8; 16], Vec<u8>);
 
@@ -299,7 +301,7 @@ impl Store {
     }
 
     /// The newest `n` reportable messages from `author`: (stamp, franking key, content).
-    pub fn franks(&self, author: &[u8; 16], n: u32) -> Result<Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>> {
+    pub fn franks(&self, author: &[u8; 16], n: u32) -> Result<Vec<Frank>> {
         let mut st = db(self.db.prepare(
             "SELECT stamp, franking_key, content FROM franks WHERE author = ?1 ORDER BY rowid DESC LIMIT ?2",
         ))?;
@@ -310,7 +312,7 @@ impl Store {
                 r.get::<_, Vec<u8>>(2)?,
             ))
         }))?;
-        rows.map(|r| db(r)).collect()
+        rows.map(db).collect()
     }
 
     /// Records `reactor`'s reaction to a message (empty `emoji`: removed), if `counter` is newer
