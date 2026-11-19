@@ -1101,3 +1101,77 @@ async fn invite_links_and_join_requests() {
     assert_eq!(pump_app(&mut bob).await, Received::Joined { group: gid2 });
     assert_eq!(alice.core.join_requests(&gid2).await.unwrap().len(), 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channels_and_communities() {
+    use songbird_app_core::mls::links::Opened;
+    use songbird_groups::roles::Role;
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    // A private channel: Alice posts; Bob subscribes by link, read-only.
+    let ch = alice
+        .core
+        .create_channel([0x0c; 16], "Town news")
+        .await
+        .unwrap();
+    assert_eq!(
+        alice.core.group_kind(&ch).unwrap(),
+        (true, false, Role::Owner)
+    );
+    let url = alice.core.create_link(&ch, false).await.unwrap();
+    assert_eq!(bob.core.open_link(&url).await.unwrap(), Opened::Joined(ch));
+    assert!(matches!(
+        pump_app(&mut alice).await,
+        Received::GroupUpdated { .. }
+    ));
+    assert_eq!(
+        bob.core.group_kind(&ch).unwrap(),
+        (true, false, Role::ReadOnly)
+    );
+    let post = alice
+        .core
+        .send_group_text(&ch, "Road closed on Monday")
+        .await
+        .unwrap();
+    let Received::Message(m) = pump_app(&mut bob).await else {
+        panic!("a post")
+    };
+    assert_eq!((m.id, m.chat), (post, ch));
+    // A subscriber's post is refused by the server (reason 14: the roles don't let it send).
+    assert!(bob.core.send_group_text(&ch, "me too").await.is_err());
+
+    // A community: its announcement group (only admins post) carries the community's ID.
+    let cid = alice
+        .core
+        .create_community([0xc0; 16], "Neighbours", &[bob.account])
+        .await
+        .unwrap();
+    assert_eq!(pump_app(&mut bob).await, Received::Joined { group: cid });
+    assert!(matches!(
+        pump_app(&mut bob).await,
+        Received::GroupUpdated { .. }
+    ));
+    assert_eq!(
+        bob.core.group_kind(&cid).unwrap(),
+        (false, true, Role::Member)
+    );
+    assert_eq!(
+        bob.core.community_groups(&cid).await.unwrap(),
+        Some(Vec::new())
+    );
+    // Alice adds a group of hers; members of the announcement group see it listed.
+    let garden = alice
+        .core
+        .create_group("Garden", &[bob.account])
+        .await
+        .unwrap();
+    assert_eq!(pump_app(&mut bob).await, Received::Joined { group: garden });
+    alice.core.community_add_group(&cid, &garden).await.unwrap();
+    assert_eq!(
+        bob.core.community_groups(&cid).await.unwrap(),
+        Some(vec![garden])
+    );
+    // A plain group is no community.
+    assert_eq!(bob.core.community_groups(&garden).await.unwrap(), None);
+}

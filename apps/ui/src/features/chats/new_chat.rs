@@ -97,6 +97,21 @@ fn body() -> impl IntoElement {
                                 "New broadcast list",
                                 open_broadcast,
                             ))
+                            // A private channel (D-0149): the user posts; others follow by link.
+                            .child(action(Icon::Megaphone, "New channel", || {
+                                let s = store();
+                                let title = format!(
+                                    "{}'s channel",
+                                    s.me.with_untracked(|m| m.name.clone())
+                                );
+                                match s.create_channel(title) {
+                                    Some(chat) => {
+                                        nav::pop_to_root();
+                                        features::groups::invite_link_page(chat);
+                                    }
+                                    None => toast("Sign up first to make a channel."),
+                                }
+                            }))
                             .child(action(
                                 Icon::Share,
                                 "Invite a friend",

@@ -199,6 +199,33 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0149 — Communities and private channels on the device
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision:
+  1. **Channels** (§6.10): a group created with `Policy::CHANNEL`; subscribers join by its
+     link read-only; the server refuses their posts (reason 14). The app's "New channel" makes
+     one and opens its link page.
+  2. **Communities** (§6.9): a community's ID is its announcement group's ID (only admins post
+     there), so members need no new content format to know it: a group whose roles let only
+     admins send, and which is not a channel, is asked for its community
+     (`POST /v1/communities/state`, 404 for a plain group). The community's name is the
+     announcement group's title (an encrypted group update); the server's meta blob stays
+     unused. Admins of both add a group (`/v1/communities/groups/add`).
+  3. **No public directory** (public channels await the owner's legal review, D-0065 §4): the
+     seeded directory shows only in the demo fixtures.
+  4. The app's bridge gained the handlers four earlier edits had silently missed (a typing
+     indicator received, joining a group, group updates, removal), found while wiring this:
+     every bridge hook was then checked to exist.
+- Evidence: `gate_a2::channels_and_communities` against the real stack: an owner posts in a
+  channel a subscriber reads, the subscriber's post is refused, a community's announcement group
+  and an added group are listed for a member (ten gate tests pass); `apps/ui` 211 tests.
+- Consequences: joining a community's other groups is by their own links (the protocol's
+  rule); a community's encrypted info beyond its name, and its picture, come with group info
+  (`/v1/groups/meta`, not yet used).
+
 ## D-0148 — Group invite links and join requests
 
 - Date: 2026-11-20

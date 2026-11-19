@@ -9,6 +9,9 @@ pub mod client;
 pub mod crypto;
 pub mod links;
 
+/// A member's role in a group (§6.6).
+pub use songbird_groups::roles::Role;
+
 use openmls_memory_storage::MemoryStorage;
 use openmls_traits::OpenMlsProvider;
 

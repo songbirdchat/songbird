@@ -305,6 +305,138 @@ pub async fn open_group_link(url: &str) -> Result<Option<ChatId>, super::Problem
     }
 }
 
+/// A real community's UI ID (its announcement group keeps the group's own).
+fn community_ui(cid: &[u8; 16]) -> ChatId {
+    ui_id(cid) ^ 1
+}
+
+/// Gives a real group's chat its kind: a channel (admin or subscriber), or a community's
+/// announcement group (with the community and its groups), from the group's roles (D-0149).
+fn apply_kind(
+    s: Store,
+    chat: ChatId,
+    gid: [u8; 16],
+    title: &str,
+    kind: Option<(bool, bool, songbird_app_core::mls::Role)>,
+    community: Option<&[[u8; 16]]>,
+) {
+    use songbird_app_core::mls::Role as R;
+    match kind {
+        Some((true, _, role)) => {
+            s.edit_chat(chat, |c| {
+                c.kind = ChatKind::Channel {
+                    followers: 1,
+                    admin: role >= R::Admin,
+                };
+                c.announcement_only = role < R::Admin;
+            });
+        }
+        Some((false, true, role)) => {
+            let cid = community_ui(&gid);
+            if s.chat(cid).is_none() {
+                let mut c = crate::store::seed::chat(cid, ChatKind::Community, title);
+                c.members = vec![crate::store::Member {
+                    contact: None,
+                    role: if role >= R::Owner {
+                        crate::store::Role::Owner
+                    } else if role >= R::Admin {
+                        crate::store::Role::Admin
+                    } else {
+                        crate::store::Role::Member
+                    },
+                }];
+                s.chats.update(|cs| cs.push(c));
+            }
+            s.edit_chat(chat, |c| {
+                c.community = Some(cid);
+                c.announcement_only = role < R::Admin;
+                c.title = "Announcements".into();
+            });
+            for g in community.unwrap_or_default() {
+                let gc = ui_id(g);
+                if s.chat(gc).is_some() {
+                    s.edit_chat(gc, |c| c.community = Some(cid));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Creates a real channel: the user posts; others subscribe by its link.
+pub fn create_channel(s: Store, title: String) -> ChatId {
+    let gid: [u8; 16] = wire::random();
+    let chat = ensure_group(s, gid, &title);
+    apply_kind(
+        s,
+        chat,
+        gid,
+        &title,
+        Some((true, false, songbird_app_core::mls::Role::Owner)),
+        None,
+    );
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        m.create_channel(gid, &title)
+            .await
+            .map_err(|_| super::problem("The channel couldn't be created. Try again."))?;
+        Ok(())
+    });
+    chat
+}
+
+/// Creates a real community with its announcement group. Answers the community's chat.
+pub fn create_community(s: Store, title: String) -> ChatId {
+    let cid: [u8; 16] = wire::random();
+    let ann = ensure_group(s, cid, &title);
+    apply_kind(
+        s,
+        ann,
+        cid,
+        &title,
+        Some((false, true, songbird_app_core::mls::Role::Owner)),
+        None,
+    );
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        m.create_community(cid, &title, &[])
+            .await
+            .map_err(|_| super::problem("The community couldn't be created. Try again."))?;
+        Ok(())
+    });
+    community_ui(&cid)
+}
+
+/// Puts a real group into a real community (an admin of both).
+pub fn community_add_group(community: ChatId, group: ChatId) {
+    let cid = GROUPS.with_borrow(|g| {
+        g.iter()
+            .find(|(k, _)| community_ui(&g[*k]) == community)
+            .map(|(_, v)| *v)
+    });
+    let (Some(cid), Some(gid)) = (cid, group_of(group)) else {
+        return;
+    };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        m.community_add_group(&cid, &gid).await.map_err(|_| {
+            super::problem("The group couldn't be added. You must be an admin of both.")
+        })
+    });
+}
+
 /// Creates a real group with real contacts: the chat shows at once; app-core creates it on the
 /// server, adds every member's devices and sends the title (D-0146).
 pub fn create_group(s: Store, title: String, members: Vec<ContactId>) -> ChatId {
@@ -888,7 +1020,10 @@ fn show_all(s: Store, m: &Core) {
     let me = m.local().account;
     for c in m.store.chats().unwrap_or_default() {
         let chat = if c.group {
-            ensure_group(s, c.id, &m.group_title(&c.id).unwrap_or_default())
+            let title = m.group_title(&c.id).unwrap_or_default();
+            let chat = ensure_group(s, c.id, &title);
+            apply_kind(s, chat, c.id, &title, m.group_kind(&c.id).ok(), None);
+            chat
         } else {
             ensure_chat(s, c.id, None)
         };
@@ -961,6 +1096,57 @@ pub async fn receive(envelope: &[u8]) -> bool {
                     m.body = Body::Deleted;
                     m.reactions.clear();
                 });
+            }
+            true
+        }
+        Ok(Received::Typing { account, started }) => {
+            // Shown only with Typing indicators on (off: neither sent nor shown).
+            if let Some(s) = crate::store::try_store()
+                && s.settings.with_untracked(|x| x.typing_indicators)
+            {
+                let chat = ui_id(&account);
+                if owns(chat) {
+                    s.edit_chat(chat, |c| c.typing = started.then(|| "typing…".to_string()));
+                    if started {
+                        // Apps stop showing it 15 s after the last "started" (§5.7).
+                        set_timeout(std::time::Duration::from_secs(15), move || {
+                            s.edit_chat(chat, |c| c.typing = None);
+                        });
+                    }
+                }
+            }
+            true
+        }
+        Ok(Received::Joined { group }) => {
+            let title = m.group_title(&group).unwrap_or_default();
+            let kind = m.group_kind(&group).ok();
+            let community = match kind {
+                Some((false, true, _)) => m.community_groups(&group).await.ok().flatten(),
+                _ => None,
+            };
+            if let Some(s) = crate::store::try_store() {
+                let chat = ensure_group(s, group, &title);
+                apply_kind(s, chat, group, &title, kind, community.as_deref());
+                s.push_message(chat, None, Body::System("You were added".into()));
+            }
+            true
+        }
+        Ok(Received::GroupUpdated { group, title }) => {
+            let devices = m.group_devices(&group).map(|d| d.len()).unwrap_or(0);
+            if let Some(s) = crate::store::try_store() {
+                let chat = ensure_group(s, group, &title);
+                if let Some(ChatKind::Channel { admin, .. }) = s.chat(chat).map(|c| c.kind) {
+                    let followers = u32::try_from(devices).unwrap_or(u32::MAX);
+                    s.edit_chat(chat, |c| c.kind = ChatKind::Channel { followers, admin });
+                }
+            }
+            true
+        }
+        Ok(Received::RemovedFromGroup { group }) => {
+            if let Some(s) = crate::store::try_store() {
+                let chat = ui_id(&group);
+                s.push_message(chat, None, Body::System("You were removed".into()));
+                s.edit_chat(chat, |c| c.members.retain(|x| x.contact.is_some()));
             }
             true
         }

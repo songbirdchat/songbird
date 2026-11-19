@@ -196,8 +196,104 @@ impl<N: Net> Messenger<N> {
         title: &str,
         members: &[[u8; 16]],
     ) -> Result<[u8; 16]> {
+        self.create_with_policy(gid, title, members, Policy::GROUP)
+            .await
+    }
+
+    /// Creates a private channel (§6.10): admins post; subscribers join read-only by link.
+    pub async fn create_channel(&mut self, gid: [u8; 16], title: &str) -> Result<[u8; 16]> {
+        self.create_with_policy(gid, title, &[], Policy::CHANNEL)
+            .await
+    }
+
+    /// Creates a community (§6.9) around its announcement group, whose ID is the community's
+    /// (D-0149): only admins post there; its members are the community's members.
+    pub async fn create_community(
+        &mut self,
+        cid: [u8; 16],
+        title: &str,
+        members: &[[u8; 16]],
+    ) -> Result<[u8; 16]> {
+        let policy = Policy {
+            send: songbird_groups::roles::Role::Admin,
+            ..Policy::GROUP
+        };
+        self.create_with_policy(cid, title, members, policy).await?;
+        let mut body = vec![1];
+        body.extend_from_slice(&cid);
+        body.extend_from_slice(&cid);
+        let (status, _) = self.net.api("POST", "/v1/communities", body).await?;
+        if status == 204 || status == 200 {
+            Ok(cid)
+        } else {
+            Err(Error::Server(status))
+        }
+    }
+
+    /// Puts a group this device's account admins into a community it admins.
+    pub async fn community_add_group(&mut self, cid: &[u8; 16], gid: &[u8; 16]) -> Result<()> {
+        let mut body = vec![1];
+        body.extend_from_slice(cid);
+        body.extend_from_slice(gid);
+        let (status, _) = self
+            .net
+            .api("POST", "/v1/communities/groups/add", body)
+            .await?;
+        if status == 204 || status == 200 {
+            Ok(())
+        } else {
+            Err(Error::Server(status))
+        }
+    }
+
+    /// A community's groups, or `None` when `cid` is not a community this device can read.
+    pub async fn community_groups(&mut self, cid: &[u8; 16]) -> Result<Option<Vec<[u8; 16]>>> {
+        let mut body = vec![1];
+        body.extend_from_slice(cid);
+        let (status, answer) = self.net.api("POST", "/v1/communities/state", body).await?;
+        if status == 404 {
+            return Ok(None);
+        }
+        if status != 200 {
+            return Err(Error::Server(status));
+        }
+        let mut r = crate::crypto::Reader::new(&answer);
+        let _announcement: [u8; 16] = r.array()?;
+        let _meta_v = r.u64()?;
+        let _meta = r.bytes32(16 << 10)?;
+        let n = r.u16()?;
+        let mut out = Vec::with_capacity(usize::from(n));
+        for _ in 0..n {
+            out.push(r.array()?);
+        }
+        r.finish()?;
+        Ok(Some(out))
+    }
+
+    /// What kind of group this is, from its roles: (a channel, an announcement group — only
+    /// admins send — and this account's role).
+    pub fn group_kind(&self, gid: &[u8; 16]) -> Result<(bool, bool, songbird_groups::roles::Role)> {
+        let group = self.load_group(gid)?;
+        let roles =
+            songbird_groups::ds::roles_in(group.extensions()).map_err(|_| Error::Malformed)?;
+        let channel = roles.policy.flags & songbird_groups::roles::FLAG_CHANNEL != 0;
+        let announcement = !channel && roles.policy.send >= songbird_groups::roles::Role::Admin;
+        Ok((
+            channel,
+            announcement,
+            roles.role(&AccountId::from_bytes(self.local.account)),
+        ))
+    }
+
+    async fn create_with_policy(
+        &mut self,
+        gid: [u8; 16],
+        title: &str,
+        members: &[[u8; 16]],
+        policy: Policy,
+    ) -> Result<[u8; 16]> {
         let ds = self.ds_key().await?;
-        let roles = Roles::new(AccountId::from_bytes(self.local.account), Policy::GROUP);
+        let roles = Roles::new(AccountId::from_bytes(self.local.account), policy);
         let cfg = MlsGroupCreateConfig::builder()
             .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
             .ciphersuite(GROUP_CIPHERSUITE)

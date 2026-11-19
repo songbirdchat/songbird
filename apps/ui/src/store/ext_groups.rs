@@ -175,6 +175,11 @@ pub struct DirectoryChannel {
 /// decision after legal review (DECISIONS.md, D-0065 §4), so these are
 /// sample entries.
 pub fn directory() -> Vec<DirectoryChannel> {
+    // There is no public channel directory (public channels await the owner's legal review,
+    // D-0065 §4): real accounts find channels by their invite links. The list is the demo's.
+    if !crate::store::demo() {
+        return Vec::new();
+    }
     vec![
         DirectoryChannel {
             id: 9001,
@@ -692,6 +697,12 @@ impl Store {
 
     /// Creates a community the user owns, with its announcement group.
     pub fn create_community(&self, title: String, about: String) -> ChatId {
+        // A real account: a real community on the server (D-0149).
+        if crate::backend::registered() && !crate::store::demo() {
+            let id = crate::backend::chat::create_community(*self, title.clone());
+            self.update_chat(id, |c| c.about = about.clone());
+            return id;
+        }
         let id = self.id();
         let mut c = seed::chat(id, ChatKind::Community, &title);
         c.about = about;
@@ -735,9 +746,17 @@ impl Store {
         gs
     }
 
+    /// Creates a private channel the user posts in (real accounts; D-0149).
+    pub fn create_channel(&self, title: String) -> Option<ChatId> {
+        crate::backend::registered().then(|| crate::backend::chat::create_channel(*self, title))
+    }
+
     /// Links a group the user admins into a community (both sides'
     /// admins agree, D-0072).
     pub fn link_group(&self, community: ChatId, group: ChatId) {
+        if crate::backend::chat::owns(group) {
+            crate::backend::chat::community_add_group(community, group);
+        }
         self.update_chat(group, |c| c.community = Some(community));
         let name = self.chat(community).map(|c| c.title).unwrap_or_default();
         self.push_message(
