@@ -28,6 +28,7 @@ members = [
     "crates/backup-storage",
     "crates/entitlements",
     "crates/tokens",
+    "crates/app-core",
     "services/delivery",
     "services/api",
     "services/push",

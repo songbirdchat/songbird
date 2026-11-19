@@ -1,0 +1,22 @@
+[package]
+name = "songbird-app-core"
+description = "Songbird's client core (A2, D-0136): PQXDH and a post-quantum Double Ratchet for 1:1 sessions (implemented from Signal's specifications, not linked, D-0047), the sealed per-device envelope, safety numbers, the encrypted on-device store (SQLCipher), and the message pipeline over the delivery client. Never linked by a service."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+songbird-keys.workspace = true
+songbird-content.workspace = true
+songbird-proto.workspace = true
+aws-lc-rs.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

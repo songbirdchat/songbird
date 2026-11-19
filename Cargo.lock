@@ -4960,6 +4960,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "songbird-app-core"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "proptest",
+ "songbird-content",
+ "songbird-keys",
+ "songbird-proto",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
 name = "songbird-backup-format"
 version = "0.1.0"
 dependencies = [

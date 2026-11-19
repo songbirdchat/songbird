@@ -199,6 +199,42 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0136 — A2 app-core, milestone 1: 1:1 sessions implemented from the specifications
+
+- Date: 2026-11-19
+- Status: accepted (owner, 2026-11-19, the three questions of `A2-plan.md` §2); the post-quantum
+  ratchet step is proposed, for review and formal modelling before release
+- Decided by: owner (protocol source, store, execution); agent (the constructions below)
+- Context: every app screen exists (D-0092) but app-core (A2) does not, so no message can be
+  exchanged. libsignal is AGPL-3.0 (D-0047).
+- Options considered: link libsignal (AGPL, audited) versus implement from Signal's published
+  specifications on aws-lc-rs (chosen by the owner, as D-0047 for the server). Local store:
+  SQLite with column sealing versus SQLCipher (chosen by the owner: whole-file encryption hides
+  schema, row counts, sizes and the search index). Post-quantum ratchet: none (PQXDH only, Signal
+  2023–2025), Signal's SPQR (erasure-coded ML-KEM braid; complex), or a KEM step on every DH
+  ratchet step (chosen; PQ3's idea, simpler than SPQR, ~2.3 KB per message of a chain).
+- Evidence: `cargo test -p songbird-app-core`: 21 tests, among them PQXDH agreement with and
+  without a one-time key, forged prekey signatures refused, the ratchet's round trips, out of order
+  and lost messages, tampering leaving state unchanged, a stripped KEM ciphertext refused, a
+  property test over random send schedules and deliveries, simultaneous session starts converging,
+  every state surviving its encoding. Prekey uploads are signed by the same XEdDSA code the server
+  verifies with. `cargo clippy -D warnings` clean.
+- Decision:
+  1. **PQXDH** per the specification (X25519, SHA-256, ML-KEM-1024, info
+     `Songbird_PQXDH_X25519_SHA-256_ML-KEM-1024`); `AD` also binds `SHA-256(PQPK || CT)`.
+  2. **Double Ratchet** per the specification; AES-256-GCM with key and nonce from HKDF of the
+     message key; at most 1,000 skipped per step and 2,000 kept.
+  3. **Post-quantum step**: each sending chain carries its sender's fresh ML-KEM-768 key and a
+     ciphertext to the peer's newest; `KDF_RK(rk, DH || SS)`. Only the initiator's first chain may
+     lack a ciphertext (PQXDH covers it); later headers without one are refused.
+  4. **Envelope**: the sender's account and device sealed to the recipient device's identity key
+     (ephemeral X25519, HKDF, AES-256-GCM), since `Deliver` names no sender. A prekey message's
+     identity must equal the one the sender's signed device list names.
+  5. **Safety numbers** over account identity keys (Signal's numeric fingerprint, 5,200 SHA-512
+     iterations), one number for all devices of both accounts.
+- Consequences: an external audit and a formal model of 3 and 4 before public launch. M2 (the
+  SQLCipher store) brings OpenSSL inside SQLCipher only, recorded then.
+
 ## D-0135 — A phone test environment on one Coolify server; TLS to delivery in the app
 
 - Date: 2026-11-19
