@@ -1352,7 +1352,8 @@ impl<N: Net> Messenger<N> {
                 let me = self.local.account;
                 let _ = self.devices_of(&me, true).await;
             }
-            _ => {}
+            // A kind this version does not know: verified, then ignored.
+            songbird_proto::system::Kind::Other(_) => {}
         }
         Ok(Received::System)
     }
