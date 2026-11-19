@@ -504,6 +504,7 @@ impl Store {
     }
 
     pub fn rename_device(&self, id: u64, name: String) {
+        crate::backend::rename_device(id, &name);
         self.devices.update(|d| {
             if let Some(x) = d.iter_mut().find(|x| x.id == id) {
                 x.name = name;

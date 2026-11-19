@@ -331,6 +331,8 @@ fn devices_here(devices: Vec<Device>) -> Vec<Device> {
 
 fn devices_body() -> AnyElement {
     let s = store();
+    // The account's real devices, from the server's list.
+    crate::backend::refresh_device_list(s);
     let link_open = signal(false);
     let selected = signal(None::<Device>);
     let detail_open = signal(false);
@@ -471,10 +473,7 @@ fn link_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
                                     .child(
                                         btn("Link device", Variant::Primary, BtnSize::Md, move || {
                                             if !(crate::backend::is_live() && crate::backend::registered()) {
-                                                // mock: the preview's device list.
-                                                let name = s.link_scanned_device();
-                                                open.set(false);
-                                                toast(format!("{name} is linked"));
+                                                toast("Sign up on this device first, then link others to it.");
                                                 return;
                                             }
                                             linking.set(true);
@@ -651,15 +650,16 @@ mod camera_flow {
             .find(|t| t.starts_with("devices: "))
             .map(ToString::to_string);
         assert_eq!(before, after_scan, "nothing is linked before the press");
+        // This test device has no account: nothing is invented, and it says why.
         app.press("Link device")?;
-        app.wait_for_gone("Link a new device?", std::time::Duration::from_secs(2))?;
+        app.settle();
         let after = app
             .screen()
             .texts()
             .iter()
             .find(|t| t.starts_with("devices: "))
             .map(ToString::to_string);
-        assert_ne!(before, after, "linked after the press");
+        assert_eq!(before, after, "no device without an account");
         Ok(())
     }
 }

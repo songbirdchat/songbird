@@ -1000,7 +1000,8 @@ pub fn save_file(suggested: impl Into<String>, bytes: Vec<u8>) {
             match std::fs::write(&path, &bytes) {
                 Ok(()) => toast(format!(
                     "Saved {}",
-                    path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+                    path.file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
                 )),
                 Err(_) => toast("The file couldn't be saved there."),
             }

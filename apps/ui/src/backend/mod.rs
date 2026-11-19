@@ -202,7 +202,12 @@ pub fn set_endpoint(endpoint: Endpoint) {
 /// store, its key, the photo and the account's local keys.
 pub fn erase_local() {
     if let Some(d) = data_dir() {
-        for f in ["songbird-core.db", "songbird-core.db-wal", "songbird-core.db-shm", "songbird-avatar.img"] {
+        for f in [
+            "songbird-core.db",
+            "songbird-core.db-wal",
+            "songbird-core.db-shm",
+            "songbird-avatar.img",
+        ] {
             let _ = std::fs::remove_file(d.join(f));
         }
     }
@@ -498,6 +503,96 @@ pub async fn devices() -> Result<Vec<RemoteDevice>, Problem> {
                 .collect()
         })
         .unwrap_or_default())
+}
+
+thread_local! {
+    /// Real device IDs (hex) by their UI ID.
+    static DEVICE_HEX: std::cell::RefCell<std::collections::HashMap<u64, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+const K_DEVICE_NAMES: &str = "sb.device_names";
+
+fn device_names() -> serde_json::Map<String, Value> {
+    Storage::get_item(K_DEVICE_NAMES)
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// Names this device gave the account's devices (a local label).
+pub fn rename_device(id: u64, name: &str) {
+    let Some(hex) = DEVICE_HEX.with_borrow(|m| m.get(&id).cloned()) else {
+        return;
+    };
+    let mut names = device_names();
+    names.insert(hex, Value::String(name.into()));
+    put(K_DEVICE_NAMES, &Value::Object(names).to_string());
+}
+
+/// Fills the Linked devices page from the server's list (`GET /v1/devices`).
+pub fn refresh_device_list(s: crate::store::Store) {
+    if !registered() {
+        return;
+    }
+    run(async move {
+        let list = devices().await?;
+        let names = device_names();
+        let mut out = Vec::with_capacity(list.len());
+        // This device first, as the page expects.
+        let mut sorted = list;
+        sorted.sort_by_key(|d| !d.this_device);
+        for d in sorted {
+            let bytes: [u8; 16] = wire::unhex(&d.id)
+                .and_then(|b| b.try_into().ok())
+                .unwrap_or([0; 16]);
+            let id = chat::ui_id(&bytes);
+            DEVICE_HEX.with_borrow_mut(|m| m.insert(id, d.id.clone()));
+            let label = names.get(&d.id).and_then(Value::as_str).map_or_else(
+                || {
+                    if d.this_device {
+                        "This device".to_string()
+                    } else if d.primary {
+                        "Main phone".to_string()
+                    } else {
+                        format!("Linked device {}", &d.id[..6])
+                    }
+                },
+                str::to_owned,
+            );
+            out.push(crate::store::Device {
+                id,
+                name: label,
+                kind: if d.primary {
+                    crate::store::DeviceKind::Phone
+                } else {
+                    crate::store::DeviceKind::Desktop
+                },
+                last_active: if d.pending {
+                    "Waiting for your main phone".into()
+                } else if d.this_device {
+                    "Active now".into()
+                } else {
+                    "Linked".into()
+                },
+                this_device: d.this_device,
+            });
+        }
+        s.devices.set(out);
+        Ok(())
+    });
+}
+
+/// Logs a device out (`DELETE` through the signed device list, `link::remove`).
+pub fn remove_device(s: crate::store::Store, id: u64) {
+    let Some(hex) = DEVICE_HEX.with_borrow(|m| m.get(&id).cloned()) else {
+        return;
+    };
+    run(async move {
+        link::remove(&hex).await?;
+        refresh_device_list(s);
+        Ok(())
+    });
 }
 
 /// `GET /v1/invites`: how many codes the account may create.

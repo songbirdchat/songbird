@@ -835,6 +835,9 @@ impl Store {
     }
 
     pub fn remove_device(&self, id: u64) {
+        if crate::backend::registered() {
+            crate::backend::remove_device(*self, id);
+        }
         self.devices.update(|d| d.retain(|x| x.id != id));
     }
 
