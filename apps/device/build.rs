@@ -21,7 +21,15 @@ fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap_or_default());
     let lib = out.join("libsbstore.a");
     let status = Command::new("xcrun")
-        .args(["--sdk", sdk, "swiftc", "-parse-as-library", "-emit-library", "-static", "-O"])
+        .args([
+            "--sdk",
+            sdk,
+            "swiftc",
+            "-parse-as-library",
+            "-emit-library",
+            "-static",
+            "-O",
+        ])
         .args(["-module-name", "SongbirdStore", "-target", triple])
         .arg("swift/Store.swift")
         .arg("-o")
@@ -34,12 +42,23 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=StoreKit");
     // The Swift runtime the system ships, and the toolchain's compatibility libraries.
     let sdk_path = String::from_utf8(
-        Command::new("xcrun").args(["--sdk", sdk, "--show-sdk-path"]).output().map(|o| o.stdout).unwrap_or_default(),
+        Command::new("xcrun")
+            .args(["--sdk", sdk, "--show-sdk-path"])
+            .output()
+            .map(|o| o.stdout)
+            .unwrap_or_default(),
     )
     .unwrap_or_default();
-    println!("cargo:rustc-link-search=native={}/usr/lib/swift", sdk_path.trim());
+    println!(
+        "cargo:rustc-link-search=native={}/usr/lib/swift",
+        sdk_path.trim()
+    );
     let toolchain = String::from_utf8(
-        Command::new("xcrun").args(["--sdk", sdk, "--find", "swiftc"]).output().map(|o| o.stdout).unwrap_or_default(),
+        Command::new("xcrun")
+            .args(["--sdk", sdk, "--find", "swiftc"])
+            .output()
+            .map(|o| o.stdout)
+            .unwrap_or_default(),
     )
     .unwrap_or_default();
     if let Some(bin) = PathBuf::from(toolchain.trim()).parent() {

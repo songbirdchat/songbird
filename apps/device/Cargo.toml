@@ -18,21 +18,22 @@ getrandom = "0.3"
 security-framework = { version = "3.7.0", default-features = false }
 objc2 = "0.6.5"
 block2 = "0.6.2"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSError", "NSString", "NSObject", "NSArray", "NSData", "NSDate", "NSValue", "NSNotification", "NSThread", "NSURL", "NSUUID", "NSSet"] }
+# The main queue: NSH runs the app on its engine thread, AppKit and UIKit take calls on main.
+dispatch2 = "0.3.1"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSError", "NSString", "NSObject", "NSArray", "NSData", "NSDate", "NSValue", "NSNotification", "NSThread", "NSURL", "NSUUID", "NSSet", "NSBundle", "NSDictionary"] }
 objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext", "LAError", "LABiometryType"] }
 objc2-core-location = { version = "0.3.2", default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate", "CLError"] }
 objc2-authentication-services = { version = "0.3.2", default-features = false, features = ["std", "block2", "ASAuthorizationPlatformPublicKeyCredentialProvider", "ASAuthorizationPlatformPublicKeyCredentialRegistrationRequest", "ASAuthorizationPlatformPublicKeyCredentialAssertionRequest", "ASAuthorizationPlatformPublicKeyCredentialDescriptor", "ASAuthorizationPublicKeyCredentialAssertionRequest", "ASAuthorizationPublicKeyCredentialRegistrationRequest", "ASAuthorizationPublicKeyCredentialDescriptor", "ASAuthorizationController", "ASAuthorizationRequest", "ASAuthorization", "ASAuthorizationError"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSWindow"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSWindow", "NSImage"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std", "UIScreen", "UIApplication", "UIResponder"] }
+objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "UIScreen", "UIApplication", "UIResponder"] }
 objc2-avf-audio = { version = "0.3.2", default-features = false, features = ["std", "AVAudioSession", "AVAudioSessionTypes"] }
 objc2-push-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "dispatch2", "PKPushRegistry", "PKPushCredentials", "PKPushPayload", "PKDefines"] }
 objc2-call-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "dispatch2", "objc2-avf-audio", "CXProvider", "CXProviderConfiguration", "CXCallUpdate", "CXHandle", "CXAction", "CXCallAction", "CXAnswerCallAction", "CXEndCallAction", "CXSetMutedCallAction", "CXError"] }
 objc2-photos = { version = "0.3.2", default-features = false, features = ["std", "block2", "dispatch2", "PHPhotoLibrary", "PHAssetCreationRequest", "PHAssetChangeRequest", "PHChangeRequest", "PhotosTypes"] }
-dispatch2 = "0.3.1"
 
 # Android: the Keystore and BiometricPrompt in Songbird's Gradle host, over JNI.
 [target.'cfg(target_os = "android")'.dependencies]

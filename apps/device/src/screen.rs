@@ -39,8 +39,9 @@ pub fn hide_in_recents(on: bool) {
     crate::android::hide_in_recents(on);
 }
 
-/// Whether the screen is being recorded or mirrored right now (iOS; elsewhere false). Call it
-/// on the UI thread.
+/// Whether the screen is being recorded or mirrored (iOS; elsewhere false): UIKit's answer as
+/// last read on the main thread, which each call refreshes. Ask it every moment: the app's
+/// cover polls it each second.
 #[must_use]
 pub fn captured() -> bool {
     #[cfg(target_os = "ios")]

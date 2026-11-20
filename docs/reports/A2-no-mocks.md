@@ -85,7 +85,7 @@ location". Left:
 - push hosts: APNs (token callbacks added to NSH's app delegate at run time), PushKit and CallKit, FCM or UnifiedPush (Apple and Firebase registrations)
 - mobile call media and the speaker route (libwebrtc's mobile archives are pinned; mobile builds need CMake, and Android its SDK and NDK)
 - notification actions and background backups: NSH has no notification actions or categories and owns the delegate; iOS background tasks must be registered before launch finishes (NSH's runner). Requests for NSH.
-- alternate app icons: no icon artwork yet, and NSH packages one icon set
+- alternate app icons: done (D-0179): the artwork, iOS alternate icons, Android launcher aliases, the Dock and the taskbar
 
 **d (backend gaps):**
 - a public channel directory (public channels await the owner's legal review, D-0065 §4)

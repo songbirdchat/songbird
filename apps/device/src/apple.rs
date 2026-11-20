@@ -125,23 +125,35 @@ pub(crate) fn authenticate(reason: &str, done: Done) {
     }
 }
 
+/// Runs `f` on the main thread, where AppKit and UIKit take calls. NSH runs the app's code on
+/// its engine thread, so a call from the app is queued on the main queue; one from a system
+/// callback, already on the main thread, runs at once.
+pub(crate) fn on_main(f: impl FnOnce(objc2::MainThreadMarker) + Send + 'static) {
+    if let Some(mtm) = objc2::MainThreadMarker::new() {
+        return f(mtm);
+    }
+    dispatch2::DispatchQueue::main().exec_async(move || {
+        if let Some(mtm) = objc2::MainThreadMarker::new() {
+            f(mtm);
+        }
+    });
+}
+
 /// macOS: every window of the app out of screen capture, or back in.
 #[cfg(target_os = "macos")]
 pub(crate) fn protect_windows(on: bool) {
-    use objc2::MainThreadMarker;
     use objc2_app_kit::{NSApplication, NSWindowSharingType};
-    let Some(mtm) = MainThreadMarker::new() else {
-        return;
-    };
-    let sharing = if on {
-        NSWindowSharingType::None
-    } else {
-        NSWindowSharingType::ReadOnly
-    };
-    let windows = NSApplication::sharedApplication(mtm).windows();
-    for i in 0..windows.count() {
-        windows.objectAtIndex(i).setSharingType(sharing);
-    }
+    on_main(move |mtm| {
+        let sharing = if on {
+            NSWindowSharingType::None
+        } else {
+            NSWindowSharingType::ReadOnly
+        };
+        let windows = NSApplication::sharedApplication(mtm).windows();
+        for i in 0..windows.count() {
+            windows.objectAtIndex(i).setSharingType(sharing);
+        }
+    });
 }
 
 /// iOS: whether the main screen is recorded, mirrored or shared.
@@ -151,9 +163,13 @@ pub(crate) fn protect_windows(on: bool) {
     reason = "UIScreen.mainScreen is still the screen the app shows on"
 )]
 pub(crate) fn captured() -> bool {
-    use objc2::MainThreadMarker;
     use objc2_ui_kit::UIScreen;
-    MainThreadMarker::new().is_some_and(|mtm| UIScreen::mainScreen(mtm).isCaptured())
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // UIKit answers on the main thread only: the answer is read there and kept, and the app
+    // (which asks every moment it shows) sees it at its next look.
+    static CAPTURED: AtomicBool = AtomicBool::new(false);
+    on_main(|mtm| CAPTURED.store(UIScreen::mainScreen(mtm).isCaptured(), Ordering::Relaxed));
+    CAPTURED.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------- location (D-0174)
@@ -272,10 +288,10 @@ mod locate {
     }
 
     pub(crate) fn current(done: Done) {
-        let Some(mtm) = MainThreadMarker::new() else {
-            done(Err(Failure::Unavailable));
-            return;
-        };
+        super::on_main(move |mtm| start(mtm, done));
+    }
+
+    fn start(mtm: MainThreadMarker, done: Done) {
         let delegate = Delegate::new(mtm, done);
         // SAFETY: a fresh manager on the main thread, configured before use; the delegate
         // outlives it (kept in LIVE until it finishes).
@@ -413,12 +429,17 @@ unsafe extern "C-unwind" fn did_fail(
 
 #[cfg(target_os = "ios")]
 pub(crate) fn register_push(on_token: crate::push::OnToken) -> bool {
-    use objc2::{MainThreadMarker, ffi, sel};
-    use objc2_ui_kit::UIApplication;
-    let Some(mtm) = MainThreadMarker::new() else {
-        return false;
-    };
     let _ = ON_TOKEN.set(on_token);
+    on_main(|mtm| {
+        let _ = register_on_main(mtm);
+    });
+    true
+}
+
+#[cfg(target_os = "ios")]
+fn register_on_main(mtm: objc2::MainThreadMarker) -> bool {
+    use objc2::{ffi, sel};
+    use objc2_ui_kit::UIApplication;
     let app = UIApplication::sharedApplication(mtm);
     // SAFETY: reading the app's delegate property on the main thread.
     let Some(delegate) = (unsafe { app.delegate() }) else {
@@ -665,9 +686,11 @@ pub(crate) mod callkit {
     }
 
     pub(crate) fn install(on: OnEvent) -> bool {
-        let Some(mtm) = MainThreadMarker::new() else {
-            return false;
-        };
+        super::on_main(move |mtm| install_on_main(mtm, on));
+        true
+    }
+
+    fn install_on_main(mtm: MainThreadMarker, on: OnEvent) {
         let delegate: Retained<Delegate> = {
             let this = Delegate::alloc(mtm).set_ivars(Ivars { on });
             // SAFETY: NSObject's designated initializer.
@@ -701,16 +724,18 @@ pub(crate) mod callkit {
                 k.push(Retained::into_super(delegate).into());
             });
         }
-        true
     }
 
     pub(crate) fn update(id: [u8; 16], caller: &str, video: bool) {
-        let u = call_update(caller, video);
-        PROVIDER.with_borrow(|p| {
-            if let Some(p) = p {
-                // SAFETY: our provider on the main thread.
-                unsafe { p.reportCallWithUUID_updated(&NSUUID::from_bytes(id), &u) };
-            }
+        let caller = caller.to_owned();
+        super::on_main(move |_| {
+            let u = call_update(&caller, video);
+            PROVIDER.with_borrow(|p| {
+                if let Some(p) = p {
+                    // SAFETY: our provider on the main thread.
+                    unsafe { p.reportCallWithUUID_updated(&NSUUID::from_bytes(id), &u) };
+                }
+            });
         });
     }
 
@@ -722,15 +747,21 @@ pub(crate) mod callkit {
             Ended::AnsweredElsewhere => CXCallEndedReason::AnsweredElsewhere,
             Ended::DeclinedElsewhere => CXCallEndedReason::DeclinedElsewhere,
         };
-        PROVIDER.with_borrow(|p| {
-            if let Some(p) = p {
-                // SAFETY: as above.
-                unsafe {
-                    p.reportCallWithUUID_endedAtDate_reason(&NSUUID::from_bytes(id), None, reason);
+        super::on_main(move |_| {
+            PROVIDER.with_borrow(|p| {
+                if let Some(p) = p {
+                    // SAFETY: as above.
+                    unsafe {
+                        p.reportCallWithUUID_endedAtDate_reason(
+                            &NSUUID::from_bytes(id),
+                            None,
+                            reason,
+                        );
+                    }
                 }
-            }
+            });
+            manual_audio(false);
         });
-        manual_audio(false);
     }
 }
 
@@ -848,14 +879,7 @@ pub(crate) mod passkeys {
         }
     }
 
-    fn run(request: Retained<ASAuthorizationRequest>, done: Done) {
-        let Some(mtm) = MainThreadMarker::new() else {
-            match done {
-                Done::Create(d) => d(Err(Failure::Unavailable)),
-                Done::Assert(d) => d(Err(Failure::Unavailable)),
-            }
-            return;
-        };
+    fn run(mtm: MainThreadMarker, request: Retained<ASAuthorizationRequest>, done: Done) {
         let delegate: Retained<Delegate> = {
             let this = Delegate::alloc(mtm).set_ivars(Ivars {
                 done: RefCell::new(Some(done)),
@@ -897,18 +921,37 @@ pub(crate) mod passkeys {
         challenge: &[u8],
         done: CreateDone,
     ) {
-        // SAFETY: a registration request from our provider.
-        let req = unsafe {
-            provider(rp_id).createCredentialRegistrationRequestWithChallenge_name_userID(
-                &NSData::with_bytes(challenge),
-                &NSString::from_str(name),
-                &NSData::with_bytes(user_id),
-            )
-        };
-        run(Retained::into_super(req), Done::Create(done));
+        let (rp_id, user_id, name, challenge) = (
+            rp_id.to_owned(),
+            user_id.to_vec(),
+            name.to_owned(),
+            challenge.to_vec(),
+        );
+        super::on_main(move |mtm| {
+            // SAFETY: a registration request from our provider.
+            let req = unsafe {
+                provider(&rp_id).createCredentialRegistrationRequestWithChallenge_name_userID(
+                    &NSData::with_bytes(&challenge),
+                    &NSString::from_str(&name),
+                    &NSData::with_bytes(&user_id),
+                )
+            };
+            run(mtm, Retained::into_super(req), Done::Create(done));
+        });
     }
 
     pub(crate) fn assert(rp_id: &str, challenge: &[u8], allow: &[Vec<u8>], done: AssertDone) {
+        let (rp_id, challenge, allow) = (rp_id.to_owned(), challenge.to_vec(), allow.to_vec());
+        super::on_main(move |mtm| assert_on_main(mtm, &rp_id, &challenge, &allow, done));
+    }
+
+    fn assert_on_main(
+        mtm: MainThreadMarker,
+        rp_id: &str,
+        challenge: &[u8],
+        allow: &[Vec<u8>],
+        done: AssertDone,
+    ) {
         // SAFETY: an assertion request from our provider, its allowed credentials set before use.
         let req = unsafe {
             let r = provider(rp_id)
@@ -927,7 +970,7 @@ pub(crate) mod passkeys {
             }
             r
         };
-        run(Retained::into_super(req), Done::Assert(done));
+        run(mtm, Retained::into_super(req), Done::Assert(done));
     }
 }
 
@@ -975,7 +1018,9 @@ pub(crate) mod store {
         let r = match code {
             0 if !jws.is_null() => {
                 // SAFETY: the Swift side passes a NUL-terminated string alive for this call.
-                let s = unsafe { CStr::from_ptr(jws) }.to_string_lossy().into_owned();
+                let s = unsafe { CStr::from_ptr(jws) }
+                    .to_string_lossy()
+                    .into_owned();
                 Ok(Proof::Apple(s))
             }
             1 => Err(Failure::Cancelled),
@@ -1000,5 +1045,72 @@ pub(crate) mod store {
         let id = park(done);
         // SAFETY: as above.
         unsafe { sb_store_current(id, answered) };
+    }
+}
+
+// ---------------------------------------------------------------- the app's icon (D-0179)
+
+/// iOS: the alternate icons in the app's asset catalog.
+#[cfg(target_os = "ios")]
+pub(crate) mod icon {
+    use std::sync::{Mutex, PoisonError};
+
+    use objc2::MainThreadMarker;
+    use objc2_foundation::{NSError, NSString};
+    use objc2_ui_kit::UIApplication;
+
+    /// Whether the bundle declares alternate icons (`alternate-icons.sh` adds them). Read from
+    /// Info.plist, which any thread may: NSH builds screens off the main thread.
+    pub(crate) fn supported() -> bool {
+        use objc2_foundation::{NSBundle, NSDictionary, ns_string};
+        NSBundle::mainBundle()
+            .objectForInfoDictionaryKey(ns_string!("CFBundleIcons"))
+            .and_then(|icons| icons.downcast::<NSDictionary>().ok())
+            .is_some_and(|icons| {
+                icons
+                    .objectForKey(ns_string!("CFBundleAlternateIcons"))
+                    .is_some()
+            })
+    }
+
+    /// Changes the icon on the main thread, where UIKit takes it.
+    pub(crate) fn set(name: Option<&str>, done: crate::icon::Done) {
+        let name = name.map(str::to_owned);
+        super::on_main(move |mtm| change(mtm, name.as_deref(), done));
+    }
+
+    fn change(mtm: MainThreadMarker, name: Option<&str>, done: crate::icon::Done) {
+        let app = UIApplication::sharedApplication(mtm);
+        if !app.supportsAlternateIcons() {
+            return done(false);
+        }
+        let done = Mutex::new(Some(done));
+        let reply = block2::RcBlock::new(move |error: *mut NSError| {
+            if let Some(done) = done.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                done(error.is_null());
+            }
+        });
+        let name = name.map(NSString::from_str);
+        app.setAlternateIconName_completionHandler(name.as_deref(), Some(&reply));
+    }
+}
+
+/// macOS: the Dock's icon while the app runs.
+#[cfg(target_os = "macos")]
+pub(crate) mod icon {
+    use objc2::AnyThread as _;
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    pub(crate) fn set(png: &'static [u8], done: crate::icon::Done) {
+        super::on_main(move |mtm| {
+            let Some(image) = NSImage::initWithData(NSImage::alloc(), &NSData::with_bytes(png))
+            else {
+                return done(false);
+            };
+            // SAFETY: the setter is unsafe only because it may take `None`; this passes an image.
+            unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
+            done(true);
+        });
     }
 }

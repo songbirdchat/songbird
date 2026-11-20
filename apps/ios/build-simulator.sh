@@ -10,6 +10,8 @@ out=${1:-$here/build}
 mkdir -p "$out"
 (cd "$here/../ui" && SONGBIRD_PREVIEW_BUILD=1 nsh package --target ios-simulator -o "$out")
 app="$out/Songbird.app"
+# The alternate app icons (D-0179), before signing.
+"$here/alternate-icons.sh" "$app" iphonesimulator
 appex="$app/PlugIns/SongbirdNotify.appex"
 sdk=$(xcrun --sdk iphonesimulator --show-sdk-path)
 mkdir -p "$appex"

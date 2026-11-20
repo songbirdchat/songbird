@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The feather (Lucide, ISC) of Songbird's app icon (D-0179); masters in apps/ui/assets/icon. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:translateX="34"
+        android:translateY="34"
+        android:scaleX="1.6667"
+        android:scaleY="1.6667">
+        <path
+            android:pathData="M12.67 19a2 2 0 0 0 1.42-.59l6.3-6.31a6 6 0 0 0-8.49-8.49L5.6 9.92A2 2 0 0 0 5 11.34V19z"
+            android:strokeColor="#16151C"
+            android:strokeWidth="2"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+        <path
+            android:pathData="M16 8 2 22"
+            android:strokeColor="#16151C"
+            android:strokeWidth="2"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+        <path
+            android:pathData="M17.5 15H9"
+            android:strokeColor="#16151C"
+            android:strokeWidth="2"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+    </group>
+</vector>

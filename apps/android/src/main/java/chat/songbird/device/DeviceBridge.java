@@ -526,6 +526,29 @@ public final class DeviceBridge {
 
     static native void nativeStore(long id, int code, String token);
 
+    // ------------------------------------------------------------ the app's icon (D-0179)
+
+    private static final String[] ICONS = {"Songbird", "Night", "Paper", "Lavender"};
+
+    /** Enables the launcher alias of icon {@code name} and disables the others. */
+    static boolean setIcon(String name) {
+        Activity a = activity.get();
+        if (a == null || !java.util.Arrays.asList(ICONS).contains(name)) return false;
+        android.content.pm.PackageManager pm = a.getPackageManager();
+        String pkg = a.getPackageName();
+        // The chosen one first, so the app always has a launcher entry.
+        pm.setComponentEnabledSetting(new android.content.ComponentName(pkg, pkg + ".Icon" + name),
+                android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
+                android.content.pm.PackageManager.DONT_KILL_APP);
+        for (String other : ICONS) {
+            if (other.equals(name)) continue;
+            pm.setComponentEnabledSetting(new android.content.ComponentName(pkg, pkg + ".Icon" + other),
+                    android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                    android.content.pm.PackageManager.DONT_KILL_APP);
+        }
+        return true;
+    }
+
     static native void nativeInit();
 
     static native void nativeAuthResult(long id, int code);

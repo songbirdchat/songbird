@@ -3,6 +3,13 @@
   "id": "chat.songbird.app",
   "version": "0.1.0",
   "build": 1,
+  "icon": {
+    "ios": "assets/icon/icon.png",
+    "android": "assets/icon/icon.png",
+    "macos": "assets/icon/icon-macos.png",
+    "windows": "assets/icon/icon-macos.png",
+    "linux": "assets/icon/icon-macos.png"
+  },
   "appearance": "system",
   "rust": ".",
   "root": "App",

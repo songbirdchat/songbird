@@ -199,6 +199,36 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0179 — App icons: the artwork, and changing it for real
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Artwork**: Songbird's feather (Lucide, ISC, the glyph the app already draws) on four
+    grounds from `theme.json`: Songbird (primary), Night (the call screen's), Paper and
+    Lavender. The masters are SVGs in `apps/ui/assets/icon`; `scripts/render-icons.sh` renders
+    them with macOS's own tools: full-bleed and opaque for iOS and Android (the system masks),
+    and Apple's rounded square with its margin for macOS, Windows and Linux. Before this the app
+    had no icon at all; `nsh.json` now gives one per platform.
+  - **Changing it** (Appearance → App icon, Plus): iOS's alternate icons, compiled into the
+    app's asset catalog by `apps/ios/alternate-icons.sh` (NSH packages the main icon only);
+    Android's adaptive icons as vectors (with the monochrome layer for themed icons), one
+    launcher alias per icon, the chosen one enabled; on macOS the Dock's icon and on Windows
+    the windows' and taskbar's, while Songbird is open (changing the bundle's or executable's
+    icon would break its signature), set again at every start. Linux desktops take the icon
+    from the launcher entry, which an app shouldn't rewrite: the choice isn't shown there.
+  - The tiles show the icons' own artwork, not theme-tinted drawings, so the preview is what
+    the system shows in light and dark. The choice stays a synced setting; each device applies
+    it at start-up, and the main icon comes back when Plus ends.
+  - **The main thread**: NSH runs the app's code on its engine thread on every platform, so the
+    Apple calls that checked for the main thread and gave up never ran from the app: macOS
+    screen protection, iOS's recording check, location, push registration, CallKit, passkeys.
+    They now run on the main queue (`apple::on_main`); the recording check reads UIKit's answer
+    there and the app's one-second poll sees it.
+- Consequences: an App Store build runs `alternate-icons.sh` before signing, like the
+  simulator build. Changing a master means running the render script and committing its PNGs.
+
 ## D-0178 — Buying a plan in the App Store and Google Play
 
 - Date: 2026-11-20
@@ -331,7 +361,7 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
   - Info.plist gains the location, photo-add and Face ID reasons; macOS the location
     entitlement; Android the location permissions and storage access up to Android 9.
 - Consequences: alternate app icons stay undone: the app has no icon artwork yet (not even its
-  main icon), and NSH packaging builds a single app icon set.
+  main icon), and NSH packaging builds a single app icon set. (Done since: D-0179.)
 
 ## D-0173 — Screen protection and the app switcher cover
 

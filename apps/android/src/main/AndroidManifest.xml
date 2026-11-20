@@ -33,6 +33,8 @@
 
     <application
         android:label="Songbird"
+        android:icon="@mipmap/icon_songbird"
+        android:roundIcon="@mipmap/icon_songbird"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:supportsRtl="true"
         android:allowBackup="false"
@@ -60,11 +62,56 @@
             android:name="chat.songbird.app.SongbirdActivity"
             android:exported="true"
             android:configChanges="locale|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|layoutDirection|fontScale"
-            android:windowSoftInputMode="adjustResize">
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- The app icon the person chose (D-0179): one launcher alias per icon, one enabled. -->
+        <activity-alias
+            android:name=".IconSongbird"
+            android:targetActivity="chat.songbird.app.SongbirdActivity"
+            android:icon="@mipmap/icon_songbird"
+            android:roundIcon="@mipmap/icon_songbird"
+            android:enabled="true"
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
+        </activity-alias>
+        <activity-alias
+            android:name=".IconNight"
+            android:targetActivity="chat.songbird.app.SongbirdActivity"
+            android:icon="@mipmap/icon_night"
+            android:roundIcon="@mipmap/icon_night"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".IconPaper"
+            android:targetActivity="chat.songbird.app.SongbirdActivity"
+            android:icon="@mipmap/icon_paper"
+            android:roundIcon="@mipmap/icon_paper"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".IconLavender"
+            android:targetActivity="chat.songbird.app.SongbirdActivity"
+            android:icon="@mipmap/icon_lavender"
+            android:roundIcon="@mipmap/icon_lavender"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
     </application>
 </manifest>

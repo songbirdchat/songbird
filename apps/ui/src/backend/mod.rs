@@ -32,6 +32,7 @@ pub mod chat;
 pub mod chat_state;
 pub mod crash;
 pub mod group_sync;
+pub mod icon;
 pub mod link;
 pub mod lock;
 pub mod nudge;

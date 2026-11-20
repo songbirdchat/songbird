@@ -586,13 +586,21 @@ static STORE: Mutex<Vec<(u64, crate::store::Done)>> = Mutex::new(Vec::new());
 
 fn store_call(method: &str, product: Option<&str>, done: crate::store::Done) {
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    STORE.lock().unwrap_or_else(PoisonError::into_inner).push((id, done));
+    STORE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((id, done));
     let long = JValueOwned::Long(i64::try_from(id).unwrap_or(i64::MAX));
     let started = match product {
         Some(p) => call(
             method,
             "(Ljava/lang/String;J)V",
-            |env| Some(vec![JValueOwned::Object(env.new_string(p).ok()?.into()), long]),
+            |env| {
+                Some(vec![
+                    JValueOwned::Object(env.new_string(p).ok()?.into()),
+                    long,
+                ])
+            },
             |_, _| Some(()),
         ),
         None => call(method, "(J)V", |_| Some(vec![long]), |_, _| Some(())),
@@ -639,4 +647,16 @@ pub extern "system" fn Java_chat_songbird_device_DeviceBridge_nativeStore(
     if let Ok(id) = u64::try_from(id) {
         finish_store(id, code, &token);
     }
+}
+
+// ---------------------------------------------------------------- the app's icon (D-0179)
+
+/// Enables the launcher alias `chat.songbird.app.Icon<name>` and disables the others.
+pub(crate) fn set_icon(name: &str) -> bool {
+    call(
+        "setIcon",
+        "(Ljava/lang/String;)Z",
+        |env| Some(vec![JValueOwned::Object(env.new_string(name).ok()?.into())]),
+        |_, v| v.z().ok(),
+    ) == Some(true)
 }

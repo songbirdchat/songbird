@@ -743,6 +743,8 @@ pub async fn start() -> Result<(), super::Problem> {
         // screen on iOS (D-0176).
         super::callkit::install();
         super::push::install();
+        // The app icon the person chose (D-0179).
+        super::icon::on_start(s);
     }
     if let Some(s) = crate::store::try_store() {
         super::chat_state::reload(s);

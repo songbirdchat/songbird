@@ -43,13 +43,24 @@ pub type Done = Box<dyn FnOnce(Result<Proof, Failure>) + Send>;
 /// Whether this platform's store sells Songbird's plans.
 #[must_use]
 pub fn available() -> bool {
-    cfg!(any(target_os = "ios", target_os = "macos", target_os = "android"))
+    cfg!(any(
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "android"
+    ))
 }
 
 /// The product ID for a plan (`plus` or `family`) and interval (`month` or `year`).
 #[must_use]
 pub fn product(plan: &str, interval: &str) -> String {
-    format!("{plan}.{}", if interval == "year" { "yearly" } else { "monthly" })
+    format!(
+        "{plan}.{}",
+        if interval == "year" {
+            "yearly"
+        } else {
+            "monthly"
+        }
+    )
 }
 
 /// Buys `product` with the store's own sheet.

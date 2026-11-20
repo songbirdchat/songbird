@@ -181,3 +181,63 @@ pub(crate) fn location(done: crate::location::Done) {
         done(run());
     });
 }
+
+/// The icon of every top-level window of this process, from a PNG (D-0179): the taskbar shows
+/// it. Windows takes PNG data as an icon resource directly.
+pub(crate) fn set_icon(png: &[u8]) -> bool {
+    use windows::Win32::{
+        Foundation::{HWND, LPARAM, WPARAM},
+        System::Threading::GetCurrentProcessId,
+        UI::WindowsAndMessaging::{
+            CreateIconFromResourceEx, EnumWindows, GetSystemMetrics, GetWindowThreadProcessId,
+            ICON_BIG, ICON_SMALL, LR_DEFAULTCOLOR, SM_CXICON, SM_CXSMICON, SendMessageW,
+            WM_SETICON,
+        },
+    };
+    unsafe extern "system" fn each(hwnd: HWND, list: LPARAM) -> windows::core::BOOL {
+        let mut pid = 0u32;
+        // SAFETY: `hwnd` is a live window EnumWindows hands over; `pid` is ours to write.
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
+        // SAFETY: as above.
+        if pid == unsafe { GetCurrentProcessId() } {
+            // SAFETY: `list` is the `Vec` passed below, alive for the whole enumeration.
+            unsafe { &mut *(list.0 as *mut Vec<HWND>) }.push(hwnd);
+        }
+        true.into()
+    }
+    // The icons live as long as the process (windows keep using them): made once per change,
+    // a handful in a session.
+    let make = |metric| {
+        // SAFETY: a plain system metric.
+        let size = unsafe { GetSystemMetrics(metric) };
+        // SAFETY: `png` is a whole PNG, which this call reads as an icon resource (version
+        // 0x30000), scaled to `size`.
+        unsafe { CreateIconFromResourceEx(png, true, 0x0003_0000, size, size, LR_DEFAULTCOLOR) }
+            .ok()
+    };
+    let (Some(big), Some(small)) = (make(SM_CXICON), make(SM_CXSMICON)) else {
+        return false;
+    };
+    let mut windows: Vec<HWND> = Vec::new();
+    // SAFETY: the callback only reads the window's process and pushes onto `windows`, which
+    // outlives the call.
+    let _ = unsafe { EnumWindows(Some(each), LPARAM(&raw mut windows as isize)) };
+    for w in &windows {
+        // SAFETY: our own windows, found above; the icons outlive them.
+        unsafe {
+            SendMessageW(
+                *w,
+                WM_SETICON,
+                Some(WPARAM(ICON_BIG as usize)),
+                Some(LPARAM(big.0 as isize)),
+            );
+            SendMessageW(
+                *w,
+                WM_SETICON,
+                Some(WPARAM(ICON_SMALL as usize)),
+                Some(LPARAM(small.0 as isize)),
+            );
+        }
+    }
+    !windows.is_empty()
+}
