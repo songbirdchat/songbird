@@ -51,6 +51,16 @@ impl std::fmt::Debug for StoredCallLink {
     }
 }
 
+/// The secret that marks a view-once message opened.
+fn viewed_key(author: &[u8; 16], id: &[u8; 16]) -> String {
+    use std::fmt::Write as _;
+    let mut key = String::from("viewed.");
+    for b in author.iter().chain(id) {
+        let _ = write!(key, "{b:02x}");
+    }
+    key
+}
+
 /// The schema version this code writes.
 pub const SCHEMA: i64 = 6;
 
@@ -689,6 +699,27 @@ impl Store {
             params![&author[..], &id[..]],
         ))
         .map(|_| ())
+    }
+
+    /// Deletes a message's kept files (a view-once message after it was shown).
+    pub fn drop_files(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<()> {
+        db(self.db.execute(
+            "DELETE FROM files WHERE author = ?1 AND id = ?2",
+            params![&author[..], &id[..]],
+        ))
+        .map(|_| ())
+    }
+
+    /// Records that a view-once message was opened (or is the sender's own).
+    pub fn mark_viewed(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<()> {
+        let key = viewed_key(author, id);
+        self.put_secret(&key, &[1])
+    }
+
+    /// Whether a view-once message was opened here.
+    pub fn viewed(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<bool> {
+        let key = viewed_key(author, id);
+        Ok(self.secret(&key)?.is_some())
     }
 
     /// Keeps an attachment's plaintext (a message's `idx`-th file).

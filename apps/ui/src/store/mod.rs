@@ -807,6 +807,10 @@ impl Store {
     }
 
     pub fn open_view_once(&self, chat: ChatId, id: MsgId) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::open_view_once(*self, chat, id);
+            return;
+        }
         self.edit_message(chat, id, |m| {
             if let Body::ViewOnce { opened, .. } = &mut m.body {
                 *opened = true;

@@ -759,6 +759,10 @@ impl<N: Net> Messenger<N> {
         id: &[u8; 16],
         idx: u32,
     ) -> Result<Zeroizing<Vec<u8>>> {
+        // A view-once file, once shown, is gone for good.
+        if self.store.viewed(author, id)? {
+            return Err(Error::Malformed);
+        }
         if let Some(b) = self.store.file(author, id, idx)? {
             return Ok(b);
         }
@@ -1448,6 +1452,54 @@ impl<N: Net> Messenger<N> {
         self.send_data(chat, data, preview).await
     }
 
+    /// Sends one photo or video to be viewed once (1:1 or group): each receiving device shows
+    /// it once, then deletes it ([`Self::view_once_opened`]). Uploaded for every device that
+    /// fetches it, as other files are.
+    pub async fn send_view_once(
+        &mut self,
+        chat: &[u8; 16],
+        bytes: &[u8],
+        meta: &crate::attachments::FileMeta,
+    ) -> Result<[u8; 16]> {
+        let fetches = if self.is_group(chat) {
+            self.group_devices(chat)?.len().saturating_sub(1).max(1)
+        } else {
+            let me = self.local.account;
+            self.devices_of(chat, false).await?.len()
+                + self.store.devices(&me)?.len().saturating_sub(1)
+        };
+        let (mut p, ct) = crate::attachments::encrypt(bytes, meta)?;
+        let id = crate::attachments::upload(&self.net, &ct, fetches).await?;
+        p.object_id = id.to_vec();
+        p.uploaded_at_ms = now_ms();
+        let video = p.content_type.starts_with("video/");
+        let message = schema::Message {
+            attachments: vec![p],
+            view_once: true,
+            ..Default::default()
+        };
+        let preview = if video {
+            "View once video"
+        } else {
+            "View once photo"
+        };
+        let id = self.send_message(chat, message, preview).await?;
+        // The sender keeps no copy to view again.
+        self.store.mark_viewed(&self.local.account, &id)?;
+        Ok(id)
+    }
+
+    /// Whether a view-once message was opened here already (its file is gone).
+    pub fn view_once_opened(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<bool> {
+        self.store.viewed(author, id)
+    }
+
+    /// A view-once message was shown: its file goes from this device for good.
+    pub fn consume_view_once(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<()> {
+        self.store.drop_files(author, id)?;
+        self.store.mark_viewed(author, id)
+    }
+
     /// Sends a poll (2 to 12 options).
     pub async fn send_poll(
         &mut self,
@@ -1865,6 +1917,17 @@ pub fn poll_in(content: &[u8]) -> Option<schema::PollCreate> {
         }) => m.poll,
         _ => None,
     }
+}
+
+/// Whether an encoded `Content` is a view-once message.
+#[must_use]
+pub fn view_once_in(content: &[u8]) -> bool {
+    Content::decode(content).is_ok_and(|c| {
+        matches!(c.body, Some(Body::Data(DataMessage {
+            kind: Some(data_message::Kind::Message(m)),
+            ..
+        })) if m.view_once)
+    })
 }
 
 /// The place a stored message's content shares, if it is a location:

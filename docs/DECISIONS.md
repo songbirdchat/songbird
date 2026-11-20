@@ -199,6 +199,31 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0158 — View-once photos and videos; real video playback
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **View once** (`Message.view_once`, §5): a "View once" attach option sends one photo; the
+    sender keeps no copy to view again. A receiving device reads the file, deletes it from its
+    store at once (and refuses to fetch it again), and shows it in a viewer that keeps no copy;
+    the message then reads "Opened" on that device. A view-once video plays from a copy in the
+    app's own data folder that goes when the viewer closes.
+  - **Videos** received in real chats are videos (not files); the media viewer plays them in
+    the platform's player with its own controls, from a decrypted copy in the app's data folder
+    (`media-playing`, emptied whenever app-core opens; the player needs a file). Real photos in
+    the viewer are the photos themselves (the viewer showed the demo illustration for every
+    message before).
+- Not done: voice notes. libwebrtc's audio device module does not record without a call's send
+  stream (tried: a local track from the platform's audio delivers no samples, and recording
+  fails to start for a process without microphone access); recording needs each platform's own
+  recorder, a native module like the camera's.
+- Evidence: `gate_a2::a_view_once_photo_is_shown_once_then_gone` (the sender keeps nothing; the
+  receiver reads it once; after that it is gone and cannot be fetched again); the A2 gate (16)
+  and `apps/ui` (214) pass.
+- Consequences: a decrypted video exists on disk, inside the app's container, while it plays.
+
 ## D-0157 — Retries: the outbox, group operations, offline sends
 
 - Date: 2026-11-20

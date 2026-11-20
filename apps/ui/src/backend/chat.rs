@@ -705,6 +705,7 @@ pub async fn start() -> Result<(), super::Problem> {
         show_all(s, &m);
     }
     super::calls::show_links(&m);
+    clear_media_cache();
     // Disappearing messages go on time, even with the app left open.
     if !SWEEPING.replace(true) {
         sweep_expired();
@@ -908,6 +909,156 @@ fn with_file(msg: MsgId, then: impl FnOnce(Vec<u8>) + 'static) {
     });
 }
 
+/// Marks a shown view-once message opened when it was opened here before.
+fn show_once_state(s: Store, m: &Core, row: &MessageRow) {
+    if songbird_app_core::messenger::view_once_in(&row.content)
+        && m.view_once_opened(&row.author, &row.id).unwrap_or(false)
+        && let Some(msg) = ui_of(&row.author, &row.id)
+    {
+        edit_shown(s, msg, |x| {
+            if let Body::ViewOnce { opened, .. } = &mut x.body {
+                *opened = true;
+            }
+        });
+    }
+}
+
+/// Where decrypted videos wait while they play (the platform's player needs a file): inside the
+/// app's own data folder, emptied when app-core opens.
+fn media_cache() -> Option<std::path::PathBuf> {
+    data_dir().map(|d| d.join("media-playing"))
+}
+
+/// Empties the playing-media folder (at start, and when a view-once video closes).
+pub fn clear_media_cache() {
+    if let Some(dir) = media_cache() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A playable file for a real video message, then `then` with its `file://` URL.
+pub fn media_file(msg: MsgId, then: impl FnOnce(String) + 'static) {
+    with_file(msg, move |bytes| {
+        if let Some(url) = write_playing(msg, &bytes) {
+            then(url);
+        }
+    });
+}
+
+fn write_playing(msg: MsgId, bytes: &[u8]) -> Option<String> {
+    let dir = media_cache()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{msg:016x}.mp4"));
+    std::fs::write(&path, bytes).ok()?;
+    Some(format!("file://{}", path.display()))
+}
+
+/// Sends a photo to be viewed once in a real chat.
+pub fn send_view_once(s: Store, chat: ChatId, f: nsh_core::picker::PickedFile) {
+    let Some(target) = core_chat(chat) else {
+        return;
+    };
+    let bytes = f.data.bytes().to_vec();
+    if bytes.is_empty() {
+        return;
+    }
+    let ui = s.push_message(
+        chat,
+        None,
+        Body::ViewOnce {
+            photo: !f.mime.starts_with("video/"),
+            opened: true,
+        },
+    );
+    let meta = songbird_app_core::attachments::FileMeta {
+        content_type: f.mime.clone(),
+        file_name: f.name.clone(),
+        width: u32::try_from(f.size.width.0).unwrap_or(0),
+        height: u32::try_from(f.size.height.0).unwrap_or(0),
+        ..Default::default()
+    };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        let me = m.local().account;
+        match m.send_view_once(&target, &bytes, &meta).await {
+            Ok(id) => {
+                let status = m
+                    .store
+                    .message(&me, &id)
+                    .ok()
+                    .flatten()
+                    .map_or(Status::Sent, |r| r.status);
+                drop(guard);
+                OUTGOING.with_borrow_mut(|o| o.insert(ui, id));
+                IDS.with_borrow_mut(|x| x.insert(ui, (me, id)));
+                set_status(s, &id, status);
+                Ok(())
+            }
+            Err(_) => {
+                drop(guard);
+                s.fail(chat, ui);
+                Err(super::problem("The photo couldn't be sent."))
+            }
+        }
+    });
+}
+
+/// Opens a received view-once message: its file is read, deleted from this device at once,
+/// and shown in a viewer that keeps no copy.
+pub fn open_view_once(s: Store, chat: ChatId, msg: MsgId) {
+    let Some((author, id)) = MEDIA.with_borrow(|m| m.get(&msg).copied()) else {
+        return;
+    };
+    super::run(async move {
+        let got = {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let m = guard
+                .as_mut()
+                .ok_or_else(|| super::problem("Not connected yet."))?;
+            let bytes = m.file(&author, &id, 0).await;
+            let video = m
+                .store
+                .message(&author, &id)
+                .ok()
+                .flatten()
+                .and_then(|r| {
+                    songbird_app_core::messenger::attachments_of(&r.content)
+                        .into_iter()
+                        .next()
+                })
+                .is_some_and(|p| p.content_type.starts_with("video/"));
+            // Gone from here as soon as it is read (as it is opened).
+            let _ = m.consume_view_once(&author, &id);
+            bytes.map(|b| (b.to_vec(), video))
+        };
+        let _ = chat;
+        edit_shown(s, msg, |x| {
+            if let Body::ViewOnce { opened, .. } = &mut x.body {
+                *opened = true;
+            }
+        });
+        let (bytes, video) =
+            got.map_err(|_| super::problem("This view-once message can't be opened any more."))?;
+        let src = if video {
+            match write_playing(msg, &bytes) {
+                Some(url) => crate::features::media::OnceSource::Video(url),
+                None => return Err(super::problem("The video couldn't be shown.")),
+            }
+        } else {
+            crate::features::media::OnceSource::Photo(nsh_core::element::ImageSrc::from(
+                super::avatar::data_uri(&bytes),
+            ))
+        };
+        crate::features::media::view_once(src);
+        Ok(())
+    });
+}
+
 /// Shows a photo (downloading it if needed).
 pub fn load_photo(msg: MsgId) {
     if media_src(msg).is_none() {
@@ -933,7 +1084,12 @@ pub fn send_picked(s: Store, chat: ChatId, files: Vec<nsh_core::picker::PickedFi
         if bytes.is_empty() {
             continue;
         }
-        let body = if photos {
+        let body = if f.mime.starts_with("video/") {
+            Body::Video {
+                caption: String::new(),
+                secs: 0,
+            }
+        } else if photos {
             Body::Image {
                 caption: String::new(),
                 alt: f.name.clone(),
@@ -1025,6 +1181,23 @@ fn body_of(row: &MessageRow) -> Body {
         .into_iter()
         .next()
     {
+        if songbird_app_core::messenger::view_once_in(&row.content) {
+            // Whether it was opened here is set after it is shown (`show_once_state`).
+            return Body::ViewOnce {
+                photo: !p.content_type.starts_with("video/"),
+                opened: false,
+            };
+        }
+        if p.content_type.starts_with("video/") {
+            return Body::Video {
+                caption: if row.text == songbird_app_core::messenger::attachment_label(&p) {
+                    String::new()
+                } else {
+                    row.text.clone()
+                },
+                secs: p.duration_ms.div_ceil(1000),
+            };
+        }
         let caption = if row.text == songbird_app_core::messenger::attachment_label(&p) {
             String::new()
         } else {
@@ -1097,6 +1270,7 @@ fn show_all(s: Store, m: &Core) {
             if poll_in(&row.content).is_some() {
                 show_tally(s, m, &row.author, &row.id);
             }
+            show_once_state(s, m, &row);
         }
         for (author, id, _) in m.pins(&c.id).unwrap_or_default() {
             if let Some(msg) = ui_of(&author, &id) {

@@ -1751,3 +1751,39 @@ async fn the_change_log_is_written_encrypted_and_read_by_members() {
     );
     assert_eq!(log[1].subjects, vec![bob.account]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_view_once_photo_is_shown_once_then_gone() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    alice.core.send_text(&bob.account, "hi").await.unwrap();
+    assert!(matches!(pump_app(&mut bob).await, Received::Message(_)));
+    let photo = vec![7u8; 40_000];
+    let meta = songbird_app_core::attachments::FileMeta {
+        content_type: "image/jpeg".into(),
+        file_name: "once.jpg".into(),
+        ..Default::default()
+    };
+    let id = alice
+        .core
+        .send_view_once(&bob.account, &photo, &meta)
+        .await
+        .unwrap();
+    // The sender keeps nothing to view again.
+    assert!(alice.core.view_once_opened(&alice.account, &id).unwrap());
+    let Received::Message(row) = pump_app(&mut bob).await else {
+        panic!("the view-once photo")
+    };
+    assert!(songbird_app_core::messenger::view_once_in(&row.content));
+    assert!(!bob.core.view_once_opened(&alice.account, &id).unwrap());
+    // Shown once…
+    assert_eq!(
+        &*bob.core.file(&alice.account, &id, 0).await.unwrap(),
+        &photo[..]
+    );
+    bob.core.consume_view_once(&alice.account, &id).unwrap();
+    // …then gone for good.
+    assert!(bob.core.view_once_opened(&alice.account, &id).unwrap());
+    assert!(bob.core.file(&alice.account, &id, 0).await.is_err());
+}

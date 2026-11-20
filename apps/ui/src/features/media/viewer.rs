@@ -315,10 +315,20 @@ fn picture(
         ),
         _ => (1, 1, String::new(), false),
     };
-    // The same mock photo as the bubble and the media grid: the message's
-    // id is the seed, its own frame the shape.
+    // A real message shows its own photo (or plays its video); a demo one the same
+    // illustration as its bubble.
+    let real = crate::backend::chat::is_media(m.id);
     let (pw, ph) = (w.max(1), h.max(1));
-    let src = crate::ui::portrait::message_photo(&alt, m.id, pw, ph);
+    let src = if real {
+        crate::backend::chat::load_photo(m.id);
+        crate::backend::chat::media_src(m.id).unwrap_or_else(|| ImageSrc::from(""))
+    } else {
+        crate::ui::portrait::message_photo(&alt, m.id, pw, ph)
+    };
+    let playing_url = signal(None::<String>);
+    if real && video {
+        crate::backend::chat::media_file(m.id, move |url| playing_url.set(Some(url)));
+    }
     let fade = animated_value(if motion::reduced() { 1.0 } else { 0.0 });
     fade.timing(1.0, motion::BASE, Easing::EaseOut);
     let size = move || {
@@ -345,14 +355,33 @@ fn picture(
         } else {
             format!("Photo: {alt}")
         })
-        .child(
+        .child((!(real && video)).then(|| {
             image(src)
                 .absolute()
                 .inset_0()
                 .object_fit(ResizeMode::Cover)
-                .accessibility_elements_hidden(true),
-        )
-        .child(video.then(|| {
+                .accessibility_elements_hidden(true)
+        }))
+        // A real video plays in the platform's player, with its own controls.
+        .child((real && video).then(|| {
+            view().absolute().inset_0().child(dynamic(move || {
+                let url = playing_url.get();
+                untracked(move || match url {
+                    Some(u) => nsh_core::element::video(u)
+                        .controls(true)
+                        .absolute()
+                        .inset_0()
+                        .into_element(),
+                    None => view()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .child(crate::ui::muted("Loading…"))
+                        .into_element(),
+                })
+            }))
+        }))
+        .child((video && !real).then(|| {
             view().flex_1().items_center().justify_center().child(
                 press_surface(Press::OnDark, move || playing.update(|p| *p = !*p))
                     .accessibility_label(move || {

@@ -183,6 +183,25 @@ fn attach_sheet(cv: Conv) -> AnyElement {
                 }),
             ),
             tile(Icon::Camera, "Camera", then(|cv| cv.camera_open.set(true))),
+            // A photo seen once, then deleted on every device (real chats).
+            tile(
+                Icon::Eye,
+                "View once",
+                then(|cv| {
+                    let (s, chat) = (cv.s, cv.chat);
+                    if !crate::backend::chat::owns(chat) {
+                        toast("View once works in chats with real contacts.");
+                        return;
+                    }
+                    spawn(async move {
+                        let mut r = nsh_core::picker::PickRequest::new(true, 1);
+                        r.max_dimension = Some(DevicePixels(1600));
+                        if let Some(f) = pick_images(r).await.into_iter().next() {
+                            crate::backend::chat::send_view_once(s, chat, f);
+                        }
+                    });
+                }),
+            ),
             // The system's document picker; app-core encrypts and uploads.
             tile(
                 Icon::File,
