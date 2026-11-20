@@ -12,6 +12,12 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- Songbird works without a camera (tablets, Chromebooks): the screens say so. -->
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <!-- Sharing where you are, once, when you ask (D-0174); never in the background. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-feature android:name="android.hardware.location" android:required="false" />
+    <!-- Saving photos and videos on Android 8 and 9 (10+ uses MediaStore without it; D-0174). -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
     <queries>
         <intent>

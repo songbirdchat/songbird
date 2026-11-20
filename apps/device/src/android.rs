@@ -197,3 +197,96 @@ pub(crate) fn set_secure(on: bool) {
 pub(crate) fn hide_in_recents(on: bool) {
     call_bool("hideInRecents", on);
 }
+
+// ---------------------------------------------------------------- location (D-0174)
+
+static LOCATING: Mutex<Vec<(u64, crate::location::Done)>> = Mutex::new(Vec::new());
+
+pub(crate) fn location(done: crate::location::Done) {
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    LOCATING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((id, done));
+    let started = call(
+        "locate",
+        "(J)V",
+        |_| {
+            Some(vec![JValueOwned::Long(
+                i64::try_from(id).unwrap_or(i64::MAX),
+            )])
+        },
+        |_, _| Some(()),
+    );
+    if started.is_none() {
+        finish_location(id, Err(crate::location::Failure::Unavailable));
+    }
+}
+
+fn finish_location(id: u64, r: Result<crate::location::Position, crate::location::Failure>) {
+    let done = {
+        let mut l = LOCATING.lock().unwrap_or_else(PoisonError::into_inner);
+        l.iter().position(|(i, _)| *i == id).map(|i| l.remove(i).1)
+    };
+    if let Some(d) = done {
+        d(r);
+    }
+}
+
+/// `DeviceBridge.nativeLocation(id, code, lat, lon, accuracy)`: code 0 a position, 1 denied,
+/// anything else unavailable.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_chat_songbird_device_DeviceBridge_nativeLocation(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    id: jlong,
+    code: jint,
+    lat: jni::sys::jdouble,
+    lon: jni::sys::jdouble,
+    accuracy: jni::sys::jdouble,
+) {
+    use crate::location::{Failure, Position};
+    let Ok(id) = u64::try_from(id) else { return };
+    finish_location(
+        id,
+        match code {
+            0 => Ok(Position {
+                latitude: lat,
+                longitude: lon,
+                accuracy_m: accuracy,
+            }),
+            1 => Err(Failure::Denied),
+            _ => Err(Failure::Unavailable),
+        },
+    );
+}
+
+// ---------------------------------------------------------------- photos (D-0174)
+
+pub(crate) fn save_media(
+    bytes: &[u8],
+    kind: crate::photos::Kind,
+    name: &str,
+    mime: &str,
+    done: crate::photos::Done,
+) {
+    let name = crate::photos::safe_name(name);
+    let ok = call(
+        "saveMedia",
+        "([BLjava/lang/String;Ljava/lang/String;Z)Z",
+        |env| {
+            Some(vec![
+                JValueOwned::Object(env.byte_array_from_slice(bytes).ok()?.into()),
+                JValueOwned::Object(env.new_string(&name).ok()?.into()),
+                JValueOwned::Object(env.new_string(mime).ok()?.into()),
+                JValueOwned::Bool(u8::from(kind == crate::photos::Kind::Video)),
+            ])
+        },
+        |_, v| v.z().ok(),
+    );
+    done(if ok == Some(true) {
+        Ok(())
+    } else {
+        Err(crate::photos::Failure::Failed)
+    });
+}

@@ -199,6 +199,27 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0174 — Saving photos and videos; the device's location, once
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Saving**: the viewer's Save and "Save to photos" (received photos and videos, as they
+    arrive) save the decrypted file: to the Photos library on iOS (add-only access: Songbird
+    can't read the library), to the shared Pictures and Movies collections on Android
+    (MediaStore, `Songbird` in them; Android 8 and 9 ask for storage access first), and to
+    Pictures › Songbird on macOS, Windows and Linux (never over an existing file). View-once
+    media are never saved. The file name is cleaned of any folder.
+  - **Location**: "Use my location" in the place picker centres it on where the device is: one
+    fix, asked at that moment, permission while using the app only (CoreLocation, Android's
+    LocationManager, the Windows Geolocator, GeoClue). Nothing tracks or runs in the
+    background; the place still goes only where the person sends it.
+  - Info.plist gains the location, photo-add and Face ID reasons; macOS the location
+    entitlement; Android the location permissions and storage access up to Android 9.
+- Consequences: alternate app icons stay undone: the app has no icon artwork yet (not even its
+  main icon), and NSH packaging builds a single app icon set.
+
 ## D-0173 — Screen protection and the app switcher cover
 
 - Date: 2026-11-20

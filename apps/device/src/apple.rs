@@ -155,3 +155,224 @@ pub(crate) fn captured() -> bool {
     use objc2_ui_kit::UIScreen;
     MainThreadMarker::new().is_some_and(|mtm| UIScreen::mainScreen(mtm).isCaptured())
 }
+
+// ---------------------------------------------------------------- location (D-0174)
+
+mod locate {
+    use std::cell::RefCell;
+
+    use objc2::{
+        DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, rc::Retained,
+        runtime::ProtocolObject,
+    };
+    use objc2_core_location::{
+        CLAuthorizationStatus, CLLocation, CLLocationManager, CLLocationManagerDelegate,
+        kCLLocationAccuracyHundredMeters,
+    };
+    use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
+
+    use crate::location::{Done, Failure, Position};
+
+    pub(crate) struct Ivars {
+        done: RefCell<Option<Done>>,
+        manager: RefCell<Option<Retained<CLLocationManager>>>,
+        requested: RefCell<bool>,
+    }
+
+    define_class!(
+        // SAFETY: NSObject has no subclassing requirements; the delegate is main-thread-only,
+        // as CoreLocation calls it on the thread the manager was made on (the main thread).
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "SongbirdLocationDelegate"]
+        #[ivars = Ivars]
+        pub(crate) struct Delegate;
+
+        unsafe impl NSObjectProtocol for Delegate {}
+
+        unsafe impl CLLocationManagerDelegate for Delegate {
+            #[unsafe(method(locationManager:didUpdateLocations:))]
+            fn did_update(&self, _manager: &CLLocationManager, locations: &NSArray<CLLocation>) {
+                let Some(last) = locations.lastObject() else {
+                    return;
+                };
+                // SAFETY: reading two properties of a location CoreLocation handed over.
+                let (c, acc) = unsafe { (last.coordinate(), last.horizontalAccuracy()) };
+                self.finish(Ok(Position {
+                    latitude: c.latitude,
+                    longitude: c.longitude,
+                    accuracy_m: acc,
+                }));
+            }
+
+            #[unsafe(method(locationManager:didFailWithError:))]
+            fn did_fail(&self, _manager: &CLLocationManager, error: &NSError) {
+                // kCLErrorLocationUnknown (0) is transient: CoreLocation keeps trying.
+                match error.code() {
+                    0 => {}
+                    1 => self.finish(Err(Failure::Denied)),
+                    _ => self.finish(Err(Failure::Unavailable)),
+                }
+            }
+
+            #[unsafe(method(locationManagerDidChangeAuthorization:))]
+            fn did_change(&self, manager: &CLLocationManager) {
+                self.follow(manager);
+            }
+        }
+    );
+
+    impl Delegate {
+        fn new(mtm: MainThreadMarker, done: Done) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(Ivars {
+                done: RefCell::new(Some(done)),
+                manager: RefCell::new(None),
+                requested: RefCell::new(false),
+            });
+            // SAFETY: NSObject's designated initializer.
+            unsafe { msg_send![super(this), init] }
+        }
+
+        /// Acts on the permission as it stands: ask, refuse, or take a fix.
+        fn follow(&self, manager: &CLLocationManager) {
+            // SAFETY: a property of the manager this delegate serves, on its thread.
+            let status = unsafe { manager.authorizationStatus() };
+            match status {
+                CLAuthorizationStatus::NotDetermined => {
+                    // SAFETY: as above; the answer comes back through `did_change`.
+                    unsafe { manager.requestWhenInUseAuthorization() };
+                }
+                CLAuthorizationStatus::Denied | CLAuthorizationStatus::Restricted => {
+                    self.finish(Err(Failure::Denied));
+                }
+                _ => {
+                    if !self.ivars().requested.replace(true) {
+                        // SAFETY: as above; one fix, delivered to `did_update` or `did_fail`.
+                        unsafe { manager.requestLocation() };
+                    }
+                }
+            }
+        }
+
+        fn finish(&self, r: Result<Position, Failure>) {
+            if let Some(done) = self.ivars().done.borrow_mut().take() {
+                done(r);
+            }
+            if let Some(m) = self.ivars().manager.borrow_mut().take() {
+                // SAFETY: detaching ourselves from the manager we made.
+                unsafe { m.setDelegate(None) };
+            }
+            // Released at the next request, not here: this method runs on it.
+        }
+    }
+
+    thread_local! {
+        /// Delegates with a request out: CoreLocation holds its delegate weakly.
+        static LIVE: RefCell<Vec<Retained<Delegate>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn current(done: Done) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            done(Err(Failure::Unavailable));
+            return;
+        };
+        let delegate = Delegate::new(mtm, done);
+        // SAFETY: a fresh manager on the main thread, configured before use; the delegate
+        // outlives it (kept in LIVE until it finishes).
+        let manager = unsafe { CLLocationManager::new() };
+        unsafe {
+            manager.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+            manager.setDesiredAccuracy(kCLLocationAccuracyHundredMeters);
+        }
+        delegate.ivars().manager.replace(Some(manager.clone()));
+        LIVE.with_borrow_mut(|l| {
+            l.retain(|d| d.ivars().done.borrow().is_some());
+            l.push(delegate.clone());
+        });
+        delegate.follow(&manager);
+    }
+}
+
+pub(crate) fn location(done: crate::location::Done) {
+    locate::current(done);
+}
+
+// ---------------------------------------------------------------- photos (D-0174)
+
+/// iOS: add-only access, then one asset from a temporary file (moved into the library).
+#[cfg(target_os = "ios")]
+pub(crate) fn save_media(
+    bytes: &[u8],
+    kind: crate::photos::Kind,
+    name: &str,
+    done: crate::photos::Done,
+) {
+    use objc2_foundation::{NSString, NSURL};
+    use objc2_photos::{
+        PHAccessLevel, PHAssetCreationRequest, PHAssetResourceCreationOptions, PHAssetResourceType,
+        PHAuthorizationStatus, PHPhotoLibrary,
+    };
+
+    use crate::photos::{Failure, Kind};
+
+    let file = std::env::temp_dir().join(format!(
+        "songbird-save-{}-{}",
+        std::process::id(),
+        crate::photos::safe_name(name)
+    ));
+    if std::fs::write(&file, bytes).is_err() {
+        done(Err(Failure::Failed));
+        return;
+    }
+    let done = std::sync::Arc::new(Mutex::new(Some(done)));
+    let finish = move |r: Result<(), Failure>| {
+        if let Some(d) = done.lock().ok().and_then(|mut d| d.take()) {
+            d(r);
+        }
+    };
+    let path = file.to_string_lossy().into_owned();
+    let handler = RcBlock::new(move |status: PHAuthorizationStatus| {
+        if status != PHAuthorizationStatus::Authorized && status != PHAuthorizationStatus::Limited {
+            let _ = std::fs::remove_file(&path);
+            finish(Err(Failure::Denied));
+            return;
+        }
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&path));
+        let resource = match kind {
+            Kind::Photo => PHAssetResourceType::Photo,
+            Kind::Video => PHAssetResourceType::Video,
+        };
+        let change = RcBlock::new(move || {
+            // SAFETY: inside the library's change block, as `creationRequestForAsset` requires.
+            let request = unsafe { PHAssetCreationRequest::creationRequestForAsset() };
+            // SAFETY: a fresh options object; the file is moved into the library (none left).
+            let options = unsafe { PHAssetResourceCreationOptions::new() };
+            unsafe {
+                options.setShouldMoveFile(true);
+                request.addResourceWithType_fileURL_options(resource, &url, Some(&options));
+            }
+        });
+        let path2 = path.clone();
+        let finish2 = finish.clone();
+        let completion = RcBlock::new(move |ok: Bool, _err: *mut NSError| {
+            let _ = std::fs::remove_file(&path2);
+            finish2(if ok.as_bool() {
+                Ok(())
+            } else {
+                Err(Failure::Failed)
+            });
+        });
+        // SAFETY: the shared library; the blocks live until the library calls them.
+        unsafe {
+            PHPhotoLibrary::sharedPhotoLibrary()
+                .performChanges_completionHandler(RcBlock::as_ptr(&change), Some(&completion));
+        }
+    });
+    // SAFETY: a class method; the handler is called once, on a queue of the system's.
+    unsafe {
+        PHPhotoLibrary::requestAuthorizationForAccessLevel_handler(
+            PHAccessLevel::AddOnly,
+            &handler,
+        );
+    }
+}

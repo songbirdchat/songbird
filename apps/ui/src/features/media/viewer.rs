@@ -551,8 +551,13 @@ fn action_bar(
                         Icon::Download,
                         || "Save".into(),
                         move || {
-                            // mock: app-core exports the decrypted file to the photo library.
-                            toast("Saved to your photos");
+                            // The decrypted file, to the library (D-0174).
+                            if !crate::backend::chat::save_to_library(
+                                current.get_untracked(),
+                                false,
+                            ) {
+                                toast("This photo is a sample: there's no file to save.");
+                            }
                         },
                     )
                     .disabled(move || blocked().is_some()),

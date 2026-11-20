@@ -4,6 +4,8 @@
 //! - [`secure`]: the vault key, kept by the system's secure store (the Keychain, the Android
 //!   Keystore, DPAPI, the Secret Service). The app encrypts its device secrets under it.
 //! - [`biometrics`]: Face ID, Touch ID, fingerprints, Windows Hello.
+//! - [`photos`]: saving a photo or video the person chose (or received, with "Save to photos").
+//! - [`location`]: one position, when the person asks to share where they are.
 //! - [`screen`]: keeping the app's windows out of screenshots and screen recording.
 //!
 //! `unsafe` is allowed in the platform modules only, each block saying why it holds.
@@ -15,6 +17,8 @@ mod apple;
 pub mod biometrics;
 #[cfg(target_os = "linux")]
 mod linux;
+pub mod location;
+pub mod photos;
 pub mod screen;
 pub mod secure;
 #[cfg(target_os = "windows")]

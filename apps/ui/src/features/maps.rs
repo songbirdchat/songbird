@@ -239,6 +239,32 @@ pub fn map(center: Signal<(f64, f64)>, zoom: Signal<f64>, interactive: bool) -> 
     frame
 }
 
+/// Centres the picker on where the device is (D-0174): asked once, now; the system asks the
+/// person's permission the first time.
+fn locate(center: Signal<(f64, f64)>, zoom: Signal<f64>) {
+    use songbird_device::location::{self, Failure};
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    location::current(Box::new(move |r| {
+        let _ = tx.send(r);
+    }));
+    spawn(async move {
+        match rx.await.unwrap_or(Err(Failure::Unavailable)) {
+            Ok(p) => {
+                center.try_set((p.latitude, p.longitude));
+                zoom.try_set(16.0);
+            }
+            Err(Failure::Denied) => {
+                toast(
+                    "Songbird isn't allowed to use your location. Allow it in your device's settings.",
+                );
+            }
+            Err(Failure::Unavailable) => {
+                toast("Your location isn't available right now. Move the map instead.");
+            }
+        }
+    });
+}
+
 /// The location picker: move the map under the pin, then send that place.
 pub fn pick(open: Signal<bool>, on_pick: impl Fn(f64, f64) + 'static) -> nsh_base::SheetElement {
     // Where the last pick was, else the middle of Europe at country scale.
@@ -271,6 +297,12 @@ pub fn pick(open: Signal<bool>, on_pick: impl Fn(f64, f64) + 'static) -> nsh_bas
                             ),
                     ),
             )
+            .child(btn(
+                "Use my location",
+                Variant::Secondary,
+                BtnSize::Md,
+                move || locate(center, zoom),
+            ))
             .child(muted(
                 "Move the map so the pin marks the place. Only the person you send it to sees it.",
             ))

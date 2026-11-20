@@ -982,6 +982,88 @@ fn with_file(msg: MsgId, then: impl FnOnce(Vec<u8>) + 'static) {
     });
 }
 
+/// Saves a real photo or video message to the library (D-0174): the Photos library on iOS, the
+/// shared collections on Android, the Pictures folder on a computer. `quiet`: no word on
+/// success (the automatic save of received media). View-once media are never saved. Answers
+/// whether `msg` is a real media message.
+pub fn save_to_library(msg: MsgId, quiet: bool) -> bool {
+    use songbird_device::photos::{self, Failure, Kind};
+    let Some((author, id)) = MEDIA.with_borrow(|m| m.get(&msg).copied()) else {
+        return false;
+    };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        let row = m
+            .store
+            .message(&author, &id)
+            .ok()
+            .flatten()
+            .ok_or_else(|| super::problem("This message is gone."))?;
+        if songbird_app_core::messenger::view_once_in(&row.content) {
+            return Err(super::problem(
+                "View-once photos and videos can't be saved.",
+            ));
+        }
+        let pointer = songbird_app_core::messenger::attachments_of(&row.content)
+            .into_iter()
+            .next()
+            .ok_or_else(|| super::problem("There's nothing to save."))?;
+        let bytes = m
+            .file(&author, &id, 0)
+            .await
+            .map_err(|_| super::problem("The file couldn't be downloaded. Try again."))?;
+        drop(guard);
+        let video = pointer.content_type.starts_with("video/");
+        let name = if pointer.file_name.is_empty() {
+            format!(
+                "Songbird-{}.{}",
+                row.sent_ms,
+                pointer.content_type.rsplit('/').next().unwrap_or("bin")
+            )
+        } else {
+            pointer.file_name.clone()
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        photos::save(
+            bytes.to_vec(),
+            if video { Kind::Video } else { Kind::Photo },
+            &name,
+            &pointer.content_type,
+            Box::new(move |r| {
+                let _ = tx.send(r);
+            }),
+        );
+        match rx.await.unwrap_or(Err(Failure::Failed)) {
+            Ok(()) => {
+                if !quiet {
+                    crate::ui::toast(if is_desktop_os() {
+                        "Saved to Pictures › Songbird"
+                    } else {
+                        "Saved to your photos"
+                    });
+                }
+                Ok(())
+            }
+            Err(Failure::Denied) => Err(super::problem(
+                "Songbird isn't allowed to add to your photos. Allow it in your device's settings, then try again.",
+            )),
+            Err(Failure::Failed) => Err(super::problem("It couldn't be saved. Try again.")),
+        }
+    });
+    true
+}
+
+fn is_desktop_os() -> bool {
+    !matches!(
+        os(),
+        nsh_core::platform::Os::Ios | nsh_core::platform::Os::Android
+    )
+}
+
 /// Marks a shown view-once message opened when it was opened here before.
 fn show_once_state(s: Store, m: &Core, row: &MessageRow) {
     if songbird_app_core::messenger::view_once_in(&row.content)
@@ -1405,6 +1487,13 @@ pub async fn receive(envelope: &[u8]) -> bool {
         Ok(Received::Message(row)) => {
             let fresh = row.author != me && !PROFILED.with_borrow(|p| p.contains(&row.chat));
             let key = m.store.profile_key(&row.chat).ok().flatten();
+            let save = row.author != me
+                && !songbird_app_core::messenger::view_once_in(&row.content)
+                && songbird_app_core::messenger::attachments_of(&row.content)
+                    .first()
+                    .is_some_and(|p| {
+                        p.content_type.starts_with("image/") || p.content_type.starts_with("video/")
+                    });
             if let Some(s) = crate::store::try_store() {
                 show(s, &me, &row, row.author != me);
                 if poll_in(&row.content).is_some() {
@@ -1412,6 +1501,14 @@ pub async fn receive(envelope: &[u8]) -> bool {
                 }
             }
             drop(guard);
+            // "Save to photos" (D-0174): received photos and videos, saved as they arrive.
+            if save
+                && crate::store::try_store()
+                    .is_some_and(|s| s.settings.with_untracked(|x| x.save_to_photos))
+                && let Some(msg) = ui_of(&row.author, &row.id)
+            {
+                save_to_library(msg, true);
+            }
             if let (true, Some(key)) = (fresh, key) {
                 refresh_profile(row.chat, *key).await;
             }

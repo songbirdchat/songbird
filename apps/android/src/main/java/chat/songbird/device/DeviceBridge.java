@@ -184,6 +184,150 @@ public final class DeviceBridge {
         });
     }
 
+    // ------------------------------------------------------------ location (D-0174)
+
+    static final int LOCATION_REQUEST = 7201;
+    private static final java.util.List<Long> WAITING = new java.util.ArrayList<>();
+
+    /** One position for request {@code id}: the permission first if not granted yet. */
+    static void locate(long id) {
+        MAIN.post(() -> {
+            Activity a = activity.get();
+            if (a == null) {
+                nativeLocation(id, 2, 0, 0, 0);
+                return;
+            }
+            boolean granted = a.checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION)
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED
+                    || a.checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION)
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED;
+            if (granted) {
+                fix(a, id);
+                return;
+            }
+            WAITING.add(id);
+            if (WAITING.size() == 1) {
+                a.requestPermissions(new String[] {
+                        android.Manifest.permission.ACCESS_FINE_LOCATION,
+                        android.Manifest.permission.ACCESS_COARSE_LOCATION}, LOCATION_REQUEST);
+            }
+        });
+    }
+
+    /** The activity's permission answers: only the location request is ours. */
+    public static void onPermissionResult(int request, int[] results) {
+        if (request != LOCATION_REQUEST) return;
+        boolean ok = false;
+        for (int r : results) ok |= r == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        Activity a = activity.get();
+        for (long id : new java.util.ArrayList<>(WAITING)) {
+            if (ok && a != null) fix(a, id);
+            else nativeLocation(id, 1, 0, 0, 0);
+        }
+        WAITING.clear();
+    }
+
+    @SuppressWarnings({"MissingPermission", "deprecation"})
+    private static void fix(Activity a, long id) {
+        android.location.LocationManager lm = a.getSystemService(android.location.LocationManager.class);
+        if (lm == null) {
+            nativeLocation(id, 2, 0, 0, 0);
+            return;
+        }
+        String provider = lm.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)
+                ? android.location.LocationManager.NETWORK_PROVIDER
+                : lm.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER)
+                ? android.location.LocationManager.GPS_PROVIDER : null;
+        if (provider == null) {
+            nativeLocation(id, 2, 0, 0, 0);
+            return;
+        }
+        final boolean[] answered = {false};
+        java.util.function.Consumer<android.location.Location> answer = loc -> {
+            if (answered[0]) return;
+            answered[0] = true;
+            if (loc == null) nativeLocation(id, 2, 0, 0, 0);
+            else nativeLocation(id, 0, loc.getLatitude(), loc.getLongitude(), loc.getAccuracy());
+        };
+        // No fix in 30 seconds: unavailable.
+        MAIN.postDelayed(() -> answer.accept(null), 30_000);
+        try {
+            if (Build.VERSION.SDK_INT >= 30) {
+                lm.getCurrentLocation(provider, new CancellationSignal(), a.getMainExecutor(), answer::accept);
+            } else {
+                lm.requestSingleUpdate(provider, new android.location.LocationListener() {
+                    @Override
+                    public void onLocationChanged(android.location.Location loc) {
+                        answer.accept(loc);
+                    }
+                }, Looper.getMainLooper());
+            }
+        } catch (SecurityException e) {
+            answer.accept(null);
+        }
+    }
+
+    // ------------------------------------------------------------ photos (D-0174)
+
+    static final int STORAGE_REQUEST = 7202;
+
+    /**
+     * Saves a photo or video to the shared Pictures/Movies collections ({@code Songbird} in
+     * them). Android 10+: MediaStore, no permission. Android 8 and 9 need storage access: asked
+     * here the first time, and this save answers false (the person saves again once allowed).
+     */
+    static boolean saveMedia(byte[] data, String name, String mime, boolean video) {
+        Activity a = activity.get();
+        if (a == null) return false;
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                android.content.ContentValues v = new android.content.ContentValues();
+                v.put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, name);
+                v.put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mime);
+                v.put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH,
+                        (video ? android.os.Environment.DIRECTORY_MOVIES : android.os.Environment.DIRECTORY_PICTURES)
+                                + "/Songbird");
+                v.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 1);
+                android.net.Uri collection = video
+                        ? android.provider.MediaStore.Video.Media.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                        : android.provider.MediaStore.Images.Media.getContentUri(android.provider.MediaStore.VOLUME_EXTERNAL_PRIMARY);
+                android.content.ContentResolver r = a.getContentResolver();
+                android.net.Uri item = r.insert(collection, v);
+                if (item == null) return false;
+                try (java.io.OutputStream out = r.openOutputStream(item)) {
+                    if (out == null) return false;
+                    out.write(data);
+                }
+                v.clear();
+                v.put(android.provider.MediaStore.MediaColumns.IS_PENDING, 0);
+                r.update(item, v, null, null);
+                return true;
+            }
+            if (a.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                MAIN.post(() -> a.requestPermissions(
+                        new String[] {android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, STORAGE_REQUEST));
+                return false;
+            }
+            @SuppressWarnings("deprecation")
+            java.io.File dir = new java.io.File(android.os.Environment.getExternalStoragePublicDirectory(
+                    video ? android.os.Environment.DIRECTORY_MOVIES : android.os.Environment.DIRECTORY_PICTURES),
+                    "Songbird");
+            if (!dir.isDirectory() && !dir.mkdirs()) return false;
+            java.io.File f = new java.io.File(dir, name);
+            for (int n = 2; f.exists() && n < 1000; n++) f = new java.io.File(dir, n + "-" + name);
+            try (java.io.FileOutputStream out = new java.io.FileOutputStream(f)) {
+                out.write(data);
+            }
+            android.media.MediaScannerConnection.scanFile(a, new String[] {f.getPath()}, new String[] {mime}, null);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    static native void nativeLocation(long id, int code, double lat, double lon, double accuracy);
+
     static native void nativeInit();
 
     static native void nativeAuthResult(long id, int code);

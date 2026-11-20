@@ -18,14 +18,17 @@ getrandom = "0.3"
 security-framework = { version = "3.7.0", default-features = false }
 objc2 = "0.6.5"
 block2 = "0.6.2"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSError", "NSString", "NSObject", "NSArray", "NSData", "NSDate", "NSValue", "NSNotification", "NSThread"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSError", "NSString", "NSObject", "NSArray", "NSData", "NSDate", "NSValue", "NSNotification", "NSThread", "NSURL"] }
 objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext", "LAError", "LABiometryType"] }
+objc2-core-location = { version = "0.3.2", default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate", "CLError"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSWindow"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std", "UIScreen"] }
+objc2-photos = { version = "0.3.2", default-features = false, features = ["std", "block2", "dispatch2", "PHPhotoLibrary", "PHAssetCreationRequest", "PHAssetChangeRequest", "PHChangeRequest", "PhotosTypes"] }
+dispatch2 = "0.3.1"
 
 # Android: the Keystore and BiometricPrompt in Songbird's Gradle host, over JNI.
 [target.'cfg(target_os = "android")'.dependencies]
@@ -33,11 +36,13 @@ jni = "0.21"
 
 # Windows: DPAPI and Windows Hello; the version NSH links.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Security_Credentials_UI", "Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Security_Credentials_UI", "Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading", "Devices_Geolocation"] }
 
 # Linux: the Secret Service (GNOME Keyring, KWallet) over D-Bus, pure Rust crypto.
 [target.'cfg(target_os = "linux")'.dependencies]
 secret-service = { version = "5", default-features = false, features = ["rt-tokio-crypto-rust"] }
+# GeoClue (location) on the same D-Bus library.
+zbus = { version = "5.19.0", default-features = false, features = ["tokio", "blocking-api"] }
 
 [lints.rust]
 unsafe_code = "deny"

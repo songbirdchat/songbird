@@ -9,17 +9,23 @@
   "ios": {
     "infoPlist": {
       "NSCameraUsageDescription": "Songbird uses the camera to scan codes when you link a device or verify a contact, to take photos and videos you choose to send, and for video calls. Nothing it sees leaves your device unless you send it, and what you send is end-to-end encrypted.",
-      "NSMicrophoneUsageDescription": "Songbird uses the microphone for calls, and for voice messages you choose to record. Your voice goes only to the people in the call or chat, end-to-end encrypted."
+      "NSMicrophoneUsageDescription": "Songbird uses the microphone for calls, and for voice messages you choose to record. Your voice goes only to the people in the call or chat, end-to-end encrypted.",
+      "NSLocationWhenInUseUsageDescription": "Songbird uses your location only when you choose to send where you are, and only once. It goes only to the person you send it to, end-to-end encrypted.",
+      "NSPhotoLibraryAddUsageDescription": "Songbird saves the photos and videos you choose to your library. It can't see what else is there.",
+      "NSFaceIDUsageDescription": "Songbird uses Face ID to open the app when you turn on unlock with Face ID. Your face data never leaves your device."
     }
   },
   "macos": {
     "infoPlist": {
       "NSCameraUsageDescription": "Songbird uses the camera to scan codes when you link a device or verify a contact, to take photos and videos you choose to send, and for video calls. Nothing it sees leaves your device unless you send it, and what you send is end-to-end encrypted.",
-      "NSMicrophoneUsageDescription": "Songbird uses the microphone for calls, and for voice messages you choose to record. Your voice goes only to the people in the call or chat, end-to-end encrypted."
+      "NSMicrophoneUsageDescription": "Songbird uses the microphone for calls, and for voice messages you choose to record. Your voice goes only to the people in the call or chat, end-to-end encrypted.",
+      "NSLocationWhenInUseUsageDescription": "Songbird uses your location only when you choose to send where you are, and only once. It goes only to the person you send it to, end-to-end encrypted.",
+      "NSLocationUsageDescription": "Songbird uses your location only when you choose to send where you are, and only once. It goes only to the person you send it to, end-to-end encrypted."
     },
     "entitlements": {
       "com.apple.security.device.camera": true,
-      "com.apple.security.device.audio-input": true
+      "com.apple.security.device.audio-input": true,
+      "com.apple.security.personal-information.location": true
     }
   }
 }

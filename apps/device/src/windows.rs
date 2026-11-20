@@ -150,3 +150,34 @@ pub(crate) fn protect_windows(on: bool) {
         let _ = unsafe { SetWindowDisplayAffinity(w, affinity) };
     }
 }
+
+/// One position from the Geolocator (asking the person first, as Windows does).
+pub(crate) fn location(done: crate::location::Done) {
+    use crate::location::{Failure, Position};
+    use windows::Devices::Geolocation::{GeolocationAccessStatus, Geolocator};
+    std::thread::spawn(move || {
+        let run = || -> Result<Position, Failure> {
+            let access = Geolocator::RequestAccessAsync()
+                .and_then(|op| op.join())
+                .map_err(|_| Failure::Unavailable)?;
+            if access != GeolocationAccessStatus::Allowed {
+                return Err(Failure::Denied);
+            }
+            let g = Geolocator::new().map_err(|_| Failure::Unavailable)?;
+            let pos = g
+                .GetGeopositionAsync()
+                .and_then(|op| op.join())
+                .map_err(|_| Failure::Unavailable)?;
+            let c = pos
+                .Coordinate()
+                .and_then(|c| Ok((c.Point()?.Position()?, c.Accuracy()?)))
+                .map_err(|_| Failure::Unavailable)?;
+            Ok(Position {
+                latitude: c.0.Latitude,
+                longitude: c.0.Longitude,
+                accuracy_m: c.1,
+            })
+        };
+        done(run());
+    });
+}

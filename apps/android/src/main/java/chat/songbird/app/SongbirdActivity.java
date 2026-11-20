@@ -41,6 +41,7 @@ public final class SongbirdActivity extends Activity {
     public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(request, permissions, results);
         CameraBridge.onPermissionResult(request, results);
+        DeviceBridge.onPermissionResult(request, results);
     }
 
     @Override
