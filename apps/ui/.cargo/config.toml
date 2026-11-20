@@ -3,3 +3,8 @@
 # then aborts at start.
 [target.'cfg(target_vendor = "apple")']
 rustflags = ["-C", "link-arg=-ObjC"]
+
+# libwebrtc per target (D-0175): LiveKit's build helper, patched to read
+# `LK_CUSTOM_WEBRTC_<target>` first (apps/vendor/webrtc-sys-build/PATCH.md).
+[patch.crates-io]
+webrtc-sys-build = { path = "../vendor/webrtc-sys-build" }

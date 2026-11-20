@@ -28,8 +28,22 @@ if [ ! -d "$out" ]; then
   tmp="$dir/.extract-$triple"
   rm -rf "$tmp"
   mkdir -p "$tmp"
-  unzip -q "$dir/$zip" -d "$tmp"
+  # -o: the Android archive has headers that differ only in case (Linux sysroot), which
+  # collide on a case-insensitive disk; none is used to build Songbird.
+  unzip -o -q "$dir/$zip" -d "$tmp"
   mv "$tmp/$triple" "$out"
   rm -rf "$tmp"
 fi
+case "$triple" in
+  mac-arm64-*) rust=aarch64_apple_darwin ;;
+  ios-device-arm64-*) rust=aarch64_apple_ios ;;
+  ios-simulator-arm64-*) rust=aarch64_apple_ios_sim ;;
+  android-arm64-*) rust=aarch64_linux_android ;;
+  linux-x64-*) rust=x86_64_unknown_linux_gnu ;;
+  win-x64-*) rust=x86_64_pc_windows_msvc ;;
+  *) rust= ;;
+esac
+# Per target first (apps/vendor/webrtc-sys-build, D-0175): a build of several targets (a phone
+# app and NSH's host tool) links each its own. The plain variable stays for one-target builds.
+[ -n "$rust" ] && echo "export LK_CUSTOM_WEBRTC_${rust}=\"$PWD/$out\""
 echo "export LK_CUSTOM_WEBRTC=\"$PWD/$out\""

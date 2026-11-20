@@ -119,7 +119,7 @@ fn content() -> AnyElement {
                     Icon::EyeOff,
                     "Block screenshots",
                     Some(match os() {
-                        nsh_core::platform::Os::Ios => "iOS doesn't let apps stop screenshots. Songbird hides itself while your screen is recorded or shared.",
+                        nsh_core::platform::Os::Ios => "iOS can't block screenshots. Songbird hides while your screen is recorded.",
                         _ => "Stops screenshots and screen recording of Songbird on this device.",
                     }),
                     move || settings.with(|x| x.block_screenshots),

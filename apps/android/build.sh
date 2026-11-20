@@ -15,7 +15,8 @@ rust="$here/build/rust"
 # 1. The Rust app, as nsh packages it.
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-(cd "$ui" && nsh package --target android -o "$tmp")
+# arm64 only: LiveKit publishes libwebrtc for arm64-v8a alone (D-0175).
+(cd "$ui" && nsh package --target android --abi arm64-v8a -o "$tmp")
 apk=$(ls "$tmp"/*.apk)
 rm -rf "$rust" && mkdir -p "$rust/jniLibs" "$rust/assets"
 (cd "$tmp" && unzip -q "$apk" 'lib/*' 'assets/*')

@@ -739,6 +739,8 @@ pub async fn start() -> Result<(), super::Problem> {
     if let Some(s) = crate::store::try_store() {
         // A crash report from last time, sent only if the user allows them (D-0170).
         super::crash::flush(s);
+        // This device's push token, registered (D-0175).
+        super::push::install();
     }
     if let Some(s) = crate::store::try_store() {
         super::chat_state::reload(s);

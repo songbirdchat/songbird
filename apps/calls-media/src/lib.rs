@@ -912,6 +912,23 @@ fn screen_thread(
     stop: &std::sync::atomic::AtomicBool,
     started: tokio::sync::oneshot::Sender<bool>,
 ) {
+    // Phones share their screen through ReplayKit or MediaProjection, not this capturer.
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    {
+        let _ = (window, source, stop);
+        let _ = started.send(false);
+    }
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    desktop_screen(window, source, stop, started);
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+fn desktop_screen(
+    window: bool,
+    source: &NativeVideoSource,
+    stop: &std::sync::atomic::AtomicBool,
+    started: tokio::sync::oneshot::Sender<bool>,
+) {
     use livekit::webrtc::desktop_capturer::{
         DesktopCaptureSourceType, DesktopCapturer, DesktopCapturerOptions,
     };

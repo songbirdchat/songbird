@@ -199,6 +199,27 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0175 — Mobile builds; libwebrtc per target; the APNs token
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Mobile builds** need CMake and `bindgen` (aws-lc-sys has no pregenerated bindings for the
+    iOS simulator; `LIBCLANG_PATH` is Xcode's), and for Android JDK 21, the SDK and NDK 28.
+  - **libwebrtc per target**: NSH packages a phone app together with a host tool built for the
+    Mac, and `webrtc-sys` read one `LK_CUSTOM_WEBRTC` for both. LiveKit's `webrtc-sys-build`
+    0.3.21 is vendored (`apps/vendor/webrtc-sys-build`, Apache-2.0, `PATCH.md`) with one
+    change: `LK_CUSTOM_WEBRTC_<target>` first. `scripts/fetch-libwebrtc.sh` exports both, so
+    every target still links only its pinned, checksum-verified archive.
+  - **Screen sharing on phones** needs ReplayKit or MediaProjection: the desktop capturer is
+    built for computers only, and the call screen hides "Share screen" on iOS and Android.
+  - **APNs token**: NSH's app delegate doesn't take the token callbacks, so the device crate
+    adds them to its class at run time (`class_addMethod`, which never replaces a method NSH
+    has), then asks UIKit to register; the token goes to `PUT /v1/push` (`{"apns": {"token"}}`)
+    once the account is connected. Real tokens need the push entitlement and a provisioning
+    profile (the Apple account steps).
+
 ## D-0174 — Saving photos and videos; the device's location, once
 
 - Date: 2026-11-20

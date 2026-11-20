@@ -106,6 +106,7 @@ public final class DeviceBridge {
     // ------------------------------------------------------------ biometrics
 
     /** Whether a strong biometric is enrolled and usable now. */
+    @SuppressWarnings("deprecation") // Android 10's canAuthenticate(), before authenticator classes
     static boolean biometrics() {
         Activity a = activity.get();
         if (a == null || Build.VERSION.SDK_INT < 29) return false;
@@ -150,8 +151,7 @@ public final class DeviceBridge {
                             if (answered[0]) return;
                             answered[0] = true;
                             boolean cancelled = code == BiometricPrompt.BIOMETRIC_ERROR_USER_CANCELED
-                                    || code == BiometricPrompt.BIOMETRIC_ERROR_CANCELED
-                                    || code == BiometricPrompt.BIOMETRIC_ERROR_NEGATIVE_BUTTON;
+                                    || code == BiometricPrompt.BIOMETRIC_ERROR_CANCELED;
                             boolean locked = code == BiometricPrompt.BIOMETRIC_ERROR_LOCKOUT
                                     || code == BiometricPrompt.BIOMETRIC_ERROR_LOCKOUT_PERMANENT;
                             nativeAuthResult(id, cancelled ? 1 : locked ? 2 : 3);

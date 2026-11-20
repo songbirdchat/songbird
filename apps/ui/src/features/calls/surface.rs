@@ -1162,6 +1162,13 @@ fn controls(sheets: Sheets) -> View {
             move || sheets.more.set(true),
         )
     };
+    // Phones share their screen through ReplayKit or MediaProjection, not wired yet.
+    let screen_share_here = || {
+        !matches!(
+            os(),
+            nsh_core::platform::Os::Ios | nsh_core::platform::Os::Android
+        )
+    };
     let build = move || {
         let row = view()
             .flex_row()
@@ -1200,7 +1207,7 @@ fn controls(sheets: Sheets) -> View {
         let row = if !compact {
             row.child(mute())
                 .child(camera())
-                .child(share())
+                .child(screen_share_here().then(share))
                 .child(group.then(|| {
                     call_btn(
                         || Icon::Hand,
@@ -1232,7 +1239,7 @@ fn controls(sheets: Sheets) -> View {
                 .child(view().w(px(8.0)))
                 .child(end())
         } else if desktop {
-            row.child(share())
+            row.child(screen_share_here().then(share))
                 .child(camera())
                 .child(mute())
                 .child(more())

@@ -5,6 +5,7 @@
 //!   Keystore, DPAPI, the Secret Service). The app encrypts its device secrets under it.
 //! - [`biometrics`]: Face ID, Touch ID, fingerprints, Windows Hello.
 //! - [`photos`]: saving a photo or video the person chose (or received, with "Save to photos").
+//! - [`push`]: the device's push token (APNs, FCM).
 //! - [`location`]: one position, when the person asks to share where they are.
 //! - [`screen`]: keeping the app's windows out of screenshots and screen recording.
 //!
@@ -19,6 +20,7 @@ pub mod biometrics;
 mod linux;
 pub mod location;
 pub mod photos;
+pub mod push;
 pub mod screen;
 pub mod secure;
 #[cfg(target_os = "windows")]

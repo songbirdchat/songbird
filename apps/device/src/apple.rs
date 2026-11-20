@@ -376,3 +376,93 @@ pub(crate) fn save_media(
         );
     }
 }
+
+// ---------------------------------------------------------------- push (D-0175)
+
+#[cfg(target_os = "ios")]
+static ON_TOKEN: std::sync::OnceLock<crate::push::OnToken> = std::sync::OnceLock::new();
+
+/// `application:didRegisterForRemoteNotificationsWithDeviceToken:`, added to NSH's app delegate.
+#[cfg(target_os = "ios")]
+unsafe extern "C-unwind" fn did_register(
+    _this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _app: *mut objc2::runtime::AnyObject,
+    token: *mut objc2_foundation::NSData,
+) {
+    // SAFETY: UIKit passes the token, alive for this call.
+    let Some(token) = (unsafe { token.as_ref() }) else {
+        return;
+    };
+    let bytes = token.to_vec();
+    if let Some(on) = ON_TOKEN.get() {
+        on(crate::push::Token::Apns(bytes));
+    }
+}
+
+/// `application:didFailToRegisterForRemoteNotificationsWithError:`: no token (no entitlement, a
+/// simulator without push). Nothing to do; the next start asks again.
+#[cfg(target_os = "ios")]
+unsafe extern "C-unwind" fn did_fail(
+    _this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    _app: *mut objc2::runtime::AnyObject,
+    _error: *mut NSError,
+) {
+}
+
+#[cfg(target_os = "ios")]
+pub(crate) fn register_push(on_token: crate::push::OnToken) -> bool {
+    use objc2::{MainThreadMarker, ffi, sel};
+    use objc2_ui_kit::UIApplication;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let _ = ON_TOKEN.set(on_token);
+    let app = UIApplication::sharedApplication(mtm);
+    // SAFETY: reading the app's delegate property on the main thread.
+    let Some(delegate) = (unsafe { app.delegate() }) else {
+        return false;
+    };
+    let obj: &objc2::runtime::AnyObject = delegate.as_ref();
+    // SAFETY: the delegate is a live object; its class lives as long as the process.
+    let cls = unsafe { ffi::object_getClass(obj) }.cast_mut();
+    if cls.is_null() {
+        return false;
+    }
+    // SAFETY: adding (never replacing: `class_addMethod` refuses a selector the class already
+    // has) two methods with the exact signatures UIKit calls them with: `v@:@@`.
+    unsafe {
+        let types = c"v@:@@".as_ptr();
+        let _ = ffi::class_addMethod(
+            cls,
+            sel!(application:didRegisterForRemoteNotificationsWithDeviceToken:),
+            std::mem::transmute::<
+                unsafe extern "C-unwind" fn(
+                    *mut objc2::runtime::AnyObject,
+                    objc2::runtime::Sel,
+                    *mut objc2::runtime::AnyObject,
+                    *mut objc2_foundation::NSData,
+                ),
+                objc2::runtime::Imp,
+            >(did_register),
+            types,
+        );
+        let _ = ffi::class_addMethod(
+            cls,
+            sel!(application:didFailToRegisterForRemoteNotificationsWithError:),
+            std::mem::transmute::<
+                unsafe extern "C-unwind" fn(
+                    *mut objc2::runtime::AnyObject,
+                    objc2::runtime::Sel,
+                    *mut objc2::runtime::AnyObject,
+                    *mut NSError,
+                ),
+                objc2::runtime::Imp,
+            >(did_fail),
+            types,
+        );
+    }
+    app.registerForRemoteNotifications();
+    true
+}
