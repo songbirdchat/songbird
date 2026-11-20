@@ -199,6 +199,33 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0180 — Sharing the screen from a phone
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Android**: MediaProjection. Share screen shows the system's own "start recording or
+    casting" prompt; on yes, a foreground service (type `mediaProjection`, as Android 14 asks)
+    takes the projection, mirrors the display into an `ImageReader` at most 1280 pixels on the
+    long side, and hands each RGBA frame, at up to 15 a second, to Rust in place. Its
+    notification says the screen is shared and has Stop sharing.
+  - **iOS**: a ReplayKit broadcast upload extension (`apps/ios/ScreenShare`), the only way iOS
+    lets an app share more than itself. Share screen opens the system's broadcast sheet with
+    Songbird's extension chosen; once the person starts it, the extension scales each frame
+    (vImage, NV12, at most 1280 pixels, 15 a second) and sends it, with its orientation, over a
+    Unix socket in the app group's container (`group.chat.songbird.app`, mode 0600), which only
+    Songbird's own processes reach. The app listens only while a share is starting or running.
+  - In the call, the frames go out as the screen-share track, end-to-end encrypted like the
+    camera (`Call::share_frames`). Nothing is recorded or kept. Stopping in the app ends the
+    system's capture; stopping from the system (the notification, the status bar) takes the
+    track out of the call and the app says so.
+  - Phones share the whole screen (the system offers nothing finer); desktops keep their
+    screen-or-window choice.
+- Consequences: on a device, the iOS app and the extension need the App Group in their
+  provisioning profiles (the notification extension needs it already). The simulator can't
+  broadcast, so iOS sharing is checked on a device.
+
 ## D-0179 — App icons: the artwork, and changing it for real
 
 - Date: 2026-11-20

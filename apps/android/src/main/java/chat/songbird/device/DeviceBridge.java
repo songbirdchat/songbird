@@ -526,6 +526,55 @@ public final class DeviceBridge {
 
     static native void nativeStore(long id, int code, String token);
 
+    // ------------------------------------------------------------ screen sharing (D-0180)
+
+    private static final int REQUEST_SCREEN = 0x5c4e;
+
+    /** Asks with the system's prompt; the answer comes to {@link #onActivityResult}. */
+    static boolean startScreenShare() {
+        Activity a = activity.get();
+        if (a == null) return false;
+        android.media.projection.MediaProjectionManager mpm =
+                a.getSystemService(android.media.projection.MediaProjectionManager.class);
+        a.runOnUiThread(() -> a.startActivityForResult(mpm.createScreenCaptureIntent(), REQUEST_SCREEN));
+        return true;
+    }
+
+    static void stopScreenShare() {
+        chat.songbird.share.ScreenShareService.stopFromApp();
+    }
+
+    /** From the activity: the person's answer to the capture prompt. */
+    public static void onActivityResult(int request, int result, android.content.Intent data) {
+        if (request != REQUEST_SCREEN) return;
+        Activity a = activity.get();
+        if (a == null || result != Activity.RESULT_OK || data == null) {
+            nativeScreenStarted(false);
+            return;
+        }
+        a.startForegroundService(new android.content.Intent(a, chat.songbird.share.ScreenShareService.class)
+                .putExtra(chat.songbird.share.ScreenShareService.EXTRA_CODE, result)
+                .putExtra(chat.songbird.share.ScreenShareService.EXTRA_DATA, data));
+    }
+
+    public static void screenStarted(boolean ok) {
+        nativeScreenStarted(ok);
+    }
+
+    public static void screenEnded() {
+        nativeScreenEnded();
+    }
+
+    public static void screenFrame(java.nio.ByteBuffer pixels, int width, int height, int stride, int rotation) {
+        nativeScreenFrame(pixels, width, height, stride, rotation);
+    }
+
+    static native void nativeScreenStarted(boolean ok);
+
+    static native void nativeScreenEnded();
+
+    static native void nativeScreenFrame(java.nio.ByteBuffer pixels, int width, int height, int stride, int rotation);
+
     // ------------------------------------------------------------ the app's icon (D-0179)
 
     private static final String[] ICONS = {"Songbird", "Night", "Paper", "Lavender"};

@@ -660,3 +660,147 @@ pub(crate) fn set_icon(name: &str) -> bool {
         |_, v| v.z().ok(),
     ) == Some(true)
 }
+
+// ---------------------------------------------------------------- screen sharing (D-0180)
+
+struct Share {
+    on_frame: crate::share::OnFrame,
+    // Behind their own locks: taken once, from any thread, while frames read `on_frame`.
+    started: Mutex<Option<crate::share::OnStarted>>,
+    ended: Mutex<Option<crate::share::OnEnded>>,
+}
+
+static SHARE: std::sync::RwLock<Option<Share>> = std::sync::RwLock::new(None);
+
+pub(crate) fn share_start(
+    on_frame: crate::share::OnFrame,
+    started: crate::share::OnStarted,
+    ended: crate::share::OnEnded,
+) {
+    *SHARE.write().unwrap_or_else(PoisonError::into_inner) = Some(Share {
+        on_frame,
+        started: Mutex::new(Some(started)),
+        ended: Mutex::new(Some(ended)),
+    });
+    if call(
+        "startScreenShare",
+        "()Z",
+        |_| Some(Vec::new()),
+        |_, v| v.z().ok(),
+    ) != Some(true)
+    {
+        share_started(false);
+    }
+}
+
+pub(crate) fn share_stop() {
+    // Stopped here: no "ended" for the app, which asked.
+    if let Some(s) = SHARE
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+    {
+        s.ended
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+    }
+    let _ = call(
+        "stopScreenShare",
+        "()V",
+        |_| Some(Vec::new()),
+        |_, _| Some(()),
+    );
+    *SHARE.write().unwrap_or_else(PoisonError::into_inner) = None;
+}
+
+fn share_started(ok: bool) {
+    let started = SHARE
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .and_then(|s| {
+            s.started
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        });
+    if let Some(started) = started {
+        started(ok);
+    }
+    if !ok {
+        *SHARE.write().unwrap_or_else(PoisonError::into_inner) = None;
+    }
+}
+
+/// `DeviceBridge.nativeScreenStarted(ok)`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_chat_songbird_device_DeviceBridge_nativeScreenStarted(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    ok: jni::sys::jboolean,
+) {
+    share_started(ok != 0);
+}
+
+/// `DeviceBridge.nativeScreenEnded()`: the person stopped it (the notification, the system).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_chat_songbird_device_DeviceBridge_nativeScreenEnded(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) {
+    let ended = SHARE
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take()
+        .and_then(|s| s.ended.into_inner().unwrap_or_else(PoisonError::into_inner));
+    if let Some(ended) = ended {
+        ended();
+    }
+}
+
+/// `DeviceBridge.nativeScreenFrame(pixels, width, height, rowStride, rotation)`: one RGBA
+/// frame in a direct buffer, read in place.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_chat_songbird_device_DeviceBridge_nativeScreenFrame(
+    env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    pixels: jni::objects::JByteBuffer<'_>,
+    width: jint,
+    height: jint,
+    stride: jint,
+    rotation: jint,
+) {
+    let (Ok(ptr), Ok(len)) = (
+        env.get_direct_buffer_address(&pixels),
+        env.get_direct_buffer_capacity(&pixels),
+    ) else {
+        return;
+    };
+    if ptr.is_null() {
+        return;
+    }
+    // SAFETY: the buffer is the Image plane Java holds open until this call returns; `len` is
+    // its capacity.
+    let data = unsafe { std::slice::from_raw_parts(ptr.cast_const(), len) };
+    let (Ok(width), Ok(height), Ok(stride), Ok(rotation)) = (
+        u32::try_from(width),
+        u32::try_from(height),
+        u32::try_from(stride),
+        u16::try_from(rotation),
+    ) else {
+        return;
+    };
+    if let Some(s) = SHARE
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+    {
+        (s.on_frame)(crate::share::Frame {
+            width,
+            height,
+            rotation,
+            pixels: crate::share::Pixels::Rgba { data, stride },
+        });
+    }
+}

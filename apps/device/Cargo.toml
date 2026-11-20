@@ -20,7 +20,7 @@ objc2 = "0.6.5"
 block2 = "0.6.2"
 # The main queue: NSH runs the app on its engine thread, AppKit and UIKit take calls on main.
 dispatch2 = "0.3.1"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSError", "NSString", "NSObject", "NSArray", "NSData", "NSDate", "NSValue", "NSNotification", "NSThread", "NSURL", "NSUUID", "NSSet", "NSBundle", "NSDictionary"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSError", "NSString", "NSObject", "NSArray", "NSData", "NSDate", "NSValue", "NSNotification", "NSThread", "NSURL", "NSUUID", "NSSet", "NSBundle", "NSDictionary", "NSFileManager"] }
 objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext", "LAError", "LABiometryType"] }
 objc2-core-location = { version = "0.3.2", default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate", "CLError"] }
 objc2-authentication-services = { version = "0.3.2", default-features = false, features = ["std", "block2", "ASAuthorizationPlatformPublicKeyCredentialProvider", "ASAuthorizationPlatformPublicKeyCredentialRegistrationRequest", "ASAuthorizationPlatformPublicKeyCredentialAssertionRequest", "ASAuthorizationPlatformPublicKeyCredentialDescriptor", "ASAuthorizationPublicKeyCredentialAssertionRequest", "ASAuthorizationPublicKeyCredentialRegistrationRequest", "ASAuthorizationPublicKeyCredentialDescriptor", "ASAuthorizationController", "ASAuthorizationRequest", "ASAuthorization", "ASAuthorizationError"] }

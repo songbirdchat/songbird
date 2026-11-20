@@ -12,6 +12,7 @@
 //! - [`push`]: the device's push token (APNs, FCM).
 //! - [`location`]: one position, when the person asks to share where they are.
 //! - [`store`]: buying a plan through the App Store (StoreKit 2) or Google Play.
+//! - [`share`]: the phone's screen in a call (MediaProjection, a ReplayKit extension).
 //! - [`screen`]: keeping the app's windows out of screenshots and screen recording.
 //!
 //! `unsafe` is allowed in the platform modules only, each block saying why it holds.
@@ -32,6 +33,7 @@ pub mod photos;
 pub mod push;
 pub mod screen;
 pub mod secure;
+pub mod share;
 pub mod store;
 #[cfg(target_os = "windows")]
 mod windows;

@@ -10,6 +10,9 @@
     <!-- Buying a plan in Google Play (D-0178). -->
     <uses-permission android:name="com.android.vending.BILLING" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Sharing the screen in a call (D-0180): MediaProjection in a foreground service. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <!-- Scanning link and safety-number codes, photos and videos to send, video calls. -->
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- Calls and voice messages (D-0176): the microphone, and the audio route of a call. -->
@@ -48,6 +51,12 @@
             android:authorities="chat.songbird.app.files"
             android:exported="false"
             android:grantUriPermissions="true" />
+
+        <!-- Sharing the screen in a call (D-0180). -->
+        <service
+            android:name="chat.songbird.share.ScreenShareService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
 
         <!-- UnifiedPush (D-0176): the user's distributor wakes Songbird; no Google services. -->
         <service

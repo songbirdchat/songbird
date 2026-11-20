@@ -930,6 +930,9 @@ pub fn share_screen(ui_call: u64, window: bool) {
     let Some(media) = media_of(ui_call) else {
         return;
     };
+    if songbird_device::share::supported() {
+        return share_phone_screen(ui_call, media);
+    }
     spawn(async move {
         match background(async move { media.share_screen(window).await }).await {
             Ok(Ok(share)) => {
@@ -943,8 +946,76 @@ pub fn share_screen(ui_call: u64, window: bool) {
     });
 }
 
+/// A phone's screen (D-0180): a screen-share track fed by the system's capture (ReplayKit's
+/// broadcast extension, MediaProjection), after the system's own prompt. The person can stop
+/// it here or from the system; either way the track leaves the call.
+fn share_phone_screen(ui_call: u64, media: Arc<Call>) {
+    enum Step {
+        Started(bool),
+        Ended,
+    }
+    spawn(async move {
+        let Ok(Ok((share, sender))) = background(async move { media.share_frames().await }).await
+        else {
+            ui::live::update(ui_call, |c| c.sharing = None);
+            toast("Screen sharing couldn't start. Try again.");
+            return;
+        };
+        with_live(|l| l.screen = Some(Arc::new(share)));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Step>();
+        let (started, ended) = (tx.clone(), tx);
+        let epoch = std::time::Instant::now();
+        songbird_device::share::start(
+            Box::new(move |f| {
+                use songbird_device::share::Pixels;
+                let at = i64::try_from(epoch.elapsed().as_micros()).unwrap_or(i64::MAX);
+                let _ = match f.pixels {
+                    Pixels::Rgba { data, stride } => {
+                        sender.send_rgba((f.width, f.height), (data, stride), at)
+                    }
+                    Pixels::Nv12 {
+                        luma,
+                        luma_stride,
+                        chroma,
+                        chroma_stride,
+                    } => sender.send_nv12_rotated(
+                        (f.width, f.height),
+                        (luma, luma_stride),
+                        (chroma, chroma_stride),
+                        f.rotation,
+                        at,
+                    ),
+                };
+            }),
+            Box::new(move |ok| drop(started.send(Step::Started(ok)))),
+            Box::new(move || drop(ended.send(Step::Ended))),
+        );
+        while let Some(step) = rx.recv().await {
+            match step {
+                Step::Started(true) => {}
+                Step::Started(false) | Step::Ended => {
+                    if let Some(share) =
+                        with_live(|l| (l.ui == ui_call).then(|| l.screen.take()).flatten())
+                            .flatten()
+                    {
+                        drop(background(async move { share.stop().await }));
+                    }
+                    ui::live::update(ui_call, |c| c.sharing = None);
+                    if matches!(step, Step::Ended) {
+                        announce_for_accessibility("You stopped sharing your screen");
+                    }
+                    break;
+                }
+            }
+        }
+    });
+}
+
 /// Stops sharing the screen.
 pub fn stop_sharing(ui_call: u64) {
+    if songbird_device::share::supported() {
+        songbird_device::share::stop();
+    }
     if let Some(share) =
         with_live(|l| (l.ui == ui_call).then(|| l.screen.take()).flatten()).flatten()
     {
@@ -1696,6 +1767,9 @@ pub fn closed(ui_call: u64, reason: EndReason, by_user: bool) {
         }
     }
     let (media, screen) = (live.media, live.screen);
+    if screen.is_some() && songbird_device::share::supported() {
+        songbird_device::share::stop();
+    }
     let leaving = background(async move {
         if let Some(share) = screen {
             share.stop().await;

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds Songbird for the iOS simulator with its Notification Service Extension (Prompt 8,
-# D-0099), without an Apple account: `nsh package --target ios-simulator`, then the extension
-# compiled for the simulator, placed in the app's PlugIns, both signed ad hoc.
+# D-0099) and its screen-sharing broadcast extension (D-0180), without an Apple account:
+# `nsh package --target ios-simulator`, then the extensions compiled for the simulator, placed
+# in the app's PlugIns, all signed ad hoc.
 #   apps/ios/build-simulator.sh [out-dir]   →   <out-dir>/Songbird.app
 # Real APNs tokens and PushKit need the registered bundle IDs and a provisioning profile (D-0094 §2).
 set -euo pipefail
@@ -24,5 +25,17 @@ xcrun --sdk iphonesimulator swiftc \
   -o "$appex/SongbirdNotify"
 cp "$here/NotificationService/Info.plist" "$appex/Info.plist"
 codesign --force --sign - --timestamp=none "$appex"
+# The screen-sharing extension (D-0180), the same way.
+screen="$app/PlugIns/SongbirdScreen.appex"
+mkdir -p "$screen"
+xcrun --sdk iphonesimulator swiftc \
+  -target arm64-apple-ios17.0-simulator -sdk "$sdk" \
+  -module-name SongbirdScreen -parse-as-library -application-extension -O \
+  -Xlinker -e -Xlinker _NSExtensionMain -Xlinker -rpath -Xlinker @executable_path/../../Frameworks \
+  -framework ReplayKit -framework Accelerate \
+  "$here/ScreenShare/SampleHandler.swift" \
+  -o "$screen/SongbirdScreen"
+cp "$here/ScreenShare/Info.plist" "$screen/Info.plist"
+codesign --force --sign - --timestamp=none "$screen"
 codesign --force --sign - --timestamp=none --preserve-metadata=entitlements "$app"
 echo "$app"

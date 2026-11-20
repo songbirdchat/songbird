@@ -45,6 +45,12 @@ public final class SongbirdActivity extends Activity {
     }
 
     @Override
+    protected void onActivityResult(int request, int result, android.content.Intent data) {
+        super.onActivityResult(request, result, data);
+        DeviceBridge.onActivityResult(request, result, data);
+    }
+
+    @Override
     protected void onStart() {
         super.onStart();
         DeviceBridge.setFront(true);

@@ -1114,3 +1114,207 @@ pub(crate) mod icon {
         });
     }
 }
+
+// ---------------------------------------------------------------- screen sharing (D-0180)
+
+/// iOS: the screen from Songbird's ReplayKit broadcast extension (`apps/ios/ScreenShare`).
+/// The app listens on a socket in the app group's container (only Songbird's processes reach
+/// it) and opens the system's broadcast sheet with the extension chosen; once the person
+/// starts it, the extension connects and sends each frame as NV12:
+/// `"SBS1"`, width, height, rotation (u32, little-endian), then the luma rows and the `CbCr`
+/// rows, packed.
+#[cfg(target_os = "ios")]
+pub(crate) mod share {
+    use std::{
+        cell::RefCell,
+        io::Read,
+        net::Shutdown,
+        os::unix::{
+            fs::PermissionsExt,
+            net::{UnixListener, UnixStream},
+        },
+        path::PathBuf,
+        sync::{
+            Mutex, PoisonError,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::{Duration, Instant},
+    };
+
+    use objc2::{
+        msg_send,
+        rc::Retained,
+        runtime::{AnyClass, AnyObject},
+    };
+    use objc2_foundation::{NSArray, NSFileManager, NSString};
+
+    use crate::share::{Frame, OnEnded, OnFrame, OnStarted, Pixels};
+
+    #[link(name = "ReplayKit", kind = "framework")]
+    unsafe extern "C" {}
+
+    const GROUP: &str = "group.chat.songbird.app";
+    const EXTENSION: &str = "chat.songbird.app.screen";
+    /// How long the system's sheet may wait for the person.
+    const WAIT: Duration = Duration::from_secs(120);
+    /// The largest frame taken (the extension scales to 1280 on the long side).
+    const MAX_PIXELS: u32 = 1280 * 1280;
+
+    static STREAM: Mutex<Option<UnixStream>> = Mutex::new(None);
+    static CANCEL: AtomicBool = AtomicBool::new(false);
+
+    thread_local! {
+        /// The picker the sheet came from (main thread), removed at the next start or stop.
+        static PICKER: RefCell<Option<Retained<AnyObject>>> = const { RefCell::new(None) };
+    }
+
+    fn socket_path() -> Option<PathBuf> {
+        let url = NSFileManager::defaultManager()
+            .containerURLForSecurityApplicationGroupIdentifier(&NSString::from_str(GROUP))?;
+        Some(PathBuf::from(url.path()?.to_string()).join("screen.sock"))
+    }
+
+    pub(crate) fn start(on_frame: OnFrame, started: OnStarted, ended: OnEnded) {
+        let Some(path) = socket_path() else {
+            return started(false);
+        };
+        let _ = std::fs::remove_file(&path);
+        let Ok(listener) = UnixListener::bind(&path) else {
+            return started(false);
+        };
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        CANCEL.store(false, Ordering::Relaxed);
+        let spawned = std::thread::Builder::new()
+            .name("songbird-screen".into())
+            .spawn(move || {
+                let stream = accept(&listener);
+                let _ = std::fs::remove_file(&path);
+                let Some(stream) = stream else {
+                    return started(false);
+                };
+                let reader = stream.try_clone();
+                *STREAM.lock().unwrap_or_else(PoisonError::into_inner) = Some(stream);
+                started(true);
+                if let Ok(reader) = reader {
+                    receive(reader, &on_frame);
+                }
+                // Ended by the extension (the person stopped it) unless the app took the stream.
+                let ours = STREAM.lock().unwrap_or_else(PoisonError::into_inner).take();
+                if ours.is_some() {
+                    ended();
+                }
+                super::on_main(|_| remove_picker());
+            });
+        if spawned.is_err() {
+            return;
+        }
+        super::on_main(|_| show_picker());
+    }
+
+    pub(crate) fn stop() {
+        CANCEL.store(true, Ordering::Relaxed);
+        if let Some(s) = STREAM.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            // The extension's next write fails and it ends the broadcast.
+            let _ = s.shutdown(Shutdown::Both);
+        }
+        super::on_main(|_| remove_picker());
+    }
+
+    fn accept(listener: &UnixListener) -> Option<UnixStream> {
+        listener.set_nonblocking(true).ok()?;
+        let until = Instant::now() + WAIT;
+        while Instant::now() < until && !CANCEL.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((s, _)) => {
+                    s.set_nonblocking(false).ok()?;
+                    return Some(s);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    fn receive(mut s: UnixStream, on_frame: &OnFrame) {
+        let mut header = [0u8; 16];
+        let mut pixels = Vec::new();
+        loop {
+            if s.read_exact(&mut header).is_err() || &header[..4] != b"SBS1" {
+                return;
+            }
+            let word = |i: usize| {
+                u32::from_le_bytes([header[i], header[i + 1], header[i + 2], header[i + 3]])
+            };
+            let (width, height, rotation) = (word(4), word(8), word(12));
+            if width == 0
+                || height == 0
+                || width % 2 != 0
+                || height % 2 != 0
+                || width.saturating_mul(height) > MAX_PIXELS
+            {
+                return;
+            }
+            let luma = (width * height) as usize;
+            pixels.resize(luma + luma / 2, 0);
+            if s.read_exact(&mut pixels).is_err() {
+                return;
+            }
+            let (y, uv) = pixels.split_at(luma);
+            on_frame(Frame {
+                width,
+                height,
+                rotation: u16::try_from(rotation % 360).unwrap_or(0),
+                pixels: Pixels::Nv12 {
+                    luma: y,
+                    luma_stride: width,
+                    chroma: uv,
+                    chroma_stride: width,
+                },
+            });
+        }
+    }
+
+    /// The system's broadcast sheet, with Songbird's extension chosen: an invisible
+    /// `RPSystemBroadcastPickerView` in the window, its button pressed.
+    fn show_picker() {
+        remove_picker();
+        let Some(cls) = AnyClass::get(c"RPSystemBroadcastPickerView") else {
+            return;
+        };
+        // SAFETY: ReplayKit's picker view, made and configured on the main thread; the
+        // window is the app's own; the button is the picker's, pressed as a tap would.
+        unsafe {
+            let picker: Retained<AnyObject> = msg_send![cls, new];
+            let _: () = msg_send![&*picker, setPreferredExtension: &*NSString::from_str(EXTENSION)];
+            let _: () = msg_send![&*picker, setShowsMicrophoneButton: false];
+            let app: Retained<AnyObject> = msg_send![
+                AnyClass::get(c"UIApplication").expect("UIKit"),
+                sharedApplication
+            ];
+            let windows: Retained<NSArray<AnyObject>> = msg_send![&*app, windows];
+            if let Some(window) = windows.firstObject() {
+                let _: () = msg_send![&*window, addSubview: &*picker];
+            }
+            let subviews: Retained<NSArray<AnyObject>> = msg_send![&*picker, subviews];
+            let button = AnyClass::get(c"UIButton").expect("UIKit");
+            for view in &subviews {
+                let is_button: bool = msg_send![&*view, isKindOfClass: button];
+                if is_button {
+                    // UIControlEventTouchUpInside.
+                    let _: () = msg_send![&*view, sendActionsForControlEvents: 1u64 << 6];
+                }
+            }
+            PICKER.with_borrow_mut(|p| *p = Some(picker));
+        }
+    }
+
+    fn remove_picker() {
+        if let Some(p) = PICKER.with_borrow_mut(Option::take) {
+            // SAFETY: our picker view, on the main thread.
+            let _: () = unsafe { msg_send![&*p, removeFromSuperview] };
+        }
+    }
+}

@@ -320,6 +320,81 @@ impl VideoSender {
         })
     }
 
+    /// Sends one NV12 frame as [`Self::send_nv12`] does, to be turned `rotation` degrees
+    /// clockwise for display (a phone's screen held sideways). Returns `false` if it was
+    /// malformed or dropped.
+    #[must_use]
+    pub fn send_nv12_rotated(
+        &self,
+        (width, height): (u32, u32),
+        (luma, luma_stride): (&[u8], u32),
+        (chroma, chroma_stride): (&[u8], u32),
+        rotation: u16,
+        timestamp_us: i64,
+    ) -> bool {
+        use livekit::webrtc::native::yuv_helper::nv12_to_i420;
+        let (Ok(cols), Ok(rows)) = (i32::try_from(width), i32::try_from(height)) else {
+            return false;
+        };
+        let rows_of = |stride: u32, n: u32| u64::from(stride) * u64::from(n);
+        if width == 0
+            || height == 0
+            || luma_stride < width
+            || chroma_stride < width.div_ceil(2) * 2
+            || u64::try_from(luma.len()).unwrap_or(0) < rows_of(luma_stride, height)
+            || u64::try_from(chroma.len()).unwrap_or(0) < rows_of(chroma_stride, height.div_ceil(2))
+        {
+            return false;
+        }
+        let mut buffer = I420Buffer::new(width, height);
+        let (sy, su, sv) = buffer.strides();
+        let (y, u, v) = buffer.data_mut();
+        nv12_to_i420(
+            luma,
+            luma_stride,
+            chroma,
+            chroma_stride,
+            y,
+            sy,
+            u,
+            su,
+            v,
+            sv,
+            cols,
+            rows,
+        );
+        self.source.capture_frame(&VideoFrame {
+            rotation: match rotation {
+                90 => VideoRotation::VideoRotation90,
+                180 => VideoRotation::VideoRotation180,
+                270 => VideoRotation::VideoRotation270,
+                _ => VideoRotation::VideoRotation0,
+            },
+            timestamp_us,
+            frame_metadata: None,
+            buffer,
+        })
+    }
+
+    /// Sends one 32-bit RGBA frame (Android's screen capture: R, G, B, A in memory, libyuv's
+    /// "ABGR"), `stride` bytes per row. Returns `false` if it was malformed or dropped.
+    #[must_use]
+    pub fn send_rgba(
+        &self,
+        (width, height): (u32, u32),
+        (data, stride): (&[u8], u32),
+        timestamp_us: i64,
+    ) -> bool {
+        rgba_to_i420(data, stride, width, height).is_some_and(|buffer| {
+            self.source.capture_frame(&VideoFrame {
+                rotation: VideoRotation::VideoRotation0,
+                timestamp_us,
+                frame_metadata: None,
+                buffer,
+            })
+        })
+    }
+
     /// Stops sending frames (the others see the camera off) or starts again.
     pub fn set_muted(&self, muted: bool) {
         if muted {
@@ -690,6 +765,30 @@ impl Call {
         }
     }
 
+    /// Shares a screen the platform captures itself (`ReplayKit` on iOS, `MediaProjection` on
+    /// Android): a screen-share track (encrypted like the camera) whose frames the caller sends
+    /// through the returned [`VideoSender`] until [`ScreenShare::stop`].
+    pub async fn share_frames(&self) -> Result<(ScreenShare, VideoSender)> {
+        let source = NativeVideoSource::new(
+            VideoResolution {
+                width: 1280,
+                height: 720,
+            },
+            true,
+        );
+        let track =
+            LocalVideoTrack::create_video_track("screen", RtcVideoSource::Native(source.clone()));
+        let sid = self
+            .publish(LocalTrack::Video(track.clone()), TrackSource::Screenshare)
+            .await?;
+        let share = ScreenShare {
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sid,
+            room: self.room.clone(),
+        };
+        Ok((share, VideoSender { source, track }))
+    }
+
     /// Sends `payload` to everyone in the room (or to `to` only) on the data channel, reliably,
     /// encrypted end to end like the media.
     pub async fn send_data(&self, topic: &str, payload: Vec<u8>, to: Option<&str>) -> Result<()> {
@@ -993,6 +1092,31 @@ fn bgra_to_i420(data: &[u8], stride: u32, width: u32, height: u32) -> Option<I42
     let (luma, blue, red) = buffer.data_mut();
     livekit::webrtc::native::yuv_helper::argb_to_i420(
         data, stride, luma, sy, blue, su, red, sv, cols, rows,
+    );
+    Some(buffer)
+}
+
+/// An RGBA frame (libyuv's "ABGR") as I420, through NV12; `None` if its sizes do not add up.
+fn rgba_to_i420(data: &[u8], stride: u32, width: u32, height: u32) -> Option<I420Buffer> {
+    use livekit::webrtc::native::yuv_helper::{abgr_to_nv12, nv12_to_i420};
+    let (cols, rows) = (i32::try_from(width).ok()?, i32::try_from(height).ok()?);
+    if width == 0
+        || height == 0
+        || stride < width.checked_mul(4)?
+        || u64::try_from(data.len()).ok()? < u64::from(stride) * u64::from(height)
+    {
+        return None;
+    }
+    let uv_stride = width.div_ceil(2) * 2;
+    let mut y = vec![0u8; usize::try_from(u64::from(width) * u64::from(height)).ok()?];
+    let mut uv =
+        vec![0u8; usize::try_from(u64::from(uv_stride) * u64::from(height.div_ceil(2))).ok()?];
+    abgr_to_nv12(data, stride, &mut y, width, &mut uv, uv_stride, cols, rows);
+    let mut buffer = I420Buffer::new(width, height);
+    let (sy, su, sv) = buffer.strides();
+    let (luma, blue, red) = buffer.data_mut();
+    nv12_to_i420(
+        &y, width, &uv, uv_stride, luma, sy, blue, su, red, sv, cols, rows,
     );
     Some(buffer)
 }

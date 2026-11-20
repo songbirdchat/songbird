@@ -1162,12 +1162,13 @@ fn controls(sheets: Sheets) -> View {
             move || sheets.more.set(true),
         )
     };
-    // Phones share their screen through ReplayKit or MediaProjection, not wired yet.
+    // Phones share through the system's capture (D-0180); desktops through the call's own.
     let screen_share_here = || {
-        !matches!(
-            os(),
-            nsh_core::platform::Os::Ios | nsh_core::platform::Os::Android
-        )
+        songbird_device::share::supported()
+            || !matches!(
+                os(),
+                nsh_core::platform::Os::Ios | nsh_core::platform::Os::Android
+            )
     };
     let build = move || {
         let row = view()
@@ -1198,6 +1199,9 @@ fn controls(sheets: Sheets) -> View {
                 move || {
                     if sharing.get_untracked() {
                         super::stop_sharing();
+                    } else if songbird_device::share::supported() {
+                        // A phone shares its whole screen, after the system's own prompt.
+                        super::start_sharing(Share::EntireScreen);
                     } else {
                         sheets.share.set(true);
                     }

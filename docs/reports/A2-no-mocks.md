@@ -74,7 +74,8 @@ Status: ☐ open · ☑ done (with the commit).
 encrypted, devices, screen share, verification symbols from the call's key, signed hellos, raised
 hands. Call links are real too (D-0153): create, join, lobby, admit, revoke, per-device keys. Left: the
 phone speaker route and the iOS and Android builds of
-call media (libwebrtc's mobile archives are pinned, the native hosts are not wired).
+call media (libwebrtc's mobile archives are pinned, the native hosts are not wired). Phone
+screen sharing: done (D-0180), MediaProjection and a ReplayKit broadcast extension.
 
 **e (native modules):** in `apps/device` (D-0172 to D-0174): device secrets under the Keychain,
 Android Keystore, DPAPI and the Secret Service; Face ID, Touch ID, fingerprint and Windows Hello
