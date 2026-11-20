@@ -45,17 +45,19 @@ Status: ☐ open · ☑ done (with the commit).
 
 - ☑ Locked chats open with the app passcode; real storage and network usage (D-0162)
 
+- ☑ Chat-list state follows the account across devices (D-0163)
+
+- ☑ HTTPS to Songbird's hosts goes through the proxy too, fail closed (D-0164)
+
 ## Open, by what they need
 
 **a (app only, or an existing endpoint):**
-- proxy for HTTP requests too
 - backup frequency, include media and second destination
 - Google Drive, OneDrive and Dropbox stores (the crate has them; OAuth needs the owner's apps)
 - parental rules enforced on the child's app
 
 **b (app-core):**
 - security notifications (KT)
-- chat list state synced (records)
 
 **Groups, the rest (b, c):** new devices joining by external commit. (Roles on received commits: D-0155; the change log: D-0156.)
 

@@ -42,7 +42,9 @@ pub fn encode(c: &Chat) -> String {
 /// Applies a record's state to a chat; unknown or bad fields are left alone.
 pub fn apply(v: &str, c: &mut Chat) {
     for part in v.split(';') {
-        let Some((k, val)) = part.split_once('=') else { continue };
+        let Some((k, val)) = part.split_once('=') else {
+            continue;
+        };
         let flag = val == "1";
         match k {
             "a" => c.archived = flag,
@@ -168,7 +170,12 @@ mod tests {
         apply(&format!("{v};z=7"), &mut d);
         assert_eq!(
             (d.archived, d.muted, d.muted_until, d.lists.clone()),
-            (true, true, 99, vec!["Family".to_string(), "Work".to_string()])
+            (
+                true,
+                true,
+                99,
+                vec!["Family".to_string(), "Work".to_string()]
+            )
         );
         apply("m=0", &mut d);
         assert!(!d.muted);

@@ -37,6 +37,7 @@ pub mod presence;
 pub mod profile;
 pub mod records;
 pub mod supervision;
+pub mod tunnel;
 pub mod usage;
 pub mod username;
 pub mod wire;
@@ -329,6 +330,26 @@ async fn send(request: HttpRequest) -> Result<(u16, Vec<u8>), Problem> {
         _ => 0,
     };
     let out = body + request.url.len() + 200;
+    // Songbird's own hosts go through the proxy when one is set (D-0164), never around it.
+    if let Some(t) = tunnel::for_url(&request.url) {
+        let t = t?;
+        let body = match request.body {
+            nsh_core::platform::HttpBody::Bytes(b) => b,
+            nsh_core::platform::HttpBody::Empty => Vec::new(),
+            _ => return Err(problem("This request can't go through the proxy.")),
+        };
+        let r = tunnel::through(
+            t,
+            request.method,
+            request.url,
+            request.headers,
+            body,
+            request.follow_redirects,
+        )
+        .await?;
+        usage::count(lane, out, r.body.len() + 200);
+        return Ok((r.status, r.body));
+    }
     match fetch(request).await {
         Ok(r) => {
             usage::count(lane, out, r.body.len() + 200);

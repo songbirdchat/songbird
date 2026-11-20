@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 mod backoff;
+pub mod https;
 mod key;
 mod ws;
 

@@ -199,6 +199,22 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0164 — HTTPS to Songbird's hosts goes through the proxy too
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: with a proxy set, the app's HTTPS requests to Songbird's own hosts (api, media and
+  the vault on it, billing) go through it like the connection (`songbird_client::https::Tunnel`:
+  TCP and TLS to the proxy, the endpoint's TLS 1.3 inside, HTTP/1.1, redirects only to HTTPS
+  and only through the proxy). Fail closed: an unreachable proxy, or one that doesn't carry a
+  host, is an error, never a direct connection. Destinations the user chose for backups are
+  reached directly, since a proxy is not an open relay. The proxy example adds billing's host.
+- Consequences: before this, only the delivery connection used the proxy, and every HTTP
+  request showed the user's IP address to Songbird. Calls still connect directly (WebRTC needs
+  UDP, which the proxy doesn't carry); the proxy page says only that it hides the IP address
+  from Songbird's servers.
+
 ## D-0163 — Chat-list state follows the account across devices
 
 - Date: 2026-11-20

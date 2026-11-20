@@ -21,6 +21,10 @@ sockudo-ws.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "macros", "io-util"] }
 tokio-rustls.workspace = true
+# HTTPS through the proxy (D-0164): HTTP/1.1 inside the tunnelled TLS session.
+hyper = { workspace = true, features = ["client"] }
+hyper-util.workspace = true
+http-body-util.workspace = true
 # Mozilla's roots for proxies and public endpoints (Prompt 9: the proxy setting).
 webpki-roots.workspace = true
 

@@ -89,6 +89,14 @@ endpoints and refuses anything else by closing the connection without a response
 the inner `ClientHello` is opaque to the proxy. The inner `ClientHello` must fit in
 `max_client_hello_bytes` (default 16 KiB) and arrive within the handshake timeout (default 10 s).
 
+**HTTPS through the proxy (D-0164).** With a proxy set, the client sends every request to
+Songbird's own hosts (the api, which also serves media, GIFs, packs and the backup vault, and
+billing) the same way: HTTP/1.1 inside the inner TLS session, redirects followed only to HTTPS and
+only through the proxy. A proxy that can't be reached, or that refuses a host, fails the request;
+the client never falls back to a direct connection. Backup destinations the user chose (their own
+WebDAV, S3 or cloud drive) are reached directly, since a proxy carries only Songbird's hosts.
+Call media (LiveKit and its WebRTC transport) does not go through a proxy.
+
 **Proxy links.** UTF-8, at most 300 bytes, one of:
 
 ```

@@ -22,7 +22,7 @@ use songbird_backup_format::object::Seen;
 use songbird_backup_format::reader::{Backup, MemoryStaging};
 use songbird_backup_format::schema::{self, Platform, record::Body as Rec};
 use songbird_backup_format::{BackupKeys, OsRng, RecoveryKey};
-use songbird_backup_storage::http::{Http, HyperHttp, Request};
+use songbird_backup_storage::http::{Http, Request};
 use songbird_backup_storage::local::LocalStore;
 use songbird_backup_storage::run::{self, Options, RunError};
 use songbird_backup_storage::s3::{S3Config, S3Store};
@@ -102,7 +102,7 @@ fn forget_seen(keys: &BackupKeys) {
 /// device (the account's main phone), **blinded**, so the vault never learns the account. The
 /// token key is pinned the first time this process sees it; release builds ship it (A12).
 struct AppPasses {
-    http: Arc<HyperHttp>,
+    http: Arc<super::tunnel::AppHttp>,
     api: String,
     device: [u8; 16],
     seed: Zeroizing<[u8; 32]>,
@@ -267,10 +267,7 @@ impl AppPasses {
 /// Keeps vault day passes ahead when backups go to Songbird's servers (start-up only).
 pub async fn prefetch_passes() -> Result<(), Problem> {
     let (device, seed) = super::device_key().ok_or_else(|| problem("Not registered."))?;
-    let http = Arc::new(
-        HyperHttp::new(&[])
-            .map_err(|_| problem("This device couldn't start a secure connection."))?,
-    );
+    let http = Arc::new(super::tunnel::AppHttp::new()?);
     let ep = endpoint();
     AppPasses {
         http,
@@ -377,10 +374,7 @@ fn store_for(
     keys: &BackupKeys,
     write: bool,
 ) -> Result<Arc<dyn BackupStore>, Problem> {
-    let http = Arc::new(
-        HyperHttp::new(&[])
-            .map_err(|_| problem("This device couldn't start a secure connection."))?,
-    );
+    let http = Arc::new(super::tunnel::AppHttp::new()?);
     match dest {
         BackupDestination::SongbirdServers => {
             if !super::is_live() {
