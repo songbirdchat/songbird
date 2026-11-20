@@ -1483,3 +1483,200 @@ async fn call_links_lobby_keys_and_revoke() {
         "the other link stays"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn timers_pins_polls_and_group_events() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    // Contacts first.
+    alice.core.send_text(&bob.account, "hi").await.unwrap();
+    assert!(matches!(pump_app(&mut bob).await, Received::Message(_)));
+    bob.core.send_text(&alice.account, "hi").await.unwrap();
+    assert!(matches!(
+        pump_app(&mut alice).await,
+        Received::Status { .. }
+    ));
+    assert!(matches!(pump_app(&mut alice).await, Received::Message(_)));
+    assert!(matches!(pump_app(&mut bob).await, Received::Status { .. }));
+
+    // A poll: Bob votes, Alice sees the tally; a vote for an option that does not exist is
+    // refused; Alice closes it and a later vote no longer counts.
+    let options = vec!["Tea".to_string(), "Coffee".to_string()];
+    let poll = alice
+        .core
+        .send_poll(&bob.account, "Drink?", &options, false)
+        .await
+        .unwrap();
+    assert!(matches!(pump_app(&mut bob).await, Received::Message(_)));
+    assert!(matches!(
+        pump_app(&mut alice).await,
+        Received::Status { .. }
+    ));
+    bob.core
+        .vote(&alice.account, &alice.account, &poll, &[1])
+        .await
+        .unwrap();
+    assert_eq!(
+        pump_app(&mut alice).await,
+        Received::PollChanged {
+            author: alice.account,
+            id: poll
+        }
+    );
+    assert_eq!(
+        alice.core.poll_tally(&alice.account, &poll).unwrap(),
+        (vec![0, 1], vec![], false)
+    );
+    assert!(
+        bob.core
+            .vote(&alice.account, &alice.account, &poll, &[0, 1])
+            .await
+            .is_err(),
+        "one choice only"
+    );
+    alice.core.close_poll(&bob.account, &poll).await.unwrap();
+    assert!(matches!(
+        pump_app(&mut bob).await,
+        Received::PollChanged { .. }
+    ));
+    assert_eq!(
+        bob.core.poll_tally(&alice.account, &poll).unwrap(),
+        (vec![0, 1], vec![1], true)
+    );
+    assert!(
+        bob.core
+            .vote(&alice.account, &alice.account, &poll, &[0])
+            .await
+            .is_err(),
+        "closed"
+    );
+
+    // A pin, for everyone in the chat.
+    alice
+        .core
+        .pin(&bob.account, &alice.account, &poll, 86_400, false)
+        .await
+        .unwrap();
+    let Received::Pinned {
+        author,
+        id,
+        until_ms,
+        ..
+    } = pump_app(&mut bob).await
+    else {
+        panic!("a pin")
+    };
+    assert_eq!((author, id), (alice.account, poll));
+    assert!(until_ms > 0);
+    assert_eq!(bob.core.pins(&alice.account).unwrap().len(), 1);
+
+    // Disappearing messages: Alice turns on a 5-second timer; Bob learns it, and the next
+    // message goes on both devices once its time is up.
+    alice.core.set_timer(&bob.account, 5).await.unwrap();
+    assert_eq!(
+        pump_app(&mut bob).await,
+        Received::TimerChanged {
+            chat: alice.account,
+            by: alice.account,
+            secs: 5
+        }
+    );
+    assert_eq!(bob.core.timer(&alice.account).unwrap(), 5);
+    let gone = alice
+        .core
+        .send_text(&bob.account, "soon gone")
+        .await
+        .unwrap();
+    assert!(matches!(pump_app(&mut bob).await, Received::Message(_)));
+    assert_eq!(bob.core.expire_messages().unwrap(), Vec::new());
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let expired = bob.core.expire_messages().unwrap();
+    assert!(
+        expired
+            .iter()
+            .any(|(_, a, i)| *a == alice.account && *i == gone)
+    );
+    assert!(
+        bob.core
+            .store
+            .message(&alice.account, &gone)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        alice
+            .core
+            .expire_messages()
+            .unwrap()
+            .iter()
+            .any(|(_, _, i)| *i == gone)
+    );
+
+    // In a group: a reaction and a poll vote travel as group events (not as empty messages).
+    let gid = alice
+        .core
+        .create_group("Club", &[bob.account])
+        .await
+        .unwrap();
+    assert_eq!(pump_app(&mut bob).await, Received::Joined { group: gid });
+    assert!(matches!(
+        pump_app(&mut bob).await,
+        Received::GroupUpdated { .. }
+    ));
+    let gpoll = alice
+        .core
+        .send_poll(&gid, "When?", &["Mon".into(), "Tue".into()], true)
+        .await
+        .unwrap();
+    let Received::Message(row) = pump_app(&mut bob).await else {
+        panic!("the group poll")
+    };
+    assert_eq!(row.chat, gid);
+    bob.core
+        .react(&gid, &alice.account, &gpoll, "👍")
+        .await
+        .unwrap();
+    // Bob's delivery receipt for the message that already disappeared arrives first, as
+    // nothing to show.
+    let mut got = pump_app(&mut alice).await;
+    while matches!(got, Received::Nothing | Received::Status { .. }) {
+        got = pump_app(&mut alice).await;
+    }
+    assert!(
+        matches!(&got, Received::Reaction { emoji, .. } if emoji == "👍"),
+        "{got:?}"
+    );
+    bob.core
+        .vote(&gid, &alice.account, &gpoll, &[0, 1])
+        .await
+        .unwrap();
+    assert!(matches!(
+        pump_app(&mut alice).await,
+        Received::PollChanged { .. }
+    ));
+    assert_eq!(
+        alice.core.poll_tally(&alice.account, &gpoll).unwrap().0,
+        vec![1, 1]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn safety_numbers_match_and_verification_is_kept() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    let (a, a_verified) = alice.core.safety(&bob.account).await.unwrap();
+    let (b, _) = bob.core.safety(&alice.account).await.unwrap();
+    // Both sides show the same 60 digits; each side's code, scanned by the other, matches.
+    assert_eq!(a.digits, b.digits);
+    assert_eq!(a.digits.len(), 60);
+    assert!(songbird_app_core::crypto::safety::scanned_matches(
+        &a,
+        &b.scannable
+    ));
+    assert!(!a_verified);
+    alice.core.set_verified(&bob.account, true).unwrap();
+    assert!(alice.core.safety(&bob.account).await.unwrap().1);
+    assert!(!alice.core.identity_changed(&bob.account).await.unwrap());
+}

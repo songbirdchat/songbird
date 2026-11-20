@@ -208,7 +208,7 @@ pub const ARTICLES: [Article; 10] = [
         title: "Disappearing messages",
         summary: "Messages that delete themselves after a while.",
         body: &[
-            "Turn on disappearing messages in a chat's info. New messages disappear after 24 hours, 7 days or 90 days, for everyone in the chat.",
+            "Turn on disappearing messages in a chat's info. New messages disappear after 24 hours, 7 days or 4 weeks, for everyone in the chat.",
             "People can still take screenshots or photos of their screen, so only share what you are comfortable with.",
         ],
     },

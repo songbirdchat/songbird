@@ -291,7 +291,7 @@ pub fn default_timer() {
             (None, "Off"),
             (Some(Disappear::Day), "24 hours"),
             (Some(Disappear::Week), "7 days"),
-            (Some(Disappear::Quarter), "90 days"),
+            (Some(Disappear::FourWeeks), "4 weeks"),
         ];
         view()
             .child(view().items_center().pt_6().pb_2().child(hero_icon(Icon::Timer)))

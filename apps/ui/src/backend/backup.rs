@@ -580,7 +580,7 @@ pub fn snapshot(s: Store) -> Snapshot {
             title: c.title.clone(),
             archived: c.archived,
             pinned: c.pinned,
-            muted_until_ms: if c.muted { u64::MAX } else { 0 },
+            muted_until_ms: if c.muted { c.muted_until } else { 0 },
             ..schema::Chat::default()
         }));
     }

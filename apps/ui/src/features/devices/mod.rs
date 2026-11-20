@@ -22,6 +22,16 @@ pub const MAX_LINKED: usize = 4;
 
 /// The safety-number screen for a contact, pushed.
 pub fn safety_number(contact: ContactId) {
+    if crate::backend::chat::owns(contact) {
+        // A real contact: the number comes from both accounts' identity keys (app-core).
+        crate::backend::chat::open_safety(contact);
+        return;
+    }
+    push_safety(contact);
+}
+
+/// Pushes the safety-number screen with what the store holds for `contact`.
+pub fn push_safety(contact: ContactId) {
     nav::push(format!("safety:{contact}"), move || {
         page("Safety number", safety_body(contact))
     });
@@ -111,6 +121,15 @@ fn safety_body(contact: ContactId) -> AnyElement {
                 .role(AccessibilityRole::Header),
         )
         .child(when(key_changed, move || banner(Tone::Info, Icon::Info, changed_note.clone())))
+        .child(when(
+            move || key_changed() && crate::backend::chat::owns(contact),
+            move || {
+                btn("Accept the new safety number", Variant::Secondary, BtnSize::Md, move || {
+                    crate::backend::chat::accept_identity(contact);
+                })
+                .into_element()
+            },
+        ))
         .child(
             card()
                 .gap_5()
@@ -223,8 +242,7 @@ fn scan_sheet(
                             }
                         },
                     );
-                    // mock: the demo camera of a preview build shows their code (app-core
-                    // compares fingerprints).
+                    // demo: a preview build's demo camera shows their code.
                     crate::camera::demo_shows(codes::safety_code(&number));
                     dynamic(move || {
                         let r = result.get();

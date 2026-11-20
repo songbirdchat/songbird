@@ -24,6 +24,7 @@ impl Store {
     // mock: app-core `chats.mark_all_read()`, which also sends read
     // receipts where the user has them on.
     pub fn mark_all_read(&self) {
+        crate::backend::chat::mark_all_read(*self);
         self.chats.update(|cs| {
             for c in cs.iter_mut().filter(|c| !c.archived && !c.request) {
                 c.unread = 0;

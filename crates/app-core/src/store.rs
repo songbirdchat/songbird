@@ -52,7 +52,7 @@ impl std::fmt::Debug for StoredCallLink {
 }
 
 /// The schema version this code writes.
-pub const SCHEMA: i64 = 5;
+pub const SCHEMA: i64 = 6;
 
 /// Outgoing message status, as the UI shows it (`crates/content`'s levels, plus the local ones).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -143,6 +143,14 @@ pub struct MessageRow {
 type Grouped = Option<(([u8; 16], [u8; 16]), Vec<Session>)>;
 /// A kept franking proof: the stamp, the franking key, the content as received.
 pub type Frank = (Vec<u8>, Vec<u8>, Vec<u8>);
+/// A message in a chat: (chat, author, id).
+pub type ChatMessage = ([u8; 16], [u8; 16], [u8; 16]);
+/// A pinned message: (author, id, pinned until, ms).
+pub type PinRow = ([u8; 16], [u8; 16], u64);
+/// The vote that counts in a closed poll: (voter, counter).
+pub type VoteHead = ([u8; 16], u64);
+/// A poll vote: (voter, counter, options).
+pub type VoteRow = ([u8; 16], u64, Vec<u32>);
 /// An outbox entry: idempotency key, chat, message ID, content.
 pub type OutboxEntry = ([u8; 16], [u8; 16], [u8; 16], Vec<u8>);
 
@@ -287,7 +295,222 @@ impl Store {
             ))?;
             db(tx.commit())?;
         }
+        if v < 6 {
+            // Disappearing messages (a time each message goes), each chat's timer, pins and poll
+            // votes (PROTOCOL §5.4, §5.8, §5.9).
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "ALTER TABLE messages ADD COLUMN expires_ms INTEGER NOT NULL DEFAULT 0;
+                 CREATE INDEX messages_by_expiry ON messages (expires_ms) WHERE expires_ms > 0;
+                 CREATE TABLE chat_timers (chat BLOB PRIMARY KEY, timer_s INTEGER NOT NULL);
+                 CREATE TABLE pins (chat BLOB NOT NULL, author BLOB NOT NULL, id BLOB NOT NULL,
+                     until_ms INTEGER NOT NULL, PRIMARY KEY (chat, author, id));
+                 CREATE TABLE poll_votes (author BLOB NOT NULL, id BLOB NOT NULL, voter BLOB NOT NULL,
+                     counter INTEGER NOT NULL, options BLOB NOT NULL, PRIMARY KEY (author, id, voter));
+                 CREATE TABLE poll_closes (author BLOB NOT NULL, id BLOB NOT NULL, heads BLOB NOT NULL,
+                     PRIMARY KEY (author, id));
+                 PRAGMA user_version = 6;",
+            ))?;
+            db(tx.commit())?;
+        }
         Ok(())
+    }
+
+    /// A chat's disappearing timer in seconds (0: off).
+    pub fn timer(&self, chat: &[u8; 16]) -> Result<u32> {
+        let t: Option<i64> = db(self
+            .db
+            .query_row(
+                "SELECT timer_s FROM chat_timers WHERE chat = ?1",
+                [&chat[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(t.and_then(|t| u32::try_from(t).ok()).unwrap_or(0))
+    }
+
+    /// Sets a chat's disappearing timer.
+    pub fn set_timer(&self, chat: &[u8; 16], secs: u32) -> Result<()> {
+        db(self.db.execute(
+            "INSERT INTO chat_timers (chat, timer_s) VALUES (?1, ?2)
+             ON CONFLICT (chat) DO UPDATE SET timer_s = ?2",
+            params![&chat[..], i64::from(secs)],
+        ))
+        .map(|_| ())
+    }
+
+    /// Deletes every message whose time is up (with its files, reactions, votes and pins).
+    /// Answers them: (chat, author, id).
+    pub fn purge_expired(&mut self, now_ms: u64) -> Result<Vec<ChatMessage>> {
+        let gone: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = {
+            let mut st = db(self.db.prepare(
+                "SELECT chat, author, id FROM messages WHERE expires_ms > 0 AND expires_ms <= ?1",
+            ))?;
+            let rows =
+                db(st.query_map([sql_ms(now_ms)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))))?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(|_| Error::Storage)?
+        };
+        let tx = db(self.db.transaction())?;
+        let mut out = Vec::with_capacity(gone.len());
+        for (chat, author, id) in gone {
+            for table in ["files", "reactions", "poll_votes", "poll_closes", "franks"] {
+                db(tx.execute(
+                    &format!("DELETE FROM {table} WHERE author = ?1 AND id = ?2"),
+                    params![author, id],
+                ))?;
+            }
+            db(tx.execute(
+                "DELETE FROM pins WHERE author = ?1 AND id = ?2",
+                params![author, id],
+            ))?;
+            db(tx.execute(
+                "DELETE FROM messages WHERE author = ?1 AND id = ?2",
+                params![author, id],
+            ))?;
+            if let (Ok(c), Ok(a), Ok(i)) = (
+                <[u8; 16]>::try_from(chat.as_slice()),
+                <[u8; 16]>::try_from(author.as_slice()),
+                <[u8; 16]>::try_from(id.as_slice()),
+            ) {
+                out.push((c, a, i));
+            }
+        }
+        db(tx.commit())?;
+        Ok(out)
+    }
+
+    /// Pins a message in a chat until `until_ms`, or unpins it (`until_ms` 0).
+    pub fn set_pin(
+        &self,
+        chat: &[u8; 16],
+        author: &[u8; 16],
+        id: &[u8; 16],
+        until_ms: u64,
+    ) -> Result<()> {
+        if until_ms == 0 {
+            db(self.db.execute(
+                "DELETE FROM pins WHERE chat = ?1 AND author = ?2 AND id = ?3",
+                params![&chat[..], &author[..], &id[..]],
+            ))?;
+        } else {
+            db(self.db.execute(
+                "INSERT INTO pins (chat, author, id, until_ms) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (chat, author, id) DO UPDATE SET until_ms = ?4",
+                params![&chat[..], &author[..], &id[..], sql_ms(until_ms)],
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// A chat's pinned messages still pinned at `now_ms`: (author, id, until).
+    pub fn pins(&self, chat: &[u8; 16], now_ms: u64) -> Result<Vec<PinRow>> {
+        let mut st = db(self.db.prepare(
+            "SELECT author, id, until_ms FROM pins WHERE chat = ?1 AND until_ms > ?2 ORDER BY until_ms",
+        ))?;
+        let rows = db(st.query_map(params![&chat[..], sql_ms(now_ms)], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        }))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (a, i, u) = db(row)?;
+            if let (Ok(a), Ok(i)) = (<[u8; 16]>::try_from(a), <[u8; 16]>::try_from(i)) {
+                out.push((a, i, u64::try_from(u).unwrap_or(0)));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Records a vote if it is the voter's newest (higher counter). Answers whether it counted.
+    pub fn put_vote(
+        &self,
+        author: &[u8; 16],
+        id: &[u8; 16],
+        voter: &[u8; 16],
+        counter: u64,
+        options: &[u32],
+    ) -> Result<bool> {
+        let opts: Vec<u8> = options.iter().flat_map(|o| o.to_be_bytes()).collect();
+        let n = db(self.db.execute(
+            "INSERT INTO poll_votes (author, id, voter, counter, options) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (author, id, voter) DO UPDATE SET counter = ?4, options = ?5 WHERE counter < ?4",
+            params![&author[..], &id[..], &voter[..], sql_ms(counter), opts],
+        ))?;
+        Ok(n > 0)
+    }
+
+    /// A poll's votes: (voter, counter, options).
+    pub fn votes(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<Vec<VoteRow>> {
+        let mut st = db(self.db.prepare(
+            "SELECT voter, counter, options FROM poll_votes WHERE author = ?1 AND id = ?2",
+        ))?;
+        let rows = db(st.query_map(params![&author[..], &id[..]], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        }))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (v, c, o) = db(row)?;
+            if let Ok(v) = <[u8; 16]>::try_from(v) {
+                let opts = o
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_be_bytes(*b))
+                    .collect();
+                out.push((v, u64::try_from(c).unwrap_or(0), opts));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Closes a poll with the votes that count: (voter, counter) heads. Answers false if it was
+    /// already closed.
+    pub fn close_poll(
+        &self,
+        author: &[u8; 16],
+        id: &[u8; 16],
+        heads: &[([u8; 16], u64)],
+    ) -> Result<bool> {
+        let mut b = Vec::with_capacity(heads.len() * 24);
+        for (v, c) in heads {
+            b.extend_from_slice(v);
+            b.extend_from_slice(&c.to_be_bytes());
+        }
+        let n = db(self.db.execute(
+            "INSERT OR IGNORE INTO poll_closes (author, id, heads) VALUES (?1, ?2, ?3)",
+            params![&author[..], &id[..], b],
+        ))?;
+        Ok(n > 0)
+    }
+
+    /// A closed poll's heads (voter, counter); `None` while open.
+    pub fn poll_heads(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<Option<Vec<VoteHead>>> {
+        let b: Option<Vec<u8>> = db(self
+            .db
+            .query_row(
+                "SELECT heads FROM poll_closes WHERE author = ?1 AND id = ?2",
+                params![&author[..], &id[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(b.map(|b| {
+            b.as_chunks::<24>()
+                .0
+                .iter()
+                .filter_map(|c| {
+                    let (v, n) = c.split_first_chunk::<16>()?;
+                    Some((*v, u64::from_be_bytes(n.try_into().ok()?)))
+                })
+                .collect()
+        }))
     }
 
     /// Keeps a call link this device made.
@@ -679,6 +902,19 @@ impl Store {
             .transpose()
     }
 
+    /// Whether an account is marked verified.
+    pub fn is_verified(&self, account: &[u8; 16]) -> Result<bool> {
+        let v: Option<i64> = db(self
+            .db
+            .query_row(
+                "SELECT verified FROM accounts WHERE account = ?1",
+                [&account[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(v == Some(1))
+    }
+
     /// Marks an account verified (safety numbers compared) or not.
     pub fn set_verified(&self, account: &[u8; 16], verified: bool) -> Result<()> {
         db(self.db.execute(
@@ -786,10 +1022,26 @@ impl Store {
     /// whether it was new. Updates the chat's preview and, for incoming ones, its unread count.
     pub fn insert_message(&mut self, m: &MessageRow, incoming: bool) -> Result<bool> {
         let tx = db(self.db.transaction())?;
+        // A disappearing message goes `expire_timer_s` after it is stored here (PROTOCOL §5.9).
+        let timer =
+            <songbird_content::schema::Content as prost::Message>::decode(m.content.as_slice())
+                .ok()
+                .and_then(|c| match c.body {
+                    Some(songbird_content::schema::content::Body::Data(d)) => {
+                        Some(d.expire_timer_s)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(0);
+        let expires = if timer == 0 {
+            0
+        } else {
+            m.stored_ms.saturating_add(u64::from(timer) * 1000)
+        };
         let n = db(tx.execute(
-            "INSERT OR IGNORE INTO messages (chat, author, id, sent_ms, stored_ms, text, content, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![&m.chat[..], &m.author[..], &m.id[..], sql_ms(m.sent_ms), sql_ms(m.stored_ms), m.text, m.content, m.status.as_i64()],
+            "INSERT OR IGNORE INTO messages (chat, author, id, sent_ms, stored_ms, text, content, status, expires_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![&m.chat[..], &m.author[..], &m.id[..], sql_ms(m.sent_ms), sql_ms(m.stored_ms), m.text, m.content, m.status.as_i64(), sql_ms(expires)],
         ))?;
         if n == 1 {
             db(tx.execute(

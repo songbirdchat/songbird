@@ -127,6 +127,9 @@ pub fn install(focus_of: impl Fn() -> Option<u64> + 'static) {
         let n = s.total_unread();
         untracked(|| set_badge(n));
     });
+    // Mutes for 8 hours or a week lift on time.
+    s.end_mutes();
+    set_interval(std::time::Duration::from_secs(60), move || s.end_mutes());
     // Ask once, when the user has anything switched on.
     spawn(async move {
         use nsh_core::notifications::NotificationPermission as P;

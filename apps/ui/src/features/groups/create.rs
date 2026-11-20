@@ -379,7 +379,7 @@ fn details_page(base: usize, community: Option<ChatId>, picked: Signal<Vec<Conta
                                         (None, "Off"),
                                         (Some(Disappear::Day), "24 hours"),
                                         (Some(Disappear::Week), "7 days"),
-                                        (Some(Disappear::Quarter), "90 days"),
+                                        (Some(Disappear::FourWeeks), "4 weeks"),
                                     ],
                                     move || timer.get(),
                                     move |v| timer.set(v),

@@ -109,7 +109,7 @@ pub enum ChatKind {
 pub enum Disappear {
     Day,
     Week,
-    Quarter,
+    FourWeeks,
 }
 
 impl Disappear {
@@ -117,7 +117,7 @@ impl Disappear {
         match self {
             Disappear::Day => "24 hours",
             Disappear::Week => "7 days",
-            Disappear::Quarter => "90 days",
+            Disappear::FourWeeks => "4 weeks",
         }
     }
 }
@@ -177,6 +177,8 @@ pub struct Chat {
     pub community: Option<ChatId>,
     pub pinned: bool,
     pub muted: bool,
+    /// When a mute ends (unix ms); `u64::MAX` while muted always.
+    pub muted_until: u64,
     pub archived: bool,
     pub favourite: bool,
     pub locked: bool,
@@ -230,8 +232,11 @@ pub enum Body {
     Poll {
         question: String,
         options: Vec<(String, u32)>,
-        mine: Option<usize>,
+        /// The options the user chose.
+        mine: Vec<usize>,
         multiple: bool,
+        /// Its author closed it: the votes are final.
+        closed: bool,
     },
     Event {
         title: String,

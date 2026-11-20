@@ -199,6 +199,46 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0154 — Disappearing messages, polls, pins, safety numbers, mutes and GIFs in real chats
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision:
+  1. **One place for events** (`Messenger::apply_event`), used by 1:1 and group receive alike:
+     reactions, edits, deletes, poll votes and closes, pins and timer changes. Before this, a
+     group's reactions, edits and deletes were stored as empty messages. Sending an event to a
+     group goes through MLS (`send_event` picks the group path for a group ID).
+  2. **Disappearing messages** (§5.9): each chat's timer is kept (schema 6, `chat_timers`);
+     every message and event carries it; a message goes `expire_timer_s` after it is stored on
+     each device (with its files, reactions, votes, pins and franking proof). The app sweeps
+     every 15 seconds. The UI's "90 days" choice is now "4 weeks": the protocol's longest timer
+     (`MAX_TIMER_S`); a synced setting of "quarter" reads as 4 weeks.
+  3. **Polls** (§5.8): a vote counts only for an open poll, for options it has, one unless it
+     allows several; the highest counter wins; only the author closes it, and then only each
+     voter's vote at the listed counter counts. The UI holds several choices (`mine` is a list)
+     and offers "Close poll" to the author, "Final results" after.
+  4. **Pins**: for everyone in the chat, 7 days (the protocol offers 24 hours, 7 days or 30
+     days), only for a message of that chat.
+  5. **Safety numbers from real keys** (D-0136's construction over both accounts' identity
+     keys); "verified" kept in the store; a changed identity key, which used to block sending
+     for good, can now be accepted from the safety-number screen (unverified until compared
+     again).
+  6. **Mute for 8 hours, 1 week or always**, lifted on time (checked every minute); backups
+     keep when a mute ends.
+  7. **GIFs** through the privacy proxy (`/v1/gifs/*`), in a GIFs tab of the sticker sheet in
+     real chats; a GIF picked is fetched through the proxy and sent as an encrypted photo.
+  8. **Mark all as read** marks every real chat read in app-core (and sends read receipts when
+     they are on).
+- Evidence: `gate_a2::timers_pins_polls_and_group_events` (a poll voted, a bad vote refused,
+  closed and a later vote refused; a pin; a 5-second timer learnt by the other side and the
+  next message gone from both devices; a group reaction and a multiple-choice vote arriving as
+  events) and `gate_a2::safety_numbers_match_and_verification_is_kept` against the real stack
+  (14 gate tests pass); `apps/ui` 214 tests.
+- Consequences: built-in emoji stickers still cannot be sent to real chats (sticker packs from
+  links are the next item); a group's pins follow no admin rule yet (roles on received commits
+  and events wait for the device-to-account map).
+
 ## D-0153 — Call links on the device
 
 - Date: 2026-11-20

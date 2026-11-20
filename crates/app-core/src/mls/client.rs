@@ -561,7 +561,7 @@ impl<N: Net> Messenger<N> {
         self.send_group_data(gid, data, text).await
     }
 
-    async fn send_group_data(
+    pub(crate) async fn send_group_data(
         &mut self,
         gid: &[u8; 16],
         data: DataMessage,
@@ -829,6 +829,11 @@ impl<N: Net> Messenger<N> {
                 };
                 if data.group_id.as_slice() != gid.as_slice() {
                     return Ok(Received::Nothing);
+                }
+                if !matches!(data.kind, Some(data_message::Kind::GroupUpdate(_)))
+                    && let Some(r) = self.apply_event(&gid, account, data)?
+                {
+                    return Ok(r);
                 }
                 if let Some(data_message::Kind::GroupUpdate(u)) = &data.kind {
                     if !u.value.is_empty() {

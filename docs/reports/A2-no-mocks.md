@@ -35,25 +35,22 @@ Status: ☐ open · ☑ done (with the commit).
 - ☑ Location: self-hosted OpenStreetMap tiles, the map picker, real places sent and shown (D-0142)
 - ☑ 1:1 text chats through app-core: send, receive, ticks, read receipts, new chat by username (675bfff)
 
+- ☑ Disappearing messages, polls, pins, safety numbers from real keys (and accepting a changed key), mute durations, GIFs, mark all read; group reactions, edits and deletes (D-0154)
+
 ## Open, by what they need
 
 **a (app only, or an existing endpoint):**
-- GIF picker (`/v1/gifs/*`)
 - proxy for HTTP requests too
 - installed sticker packs in the picker
-- mute durations
 - backup frequency, include media and second destination
 - Google Drive, OneDrive and Dropbox stores (the crate has them; OAuth needs the owner's apps)
 - parental rules enforced on the child's app
 - lock chat unlocked with the app passcode
 
 **b (app-core):**
-- pins and polls in real chats
-- disappearing timers (`TimerChange`, `EXPIRES`)
-- mark all read
 - broadcast lists
 - presence and nudges to contacts
-- safety numbers from real keys; security notifications (KT)
+- security notifications (KT)
 - sticker packs from links (`/v1/packs`)
 - chat list state synced (records)
 - network usage counted

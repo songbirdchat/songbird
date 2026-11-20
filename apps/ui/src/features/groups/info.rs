@@ -732,7 +732,7 @@ fn add_sheet(s: Store, chat: ChatId, open: Signal<bool>) -> View {
         )
 }
 
-/// Off, 24 hours, 7 days, 90 days.
+/// Off, 24 hours, 7 days, 4 weeks.
 fn timer_sheet(s: Store, chat: ChatId, ch: Memo<Option<Chat>>, open: Signal<bool>) -> View {
     let allowed = move || ch.with(|c| c.as_ref().is_some_and(can_edit_info));
     let current = move || ch.with(|c| c.as_ref().and_then(|c| c.disappearing));
@@ -765,7 +765,7 @@ fn timer_sheet(s: Store, chat: ChatId, ch: Memo<Option<Chat>>, open: Signal<bool
             option(None, "Off"),
             option(Some(Disappear::Day), "24 hours"),
             option(Some(Disappear::Week), "7 days"),
-            option(Some(Disappear::Quarter), "90 days"),
+            option(Some(Disappear::FourWeeks), "4 weeks"),
         ]))
         .child(
             view().style_when(allowed, |st| st.hidden()).child(footnote(move || {

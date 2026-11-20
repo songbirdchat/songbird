@@ -191,6 +191,12 @@ pub fn install(s: Store) {
     provide_context(s);
 }
 
+/// Milliseconds since the epoch (the system clock).
+pub fn now_ms() -> u64 {
+    // After 1970 and within u64 milliseconds.
+    nsh_core::time::unix_ms().max(0.0) as u64
+}
+
 /// Whether this run shows the demo data: only a preview build started as a
 /// screenshot fixture (`SONGBIRD_ONBOARDED=1`, or the `songbird-onboarded`
 /// marker in the data folder). Every other run is a real account on the
@@ -347,7 +353,47 @@ impl Store {
         self.edit_chat(id, |c| c.pinned = !c.pinned);
     }
     pub fn toggle_mute(&self, id: ChatId) {
-        self.edit_chat(id, |c| c.muted = !c.muted);
+        let muted = self.chat(id).is_some_and(|c| c.muted);
+        if muted {
+            self.unmute(id);
+        } else {
+            self.mute(id, None);
+        }
+    }
+
+    /// Mutes a chat for `ms` (None: always).
+    pub fn mute(&self, id: ChatId, ms: Option<u64>) {
+        let until = ms.map_or(u64::MAX, |ms| now_ms().saturating_add(ms));
+        self.edit_chat(id, |c| {
+            c.muted = true;
+            c.muted_until = until;
+        });
+    }
+
+    pub fn unmute(&self, id: ChatId) {
+        self.edit_chat(id, |c| {
+            c.muted = false;
+            c.muted_until = 0;
+        });
+    }
+
+    /// Lifts the mutes whose time is up (called every minute).
+    pub fn end_mutes(&self) {
+        let now = now_ms();
+        let due = self.chats.with_untracked(|cs| {
+            cs.iter()
+                .any(|c| c.muted && c.muted_until != u64::MAX && c.muted_until <= now)
+        });
+        if due {
+            self.chats.update(|cs| {
+                for c in cs.iter_mut() {
+                    if c.muted && c.muted_until != u64::MAX && c.muted_until <= now {
+                        c.muted = false;
+                        c.muted_until = 0;
+                    }
+                }
+            });
+        }
     }
     pub fn toggle_archive(&self, id: ChatId) {
         self.edit_chat(id, |c| c.archived = !c.archived);
@@ -359,6 +405,10 @@ impl Store {
         self.edit_chat(id, |c| c.locked = !c.locked);
     }
     pub fn set_disappearing(&self, id: ChatId, timer: Option<Disappear>) {
+        if crate::backend::chat::owns(id) {
+            // For everyone in the chat; app-core keeps it and stamps new messages with it.
+            crate::backend::chat::set_timer(id, timer);
+        }
         self.edit_chat(id, |c| c.disappearing = timer);
         let label = match timer {
             Some(t) => format!(
@@ -409,6 +459,9 @@ impl Store {
         }
     }
     pub fn verify(&self, contact: ContactId, verified: bool) {
+        if crate::backend::chat::owns(contact) {
+            crate::backend::chat::set_verified(contact, verified);
+        }
         self.contacts.update(|cs| {
             if let Some(c) = cs.iter_mut().find(|c| c.id == contact) {
                 c.verified = verified;
@@ -663,19 +716,75 @@ impl Store {
     }
 
     pub fn toggle_pin_message(&self, chat: ChatId, id: MsgId) {
+        if crate::backend::chat::owns(chat) {
+            // Pinned for everyone in the chat; the message shows pinned once app-core has it.
+            let pinned = self
+                .messages
+                .with_untracked(|all| {
+                    all.get(&chat)
+                        .and_then(|v| v.iter().find(|m| m.id == id).map(|m| m.pinned))
+                })
+                .unwrap_or(false);
+            crate::backend::chat::pin(*self, chat, id, !pinned);
+            return;
+        }
         self.edit_message(chat, id, |m| m.pinned = !m.pinned);
     }
 
+    /// The options a press on `option` leaves chosen: one choice is replaced (or taken back);
+    /// with several allowed, it is added or taken back.
+    pub fn after_press(mine: &[usize], option: usize, multiple: bool) -> Vec<usize> {
+        if mine.contains(&option) {
+            mine.iter().copied().filter(|o| *o != option).collect()
+        } else if multiple {
+            let mut v = mine.to_vec();
+            v.push(option);
+            v.sort_unstable();
+            v
+        } else {
+            vec![option]
+        }
+    }
+
     pub fn vote(&self, chat: ChatId, id: MsgId, option: usize) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::vote(*self, chat, id, option);
+            return;
+        }
         self.edit_message(chat, id, |m| {
-            if let Body::Poll { options, mine, .. } = &mut m.body {
-                if let Some(old) = mine.take() {
-                    options[old].1 -= 1;
+            if let Body::Poll {
+                options,
+                mine,
+                multiple,
+                closed: false,
+                ..
+            } = &mut m.body
+            {
+                let next = Self::after_press(mine, option, *multiple);
+                for o in mine.iter() {
+                    if let Some(x) = options.get_mut(*o) {
+                        x.1 = x.1.saturating_sub(1);
+                    }
                 }
-                if *mine != Some(option) {
-                    options[option].1 += 1;
-                    *mine = Some(option);
+                for o in &next {
+                    if let Some(x) = options.get_mut(*o) {
+                        x.1 += 1;
+                    }
                 }
+                *mine = next;
+            }
+        });
+    }
+
+    /// Closes the user's own poll: the votes are final for everyone.
+    pub fn close_poll(&self, chat: ChatId, id: MsgId) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::close_poll(*self, chat, id);
+            return;
+        }
+        self.edit_message(chat, id, |m| {
+            if let Body::Poll { closed, .. } = &mut m.body {
+                *closed = true;
             }
         });
     }
@@ -937,6 +1046,15 @@ impl Default for Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn poll_presses_replace_add_and_take_back() {
+        assert_eq!(Store::after_press(&[], 1, false), vec![1]);
+        assert_eq!(Store::after_press(&[1], 2, false), vec![2]);
+        assert_eq!(Store::after_press(&[1], 1, false), Vec::<usize>::new());
+        assert_eq!(Store::after_press(&[2], 0, true), vec![0, 2]);
+        assert_eq!(Store::after_press(&[0, 2], 2, true), vec![0]);
+    }
 
     #[test]
     fn clock_and_days() {

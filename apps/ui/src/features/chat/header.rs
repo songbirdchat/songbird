@@ -371,22 +371,38 @@ fn more_menu(cv: Conv, nudge: bool) -> AnyElement {
             if muted() {
                 "Unmute notifications"
             } else {
-                "Mute notifications"
+                "Mute for 8 hours"
             },
             false,
             move || {
-                s.toggle_mute(chat);
-                toast(if muted() {
-                    "Notifications muted"
+                if muted() {
+                    s.unmute(chat);
+                    toast("Notifications on");
                 } else {
-                    "Notifications on"
-                });
+                    s.mute(chat, Some(8 * 3_600_000));
+                    toast("Muted for 8 hours");
+                }
             },
         ),
-        menu_entry(Icon::Timer, "Disappearing messages", false, move || {
-            cv.timer_open.set(true)
-        }),
     ]);
+    if !muted() {
+        items.extend([
+            menu_entry(Icon::BellOff, "Mute for 1 week", false, move || {
+                s.mute(chat, Some(7 * 24 * 3_600_000));
+                toast("Muted for 1 week");
+            }),
+            menu_entry(Icon::BellOff, "Mute always", false, move || {
+                s.mute(chat, None);
+                toast("Muted until you unmute");
+            }),
+        ]);
+    }
+    items.extend([menu_entry(
+        Icon::Timer,
+        "Disappearing messages",
+        false,
+        move || cv.timer_open.set(true),
+    )]);
     if nudge {
         items.push(menu_entry(Icon::Zap, "Send a nudge", false, move || {
             super::send_nudge(s, chat)

@@ -67,6 +67,7 @@ pub fn chat(id: ChatId, kind: ChatKind, title: &str) -> Chat {
         community: None,
         pinned: false,
         muted: false,
+        muted_until: 0,
         archived: false,
         favourite: false,
         locked: false,
@@ -391,8 +392,9 @@ pub fn seed() -> Seed {
                     ("Sushi".into(), 5),
                     ("Salad bar".into(), 1),
                 ],
-                mine: Some(1),
+                mine: vec![1],
                 multiple: false,
+                closed: false,
             },
         );
         t.add(
@@ -714,8 +716,9 @@ pub fn seed() -> Seed {
             Body::Poll {
                 question: "Leave at".into(),
                 options: vec![("7:00".into(), 2), ("8:30".into(), 4)],
-                mine: None,
+                mine: Vec::new(),
                 multiple: false,
+                closed: false,
             },
         );
         put(&mut chats, g, t);

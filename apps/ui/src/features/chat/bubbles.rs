@@ -1422,7 +1422,7 @@ fn poll_body(cv: Conv, item: ItemMemo) -> AnyElement {
                             label.clone(),
                             *votes,
                             *votes as f32 / total as f32,
-                            *mine == Some(n),
+                            mine.contains(&n),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1431,6 +1431,10 @@ fn poll_body(cv: Conv, item: ItemMemo) -> AnyElement {
         })
     });
     let total = computed(move || options.with(|o| o.iter().map(|o| o.2).sum::<u32>()));
+    let closed = sel(item, |i| {
+        matches!(i.m.body, Body::Poll { closed: true, .. })
+    });
+    let own = sel(item, |i| i.m.mine());
     view()
         .w(px(270.0))
         .px(px(PAD_X))
@@ -1467,7 +1471,9 @@ fn poll_body(cv: Conv, item: ItemMemo) -> AnyElement {
                 let chosen = move || o.with(|o| o.4);
                 pressable()
                     .on_press(move || {
-                        cv.s.vote(cv.chat, id.get_untracked(), o.with_untracked(|o| o.0))
+                        if !closed.get_untracked() {
+                            cv.s.vote(cv.chat, id.get_untracked(), o.with_untracked(|o| o.0));
+                        }
                     })
                     .selected(chosen)
                     .accessibility_label(super::say(move || {
@@ -1545,12 +1551,34 @@ fn poll_body(cv: Conv, item: ItemMemo) -> AnyElement {
             },
         ))
         .child(
-            text(move || match total.get() {
-                1 => "1 vote".to_string(),
-                n => format!("{n} votes"),
-            })
-            .text_size(px(font::CAPTION))
-            .text_color(move || c::bubble_meta()),
+            view()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(
+                    text(move || {
+                        let n = match total.get() {
+                            1 => "1 vote".to_string(),
+                            n => format!("{n} votes"),
+                        };
+                        if closed.get() {
+                            format!("{n} · Final results")
+                        } else {
+                            n
+                        }
+                    })
+                    .text_size(px(font::CAPTION))
+                    .text_color(move || c::bubble_meta()),
+                )
+                .child(when(
+                    move || own.get() && !closed.get(),
+                    move || {
+                        btn("Close poll", Variant::Ghost, BtnSize::Sm, move || {
+                            cv.s.close_poll(cv.chat, id.get_untracked());
+                        })
+                        .into_element()
+                    },
+                )),
         )
         .into_element()
 }

@@ -89,7 +89,7 @@ fn timer(t: Option<Disappear>) -> String {
         None => "off",
         Some(Disappear::Day) => "day",
         Some(Disappear::Week) => "week",
-        Some(Disappear::Quarter) => "quarter",
+        Some(Disappear::FourWeeks) => "four_weeks",
     }
     .into()
 }
@@ -99,7 +99,8 @@ fn p_timer(v: &str) -> Option<Option<Disappear>> {
         "off" => Some(None),
         "day" => Some(Some(Disappear::Day)),
         "week" => Some(Some(Disappear::Week)),
-        "quarter" => Some(Some(Disappear::Quarter)),
+        // "quarter" (90 days) was offered before the protocol's 4-week limit was honoured.
+        "four_weeks" | "quarter" => Some(Some(Disappear::FourWeeks)),
         _ => None,
     }
 }

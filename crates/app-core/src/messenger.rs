@@ -165,6 +165,21 @@ pub enum Received {
         /// Its title, when it changed.
         title: String,
     },
+    /// A chat's disappearing timer changed (`secs` 0: off), by `by`.
+    TimerChanged {
+        chat: [u8; 16],
+        by: [u8; 16],
+        secs: u32,
+    },
+    /// A message was pinned (until `until_ms`) or unpinned (`until_ms` 0) in a chat.
+    Pinned {
+        chat: [u8; 16],
+        author: [u8; 16],
+        id: [u8; 16],
+        until_ms: u64,
+    },
+    /// A poll's votes changed, or it was closed: read its tally again ([`Messenger::poll_tally`]).
+    PollChanged { author: [u8; 16], id: [u8; 16] },
     /// A system notice was handled (prekeys refilled, the device list refreshed).
     System,
     /// Nothing to show (a duplicate, a dropped or unreadable envelope).
@@ -524,6 +539,66 @@ impl<N: Net> Messenger<N> {
         Ok(())
     }
 
+    /// An account's identity key as the server has it now (checked to be a valid key).
+    async fn fetch_account_key(&mut self, account: &[u8; 16]) -> Result<[u8; 32]> {
+        let body = serde_json::json!({ "account": hex(account) })
+            .to_string()
+            .into_bytes();
+        let (status, b) = self.net.api("POST", "/v1/devices/identity", body).await?;
+        if status != 200 {
+            return Err(Error::Server(status));
+        }
+        let v = json(&b)?;
+        let k: [u8; 32] = unhex(
+            v.get("identity_key")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+        )?;
+        if !songbird_keys::ed25519_public_key_ok(&k) {
+            return Err(Error::Verify);
+        }
+        Ok(k)
+    }
+
+    /// The safety number with `account` (PROTOCOL §4.9, D-0136) and whether the user marked
+    /// it verified. Their key is fetched and pinned on first sight.
+    pub async fn safety(
+        &mut self,
+        account: &[u8; 16],
+    ) -> Result<(crate::crypto::safety::SafetyNumber, bool)> {
+        let me = self.local.account;
+        let ours = self.store.account_key(&me)?.ok_or(Error::NoSession)?;
+        if self.store.account_key(account)?.is_none() {
+            self.devices_of(account, false).await?;
+        }
+        let theirs = self.store.account_key(account)?.ok_or(Error::NoSession)?;
+        let number = crate::crypto::safety::safety_number((&me, &ours), (account, &theirs));
+        Ok((number, self.store.is_verified(account)?))
+    }
+
+    /// Marks `account` verified (safety numbers compared) or not.
+    pub fn set_verified(&self, account: &[u8; 16], verified: bool) -> Result<()> {
+        self.store.set_verified(account, verified)
+    }
+
+    /// Accepts `account`'s new identity key after it changed (they reinstalled, or someone sits
+    /// in between: the user decides, having seen the new safety number). Unverifies them and
+    /// fetches the device list the new key signed.
+    pub async fn accept_identity_change(&mut self, account: &[u8; 16]) -> Result<()> {
+        let key = self.fetch_account_key(account).await?;
+        self.store.accept_identity(account, &key)?;
+        self.devices_of(account, true).await.map(|_| ())
+    }
+
+    /// Whether `account`'s identity key on the server differs from the one pinned here.
+    pub async fn identity_changed(&mut self, account: &[u8; 16]) -> Result<bool> {
+        let Some(pinned) = self.store.account_key(account)? else {
+            return Ok(false);
+        };
+        let now = self.fetch_account_key(account).await?;
+        Ok(!crate::crypto::ct_eq(&pinned, &now))
+    }
+
     /// An account's devices from its verified list (fetched when `force` or unknown).
     pub async fn devices_of(
         &mut self,
@@ -542,20 +617,8 @@ impl<N: Net> Messenger<N> {
         let identity = if let Some(k) = self.store.account_key(account)? {
             k
         } else {
-            let (status, b) = self
-                .net
-                .api("POST", "/v1/devices/identity", body.clone())
-                .await?;
-            if status != 200 {
-                return Err(Error::Server(status));
-            }
-            let v = json(&b)?;
-            let k: [u8; 32] = unhex(
-                v.get("identity_key")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
-            )?;
-            if !songbird_keys::ed25519_public_key_ok(&k) || !self.store.pin_account(account, &k)? {
+            let k = self.fetch_account_key(account).await?;
+            if !self.store.pin_account(account, &k)? {
                 return Err(Error::IdentityChanged);
             }
             k
@@ -706,6 +769,14 @@ impl<N: Net> Messenger<N> {
     /// Sends an event about an earlier message (a reaction, an edit, a delete): franked like any
     /// visible message, kept in the outbox until accepted, but not a message of its own.
     async fn send_event(&mut self, to: &[u8; 16], kind: data_message::Kind) -> Result<()> {
+        if self.is_group(to) {
+            let data = DataMessage {
+                group_id: to.to_vec(),
+                expire_timer_s: self.store.timer(to)?,
+                kind: Some(kind),
+            };
+            return self.send_group_data(to, data, "").await.map(|_| ());
+        }
         let id = *random::<16>()?;
         let sent_at = now_ms();
         let content = Content {
@@ -714,6 +785,7 @@ impl<N: Net> Messenger<N> {
             message_id: id.to_vec(),
             sent_at_ms: sent_at,
             body: Some(Body::Data(DataMessage {
+                expire_timer_s: self.store.timer(to)?,
                 kind: Some(kind),
                 ..Default::default()
             })),
@@ -911,9 +983,12 @@ impl<N: Net> Messenger<N> {
     pub async fn send_data(
         &mut self,
         to: &[u8; 16],
-        data: DataMessage,
+        mut data: DataMessage,
         preview: &str,
     ) -> Result<[u8; 16]> {
+        if matches!(data.kind, Some(data_message::Kind::Message(_))) {
+            data.expire_timer_s = self.store.timer(to)?;
+        }
         let id = *random::<16>()?;
         let sent_at = now_ms();
         let content = Content {
@@ -1118,6 +1193,390 @@ impl<N: Net> Messenger<N> {
         }
     }
 
+    /// Whether `id` is one of this device's groups (else a 1:1 chat's account).
+    pub fn is_group(&self, id: &[u8; 16]) -> bool {
+        self.load_group(id).is_ok()
+    }
+
+    /// Applies a received event (`data` in `chat`, from `account`): reactions, edits, deletes,
+    /// votes, closes, pins and timer changes. `None` for a visible message (the caller stores
+    /// it); `Some(Received::Nothing)` for an event refused (wrong author, unknown target).
+    pub(crate) fn apply_event(
+        &mut self,
+        chat: &[u8; 16],
+        account: &[u8; 16],
+        data: &DataMessage,
+    ) -> Result<Option<Received>> {
+        let target = |t: Option<&schema::MessageRef>| {
+            t.and_then(|t| {
+                Some((
+                    <[u8; 16]>::try_from(t.author.as_slice()).ok()?,
+                    <[u8; 16]>::try_from(t.message_id.as_slice()).ok()?,
+                ))
+            })
+        };
+        let nothing = Ok(Some(Received::Nothing));
+        match &data.kind {
+            Some(data_message::Kind::Reaction(r)) => {
+                let Some((author, id)) = target(r.target.as_ref()) else {
+                    return nothing;
+                };
+                let emoji = if r.remove {
+                    String::new()
+                } else {
+                    r.emoji.clone()
+                };
+                if self.store.react(&author, &id, account, &emoji, r.counter)? {
+                    return Ok(Some(Received::Reaction {
+                        author,
+                        id,
+                        reactor: *account,
+                        emoji,
+                    }));
+                }
+                nothing
+            }
+            Some(data_message::Kind::Edit(e)) => {
+                // Only the author edits, and only an existing message.
+                let Ok(id) = <[u8; 16]>::try_from(e.target_message_id.as_slice()) else {
+                    return nothing;
+                };
+                let text = e.text.as_ref().map(|t| t.body.clone()).unwrap_or_default();
+                if self.store.message(account, &id)?.is_some() {
+                    self.store.set_text(account, &id, &text)?;
+                    return Ok(Some(Received::Edited {
+                        author: *account,
+                        id,
+                        text,
+                    }));
+                }
+                nothing
+            }
+            Some(data_message::Kind::Delete(d)) => {
+                let Some((author, id)) = target(d.target.as_ref()) else {
+                    return nothing;
+                };
+                if author != *account || self.store.message(&author, &id)?.is_none() {
+                    return nothing;
+                }
+                self.store.mark_deleted(&author, &id)?;
+                Ok(Some(Received::Deleted { author, id }))
+            }
+            Some(data_message::Kind::TimerChange(t)) => {
+                self.store.set_timer(chat, t.expire_timer_s)?;
+                Ok(Some(Received::TimerChanged {
+                    chat: *chat,
+                    by: *account,
+                    secs: t.expire_timer_s,
+                }))
+            }
+            Some(data_message::Kind::Pin(p)) => {
+                let Some((author, id)) = target(p.target.as_ref()) else {
+                    return nothing;
+                };
+                // Only a message of this chat is pinned here.
+                if self
+                    .store
+                    .message(&author, &id)?
+                    .is_none_or(|m| m.chat != *chat)
+                {
+                    return nothing;
+                }
+                let until = if p.unpin {
+                    0
+                } else {
+                    now_ms().saturating_add(u64::from(p.duration_s) * 1000)
+                };
+                self.store.set_pin(chat, &author, &id, until)?;
+                Ok(Some(Received::Pinned {
+                    chat: *chat,
+                    author,
+                    id,
+                    until_ms: until,
+                }))
+            }
+            Some(data_message::Kind::PollVote(_) | data_message::Kind::PollClose(_)) => {
+                self.apply_poll(account, data)
+            }
+            Some(data_message::Kind::Message(_)) | None => Ok(None),
+            // Kinds with no behaviour on this device yet are not shown as messages.
+            Some(_) => nothing,
+        }
+    }
+
+    /// A vote or a poll's closing (see [`Self::apply_event`]).
+    fn apply_poll(&mut self, account: &[u8; 16], data: &DataMessage) -> Result<Option<Received>> {
+        let target = |t: Option<&schema::MessageRef>| {
+            t.and_then(|t| {
+                Some((
+                    <[u8; 16]>::try_from(t.author.as_slice()).ok()?,
+                    <[u8; 16]>::try_from(t.message_id.as_slice()).ok()?,
+                ))
+            })
+        };
+        let nothing = Ok(Some(Received::Nothing));
+        match &data.kind {
+            Some(data_message::Kind::PollVote(v)) => {
+                let Some((author, id)) = target(v.poll.as_ref()) else {
+                    return nothing;
+                };
+                let Some(poll) = self.poll_of(&author, &id)? else {
+                    return nothing;
+                };
+                // A vote counts only for a poll still open, with options it has, at most one
+                // unless it allows several (an empty vote retracts).
+                let n = u32::try_from(poll.options.len()).unwrap_or(0);
+                let mut seen = std::collections::HashSet::new();
+                let valid = v.options.iter().all(|o| *o < n && seen.insert(*o))
+                    && (poll.multiple_choice || v.options.len() <= 1);
+                if !valid || self.store.poll_heads(&author, &id)?.is_some() {
+                    return nothing;
+                }
+                if self
+                    .store
+                    .put_vote(&author, &id, account, v.counter, &v.options)?
+                {
+                    return Ok(Some(Received::PollChanged { author, id }));
+                }
+                nothing
+            }
+            Some(data_message::Kind::PollClose(c)) => {
+                let Some((author, id)) = target(c.poll.as_ref()) else {
+                    return nothing;
+                };
+                // Only the poll's author closes it.
+                if author != *account || self.poll_of(&author, &id)?.is_none() {
+                    return nothing;
+                }
+                let heads: Vec<([u8; 16], u64)> = c
+                    .heads
+                    .iter()
+                    .filter_map(|h| {
+                        Some((<[u8; 16]>::try_from(h.voter.as_slice()).ok()?, h.counter))
+                    })
+                    .collect();
+                if self.store.close_poll(&author, &id, &heads)? {
+                    return Ok(Some(Received::PollChanged { author, id }));
+                }
+                nothing
+            }
+            _ => nothing,
+        }
+    }
+
+    /// The `PollCreate` of a stored message.
+    fn poll_of(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<Option<schema::PollCreate>> {
+        let Some(row) = self.store.message(author, id)? else {
+            return Ok(None);
+        };
+        let Ok(content) = Content::decode(row.content.as_slice()) else {
+            return Ok(None);
+        };
+        Ok(match content.body {
+            Some(Body::Data(DataMessage {
+                kind: Some(data_message::Kind::Message(m)),
+                ..
+            })) => m.poll,
+            _ => None,
+        })
+    }
+
+    /// A poll's tally: votes per option, the options this account chose, whether it is closed.
+    /// A closed poll counts only each voter's vote with exactly the counter it was closed with.
+    pub fn poll_tally(
+        &self,
+        author: &[u8; 16],
+        id: &[u8; 16],
+    ) -> Result<(Vec<u32>, Vec<u32>, bool)> {
+        let n = self.poll_of(author, id)?.map_or(0, |p| p.options.len());
+        let heads = self.store.poll_heads(author, id)?;
+        let mut counts = vec![0u32; n];
+        let mut mine = Vec::new();
+        for (voter, counter, options) in self.store.votes(author, id)? {
+            if let Some(h) = &heads
+                && !h.iter().any(|(v, c)| *v == voter && *c == counter)
+            {
+                continue;
+            }
+            for o in &options {
+                if let Some(c) = usize::try_from(*o).ok().and_then(|o| counts.get_mut(o)) {
+                    *c += 1;
+                }
+            }
+            if voter == self.local.account {
+                mine = options;
+            }
+        }
+        Ok((counts, mine, heads.is_some()))
+    }
+
+    /// Sends a visible message to a chat (1:1 or group).
+    pub async fn send_message(
+        &mut self,
+        chat: &[u8; 16],
+        message: schema::Message,
+        preview: &str,
+    ) -> Result<[u8; 16]> {
+        let data = DataMessage {
+            kind: Some(data_message::Kind::Message(message)),
+            ..Default::default()
+        };
+        if self.is_group(chat) {
+            let data = DataMessage {
+                group_id: chat.to_vec(),
+                expire_timer_s: self.store.timer(chat)?,
+                ..data
+            };
+            return self.send_group_data(chat, data, preview).await;
+        }
+        self.send_data(chat, data, preview).await
+    }
+
+    /// Sends a poll (2 to 12 options).
+    pub async fn send_poll(
+        &mut self,
+        chat: &[u8; 16],
+        question: &str,
+        options: &[String],
+        multiple: bool,
+    ) -> Result<[u8; 16]> {
+        let message = schema::Message {
+            poll: Some(schema::PollCreate {
+                question: question.to_owned(),
+                options: options.to_vec(),
+                multiple_choice: multiple,
+            }),
+            ..Default::default()
+        };
+        songbird_content::validate::content(&Content {
+            version: songbird_content::VERSION,
+            required_version: 1,
+            message_id: vec![0; 16],
+            sent_at_ms: 1,
+            body: Some(Body::Data(DataMessage {
+                kind: Some(data_message::Kind::Message(message.clone())),
+                ..Default::default()
+            })),
+        })
+        .map_err(|_| Error::Malformed)?;
+        self.send_message(chat, message, &format!("Poll: {question}"))
+            .await
+    }
+
+    /// Applies one of this account's own events here first (as anyone else will), then sends it.
+    async fn own_event(&mut self, chat: &[u8; 16], kind: data_message::Kind) -> Result<()> {
+        let me = self.local.account;
+        let data = DataMessage {
+            kind: Some(kind),
+            ..Default::default()
+        };
+        if matches!(
+            self.apply_event(chat, &me, &data)?,
+            None | Some(Received::Nothing)
+        ) {
+            return Err(Error::Malformed);
+        }
+        let Some(kind) = data.kind else {
+            return Err(Error::Malformed);
+        };
+        self.send_event(chat, kind).await
+    }
+
+    /// Votes in a poll (replacing this account's earlier vote; no options retracts it).
+    pub async fn vote(
+        &mut self,
+        chat: &[u8; 16],
+        author: &[u8; 16],
+        id: &[u8; 16],
+        options: &[u32],
+    ) -> Result<()> {
+        let counter = self.next_counter("vote_counter")?;
+        let kind = data_message::Kind::PollVote(schema::PollVote {
+            poll: Some(schema::MessageRef {
+                author: author.to_vec(),
+                message_id: id.to_vec(),
+            }),
+            options: options.to_vec(),
+            counter,
+        });
+        self.own_event(chat, kind).await
+    }
+
+    /// Closes this account's own poll: only the votes counted now count, for everyone.
+    pub async fn close_poll(&mut self, chat: &[u8; 16], id: &[u8; 16]) -> Result<()> {
+        let me = self.local.account;
+        let heads: Vec<schema::VoteHead> = self
+            .store
+            .votes(&me, id)?
+            .into_iter()
+            .map(|(voter, counter, _)| schema::VoteHead {
+                voter: voter.to_vec(),
+                counter,
+            })
+            .collect();
+        let kind = data_message::Kind::PollClose(schema::PollClose {
+            poll: Some(schema::MessageRef {
+                author: me.to_vec(),
+                message_id: id.to_vec(),
+            }),
+            heads,
+        });
+        self.own_event(chat, kind).await
+    }
+
+    /// Pins a message for `duration_s` (24 hours, 7 days or 30 days), or unpins it.
+    pub async fn pin(
+        &mut self,
+        chat: &[u8; 16],
+        author: &[u8; 16],
+        id: &[u8; 16],
+        duration_s: u32,
+        unpin: bool,
+    ) -> Result<()> {
+        let kind = data_message::Kind::Pin(schema::Pin {
+            target: Some(schema::MessageRef {
+                author: author.to_vec(),
+                message_id: id.to_vec(),
+            }),
+            unpin,
+            duration_s: if unpin { 0 } else { duration_s },
+        });
+        self.own_event(chat, kind).await
+    }
+
+    /// Sets a chat's disappearing timer (0: off) for everyone in it.
+    pub async fn set_timer(&mut self, chat: &[u8; 16], secs: u32) -> Result<()> {
+        if secs != 0
+            && !(songbird_content::validate::MIN_TIMER_S..=songbird_content::validate::MAX_TIMER_S)
+                .contains(&secs)
+        {
+            return Err(Error::Malformed);
+        }
+        self.store.set_timer(chat, secs)?;
+        self.send_event(
+            chat,
+            data_message::Kind::TimerChange(schema::TimerChange {
+                expire_timer_s: secs,
+            }),
+        )
+        .await
+    }
+
+    /// A chat's disappearing timer (0: off).
+    pub fn timer(&self, chat: &[u8; 16]) -> Result<u32> {
+        self.store.timer(chat)
+    }
+
+    /// Deletes every message whose time is up; answers them (chat, author, id).
+    pub fn expire_messages(&mut self) -> Result<Vec<crate::store::ChatMessage>> {
+        self.store.purge_expired(now_ms())
+    }
+
+    /// A chat's pinned messages now: (author, id, until).
+    pub fn pins(&self, chat: &[u8; 16]) -> Result<Vec<crate::store::PinRow>> {
+        self.store.pins(chat, now_ms())
+    }
+
     /// Sends receipts for `ids` (messages by `author`) at `kind`.
     pub async fn send_receipt(
         &mut self,
@@ -1215,68 +1674,8 @@ impl<N: Net> Messenger<N> {
                 if account != self.local.account && !franked_ok {
                     return Ok(Received::Nothing);
                 }
-                match &data.kind {
-                    Some(data_message::Kind::Reaction(r)) => {
-                        let Some((author, id)) = r.target.as_ref().and_then(|t| {
-                            Some((
-                                <[u8; 16]>::try_from(t.author.as_slice()).ok()?,
-                                <[u8; 16]>::try_from(t.message_id.as_slice()).ok()?,
-                            ))
-                        }) else {
-                            return Ok(Received::Nothing);
-                        };
-                        let emoji = if r.remove {
-                            String::new()
-                        } else {
-                            r.emoji.clone()
-                        };
-                        if self
-                            .store
-                            .react(&author, &id, &account, &emoji, r.counter)?
-                        {
-                            return Ok(Received::Reaction {
-                                author,
-                                id,
-                                reactor: account,
-                                emoji,
-                            });
-                        }
-                        return Ok(Received::Nothing);
-                    }
-                    Some(data_message::Kind::Edit(e)) => {
-                        // Only the author edits, and only an existing message.
-                        let Ok(id) = <[u8; 16]>::try_from(e.target_message_id.as_slice()) else {
-                            return Ok(Received::Nothing);
-                        };
-                        let text = e.text.as_ref().map(|t| t.body.clone()).unwrap_or_default();
-                        if self.store.message(&account, &id)?.is_some() {
-                            self.store.set_text(&account, &id, &text)?;
-                            return Ok(Received::Edited {
-                                author: account,
-                                id,
-                                text,
-                            });
-                        }
-                        return Ok(Received::Nothing);
-                    }
-                    Some(data_message::Kind::Delete(d)) => {
-                        let Some(id) = d.target.as_ref().and_then(|t| {
-                            (t.author.as_slice() == account.as_slice())
-                                .then(|| <[u8; 16]>::try_from(t.message_id.as_slice()).ok())
-                                .flatten()
-                        }) else {
-                            return Ok(Received::Nothing);
-                        };
-                        if self.store.message(&account, &id)?.is_some() {
-                            self.store.mark_deleted(&account, &id)?;
-                            return Ok(Received::Deleted {
-                                author: account,
-                                id,
-                            });
-                        }
-                        return Ok(Received::Nothing);
-                    }
-                    _ => {}
+                if let Some(r) = self.apply_event(&account, &account, data)? {
+                    return Ok(r);
                 }
                 let row = data_row(&content, data, account, account, Status::Delivered)?;
                 if !self.store.insert_message(&row, true)? {
@@ -1436,6 +1835,19 @@ pub fn attachments_of(content: &[u8]) -> Vec<schema::AttachmentPointer> {
             ..
         })) => m.attachments,
         _ => Vec::new(),
+    }
+}
+
+/// The poll an encoded `Content` holds, if any.
+#[must_use]
+pub fn poll_in(content: &[u8]) -> Option<schema::PollCreate> {
+    let c = Content::decode(content).ok()?;
+    match c.body? {
+        Body::Data(DataMessage {
+            kind: Some(data_message::Kind::Message(m)),
+            ..
+        }) => m.poll,
+        _ => None,
     }
 }
 

@@ -120,6 +120,8 @@ pub fn ui_id(bytes: &[u8; 16]) -> u64 {
 }
 
 thread_local! {
+    /// Whether the disappearing-message sweep runs.
+    static SWEEPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Real groups by UI chat ID (D-0146).
     static GROUPS: RefCell<HashMap<ChatId, [u8; 16]>> = RefCell::new(HashMap::new());
 }
@@ -668,6 +670,13 @@ pub async fn start() -> Result<(), super::Problem> {
         show_all(s, &m);
     }
     super::calls::show_links(&m);
+    // Disappearing messages go on time, even with the app left open.
+    if !SWEEPING.replace(true) {
+        sweep_expired();
+        Owner::detached().run(|| {
+            set_interval(std::time::Duration::from_secs(15), sweep_expired);
+        });
+    }
     let keyed: Vec<([u8; 16], [u8; 32])> = m
         .store
         .chats()
@@ -1006,6 +1015,15 @@ fn body_of(row: &MessageRow) -> Body {
             }
         };
     }
+    if let Some(p) = poll_in(&row.content) {
+        return Body::Poll {
+            question: p.question,
+            options: p.options.into_iter().map(|o| (o, 0)).collect(),
+            mine: Vec::new(),
+            multiple: p.multiple_choice,
+            closed: false,
+        };
+    }
     if let Some((lat, lon, name)) = songbird_app_core::messenger::location_of(&row.content) {
         let label = if name.is_empty() {
             format!("{lat:.5}, {lon:.5}")
@@ -1041,8 +1059,20 @@ fn show_all(s: Store, m: &Core) {
                     apply_reaction(s, msg, by, &emoji);
                 }
             }
+            if poll_in(&row.content).is_some() {
+                show_tally(s, m, &row.author, &row.id);
+            }
         }
-        s.edit_chat(chat, |x| x.unread = c.unread);
+        for (author, id, _) in m.pins(&c.id).unwrap_or_default() {
+            if let Some(msg) = ui_of(&author, &id) {
+                edit_shown(s, msg, |x| x.pinned = true);
+            }
+        }
+        let timer = timer_choice(m.timer(&c.id).unwrap_or(0));
+        s.edit_chat(chat, |x| {
+            x.unread = c.unread;
+            x.disappearing = timer;
+        });
     }
 }
 
@@ -1061,6 +1091,9 @@ pub async fn receive(envelope: &[u8]) -> bool {
             let key = m.store.profile_key(&row.chat).ok().flatten();
             if let Some(s) = crate::store::try_store() {
                 show(s, &me, &row, row.author != me);
+                if poll_in(&row.content).is_some() {
+                    show_tally(s, m, &row.author, &row.id);
+                }
             }
             drop(guard);
             if let (true, Some(key)) = (fresh, key) {
@@ -1158,6 +1191,44 @@ pub async fn receive(envelope: &[u8]) -> bool {
             }
             true
         }
+        Ok(Received::TimerChanged { chat, by, secs }) => {
+            if let Some(s) = crate::store::try_store() {
+                let ui_chat = chat_ui(&chat);
+                let t = timer_choice(secs);
+                s.edit_chat(ui_chat, |c| c.disappearing = t);
+                let who = if by == me {
+                    "You".to_string()
+                } else {
+                    s.contact_name(Some(ui_id(&by)))
+                };
+                let line = match t {
+                    Some(t) => format!(
+                        "{who} turned on disappearing messages. New messages will disappear after {}.",
+                        t.label()
+                    ),
+                    None => format!("{who} turned off disappearing messages."),
+                };
+                s.push_message(ui_chat, None, Body::System(line));
+            }
+            true
+        }
+        Ok(Received::Pinned {
+            author,
+            id,
+            until_ms,
+            ..
+        }) => {
+            if let (Some(s), Some(msg)) = (crate::store::try_store(), ui_of(&author, &id)) {
+                edit_shown(s, msg, |x| x.pinned = until_ms > 0);
+            }
+            true
+        }
+        Ok(Received::PollChanged { author, id }) => {
+            if let Some(s) = crate::store::try_store() {
+                show_tally(s, m, &author, &id);
+            }
+            true
+        }
         Ok(Received::Call {
             account,
             group,
@@ -1192,6 +1263,48 @@ fn set_status(s: Store, core_id: &[u8; 16], status: Status) {
 /// Sends what the user wrote in a real chat (`ui_id` is the message the UI
 /// already shows as Sending).
 pub fn send(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
+    if let Body::Poll {
+        question,
+        options,
+        multiple,
+        ..
+    } = body
+    {
+        let Some(target) = core_chat(chat) else {
+            return;
+        };
+        let (question, multiple) = (question.clone(), *multiple);
+        let options: Vec<String> = options.iter().map(|o| o.0.clone()).collect();
+        super::run(async move {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let m = guard
+                .as_mut()
+                .ok_or_else(|| super::problem("Not connected yet."))?;
+            let me = m.local().account;
+            match m.send_poll(&target, &question, &options, multiple).await {
+                Ok(id) => {
+                    let status = m
+                        .store
+                        .message(&me, &id)
+                        .ok()
+                        .flatten()
+                        .map_or(Status::Sent, |r| r.status);
+                    drop(guard);
+                    OUTGOING.with_borrow_mut(|o| o.insert(ui_msg, id));
+                    IDS.with_borrow_mut(|x| x.insert(ui_msg, (me, id)));
+                    set_status(s, &id, status);
+                    Ok(())
+                }
+                Err(_) => {
+                    drop(guard);
+                    s.fail(chat, ui_msg);
+                    Err(super::problem("The poll couldn't be sent."))
+                }
+            }
+        });
+        return;
+    }
     if let Some(gid) = group_of(chat) {
         let text = match body {
             Body::Text(t) => t.clone(),
@@ -1299,7 +1412,8 @@ pub fn send(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
                 s.fail(chat, ui_msg);
                 Err(super::problem(match e {
                     songbird_app_core::Error::IdentityChanged => {
-                        "This person's safety number changed. Check it before sending."
+                        s.set_key_changed(chat, true);
+                        "This person's safety number changed. Open it from their profile to continue."
                     }
                     songbird_app_core::Error::Network => {
                         "Can't reach the server. The message will be sent when you're back online."
@@ -1522,16 +1636,300 @@ fn apply_reaction(s: Store, msg: MsgId, by: Option<ContactId>, emoji: &str) {
 }
 
 fn edit_shown(s: Store, msg: MsgId, f: impl Fn(&mut crate::store::Message)) {
-    let chats: Vec<ChatId> = ACCOUNTS.with_borrow(|a| a.keys().copied().collect());
-    for chat in chats {
-        s.messages.update(|all| {
-            if let Some(m) = all
-                .get_mut(&chat)
-                .and_then(|v| v.iter_mut().find(|x| x.id == msg))
-            {
+    s.messages.update(|all| {
+        for v in all.values_mut() {
+            if let Some(m) = v.iter_mut().find(|x| x.id == msg) {
                 f(m);
+                return;
             }
-        });
+        }
+    });
+}
+
+/// The UI chat of a real chat ID (an account or a group).
+fn chat_ui(id: &[u8; 16]) -> ChatId {
+    ui_id(id)
+}
+
+/// The app-core chat ID of a real UI chat: its group, else its account.
+fn core_chat(chat: ChatId) -> Option<[u8; 16]> {
+    group_of(chat).or_else(|| account_of(chat))
+}
+
+/// The poll a message holds, if any.
+fn poll_in(content: &[u8]) -> Option<songbird_content::schema::PollCreate> {
+    songbird_app_core::messenger::poll_in(content)
+}
+
+/// Shows a poll's tally as app-core counts it.
+fn show_tally(s: Store, m: &Core, author: &[u8; 16], id: &[u8; 16]) {
+    let Some(msg) = ui_of(author, id) else { return };
+    let Ok((counts, mine, closed)) = m.poll_tally(author, id) else {
+        return;
+    };
+    edit_shown(s, msg, |x| {
+        if let Body::Poll {
+            options,
+            mine: shown,
+            closed: c,
+            ..
+        } = &mut x.body
+        {
+            for (o, n) in options.iter_mut().zip(&counts) {
+                o.1 = *n;
+            }
+            *shown = mine
+                .iter()
+                .filter_map(|o| usize::try_from(*o).ok())
+                .collect();
+            *c = closed;
+        }
+    });
+}
+
+/// Votes in a real chat's poll (pressing an option again takes it back).
+pub fn vote(s: Store, chat: ChatId, msg: MsgId, option: usize) {
+    let (Some(target), Some((author, id))) =
+        (core_chat(chat), IDS.with_borrow(|x| x.get(&msg).copied()))
+    else {
+        return;
+    };
+    let (mine, multiple) = s
+        .message(chat, msg)
+        .and_then(|m| match m.body {
+            Body::Poll { mine, multiple, .. } => Some((mine, multiple)),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let next: Vec<u32> = Store::after_press(&mine, option, multiple)
+        .into_iter()
+        .filter_map(|o| u32::try_from(o).ok())
+        .collect();
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        let r = m.vote(&target, &author, &id, &next).await;
+        show_tally(s, m, &author, &id);
+        r.map_err(|_| super::problem("Your vote couldn't be sent. The poll may be closed."))
+    });
+}
+
+/// Closes the user's own poll in a real chat.
+pub fn close_poll(s: Store, chat: ChatId, msg: MsgId) {
+    let (Some(target), Some((author, id))) =
+        (core_chat(chat), IDS.with_borrow(|x| x.get(&msg).copied()))
+    else {
+        return;
+    };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        let r = m.close_poll(&target, &id).await;
+        show_tally(s, m, &author, &id);
+        r.map_err(|_| super::problem("The poll couldn't be closed."))
+    });
+}
+
+/// How long a pin lasts: 7 days (the protocol offers 24 hours, 7 days or 30 days).
+const PIN_SECS: u32 = 604_800;
+
+/// Pins (or unpins) a message for everyone in a real chat.
+pub fn pin(s: Store, chat: ChatId, msg: MsgId, on: bool) {
+    let (Some(target), Some((author, id))) =
+        (core_chat(chat), IDS.with_borrow(|x| x.get(&msg).copied()))
+    else {
+        toast("This message can't be pinned yet.");
+        return;
+    };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        m.pin(&target, &author, &id, PIN_SECS, !on)
+            .await
+            .map_err(|_| super::problem("The pin couldn't be sent."))?;
+        drop(guard);
+        edit_shown(s, msg, |x| x.pinned = on);
+        Ok(())
+    });
+}
+
+/// A disappearing timer in seconds, from the UI's choice.
+pub fn timer_secs(t: Option<crate::store::Disappear>) -> u32 {
+    match t {
+        None => 0,
+        Some(crate::store::Disappear::Day) => 86_400,
+        Some(crate::store::Disappear::Week) => 604_800,
+        Some(crate::store::Disappear::FourWeeks) => 2_419_200,
+    }
+}
+
+/// The UI's choice for a timer in seconds (the nearest it offers, rounding down).
+fn timer_choice(secs: u32) -> Option<crate::store::Disappear> {
+    match secs {
+        0 => None,
+        s if s >= 2_419_200 => Some(crate::store::Disappear::FourWeeks),
+        s if s >= 604_800 => Some(crate::store::Disappear::Week),
+        _ => Some(crate::store::Disappear::Day),
+    }
+}
+
+/// Sets a real chat's disappearing timer for everyone in it.
+pub fn set_timer(chat: ChatId, t: Option<crate::store::Disappear>) {
+    let Some(target) = core_chat(chat) else {
+        return;
+    };
+    let secs = timer_secs(t);
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        m.set_timer(&target, secs)
+            .await
+            .map_err(|_| super::problem("The timer couldn't be changed."))
+    });
+}
+
+/// Deletes the messages whose time is up, here and from the screen; every 15 seconds while
+/// app-core is open.
+fn sweep_expired() {
+    super::run(async move {
+        let gone = {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let Some(m) = guard.as_mut() else {
+                return Ok(());
+            };
+            m.expire_messages().unwrap_or_default()
+        };
+        if let Some(s) = crate::store::try_store() {
+            for (chat, author, id) in gone {
+                if let Some(msg) = ui_of(&author, &id) {
+                    let ui_chat = chat_ui(&chat);
+                    s.messages.update(|all| {
+                        if let Some(v) = all.get_mut(&ui_chat) {
+                            v.retain(|m| m.id != msg);
+                        }
+                    });
+                    IDS.with_borrow_mut(|x| x.remove(&msg));
+                    MEDIA.with_borrow_mut(|x| x.remove(&msg));
+                }
+            }
+        }
+        Ok(())
+    });
+}
+
+/// Opens a real contact's safety number: fetched from both accounts' identity keys, then shown.
+pub fn open_safety(contact: ContactId) {
+    let Some(account) = account_of(contact) else {
+        return;
+    };
+    super::run(async move {
+        let got = {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let m = guard
+                .as_mut()
+                .ok_or_else(|| super::problem("Not connected yet."))?;
+            m.safety(&account).await
+        };
+        match got {
+            Ok((number, verified)) => {
+                if let Some(s) = crate::store::try_store() {
+                    s.contacts.update(|cs| {
+                        if let Some(c) = cs.iter_mut().find(|c| c.id == contact) {
+                            c.safety_number = number.digits.clone();
+                            c.verified = verified;
+                        }
+                    });
+                }
+                crate::features::devices::push_safety(contact);
+                Ok(())
+            }
+            Err(songbird_app_core::Error::IdentityChanged) => {
+                if let Some(s) = crate::store::try_store() {
+                    s.set_key_changed(contact, true);
+                }
+                crate::features::devices::push_safety(contact);
+                Ok(())
+            }
+            Err(_) => Err(super::problem("The safety number couldn't be loaded.")),
+        }
+    });
+}
+
+/// Keeps whether the user verified a real contact.
+pub fn set_verified(contact: ContactId, verified: bool) {
+    let Some(account) = account_of(contact) else {
+        return;
+    };
+    super::run(async move {
+        let lock = core();
+        let guard = lock.lock().await;
+        if let Some(m) = guard.as_ref() {
+            let _ = m.set_verified(&account, verified);
+        }
+        Ok(())
+    });
+}
+
+/// Accepts a real contact's new identity key (after it changed): their new safety number
+/// shows, unverified, and messages to them work again.
+pub fn accept_identity(contact: ContactId) {
+    let Some(account) = account_of(contact) else {
+        return;
+    };
+    super::run(async move {
+        let got = {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let m = guard
+                .as_mut()
+                .ok_or_else(|| super::problem("Not connected yet."))?;
+            match m.accept_identity_change(&account).await {
+                Ok(()) => m.safety(&account).await,
+                Err(e) => Err(e),
+            }
+        };
+        let (number, _) =
+            got.map_err(|_| super::problem("The new safety number couldn't be accepted."))?;
+        if let Some(s) = crate::store::try_store() {
+            s.contacts.update(|cs| {
+                if let Some(c) = cs.iter_mut().find(|c| c.id == contact) {
+                    c.safety_number = number.digits.clone();
+                    c.verified = false;
+                    c.key_changed = false;
+                }
+            });
+        }
+        crate::nav::pop();
+        crate::features::devices::push_safety(contact);
+        toast("New safety number accepted. Compare it to verify them again.");
+        Ok(())
+    });
+}
+
+/// Marks every real chat read (Chats → Mark all as read).
+pub fn mark_all_read(s: Store) {
+    let chats: Vec<ChatId> = s.chats.with_untracked(|cs| {
+        cs.iter()
+            .filter(|c| !c.archived && !c.request && owns(c.id))
+            .map(|c| c.id)
+            .collect()
+    });
+    for chat in chats {
+        mark_read(chat);
     }
 }
 
