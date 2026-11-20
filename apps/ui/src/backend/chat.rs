@@ -1191,6 +1191,19 @@ pub async fn receive(envelope: &[u8]) -> bool {
             }
             true
         }
+        Ok(Received::GroupRulesBroken { group }) => {
+            if let Some(s) = crate::store::try_store() {
+                s.push_message(
+                    ui_id(&group),
+                    None,
+                    Body::System(
+                        "Someone made a change this group's rules don't allow, so this device stopped following the group. Ask an admin to add you again."
+                            .into(),
+                    ),
+                );
+            }
+            true
+        }
         Ok(Received::TimerChanged { chat, by, secs }) => {
             if let Some(s) = crate::store::try_store() {
                 let ui_chat = chat_ui(&chat);

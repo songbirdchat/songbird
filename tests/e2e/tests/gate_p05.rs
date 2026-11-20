@@ -720,7 +720,15 @@ async fn roles_metadata_change_log_and_leaving() {
         .unwrap();
     assert_eq!(st, 409, "a write from an old version loses");
     let (_, state_bytes) = state(&s, 2).await;
-    assert!(state_bytes.ends_with(b"sealed: name"));
+    // The meta blob, then each member device's account (D-0155): `n u16 | n × 32`.
+    let at = state_bytes
+        .windows(b"sealed: name".len())
+        .rposition(|w| w == b"sealed: name")
+        .expect("the meta blob");
+    let tail = &state_bytes[at + b"sealed: name".len()..];
+    let n = usize::from(u16::from_be_bytes([tail[0], tail[1]]));
+    assert!(n > 0);
+    assert_eq!(tail.len(), 2 + n * 32);
 
     // The change log: Alice's entry, for any member (a newly linked device reads it too).
     let (st, log) = s.people[2]

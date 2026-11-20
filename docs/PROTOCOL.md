@@ -1378,6 +1378,17 @@ ratchet tree` to:
 
 Anyone else gets 404, the same answer as for no group.
 
+- **Member accounts** (D-0155): for a device in the group, the answer to `POST
+  /v1/groups/state` ends, after the meta blob, with `n u16 | n × (device [16] | account [16])`:
+  each member device's account. Devices check every pair against that account's signed device
+  list before using it, so the server can leave a device out but not attribute it to another
+  account. A link's state (`/v1/groups/links/open`) has no such part.
+- **Clients check commits too** (D-0155): before merging a member's commit, a device builds
+  the commit's change in accounts from pairs it verified and runs the same `authorize` the
+  server ran; a commit it refuses ends its following of the group (it shows why). It also drops
+  group messages from accounts the roles do not let send, and pins from accounts that may not
+  pin.
+
 ### 6.5 Group messages: `Send` with `GROUP` (`0x40`)
 
 Flags `SHARED | GROUP`; the `GROUP` block (`group [16]`) comes after every other block; `count`

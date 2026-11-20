@@ -56,7 +56,7 @@ Status: ☐ open · ☑ done (with the commit).
 - network usage counted
 - storage per chat
 
-**Groups, the rest (b, c):** roles enforced on received commits (needs a device-to-account map), the change log, new devices joining by external commit.
+**Groups, the rest (b, c):** the change log, new devices joining by external commit. (Roles on received commits: done, D-0155.)
 
 **M6 attachments, the rest (a, b, c):** voice notes (microphone, e), video playback, view-once, the user's own GPS position (e; picking on the map is done), view-once,
 download, save, HD, auto-download.

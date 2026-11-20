@@ -180,6 +180,9 @@ pub enum Received {
     },
     /// A poll's votes changed, or it was closed: read its tally again ([`Messenger::poll_tally`]).
     PollChanged { author: [u8; 16], id: [u8; 16] },
+    /// A commit in a group broke the group's rules (a change the committer's role does not
+    /// allow): this device did not follow it, and stops following the group.
+    GroupRulesBroken { group: [u8; 16] },
     /// A system notice was handled (prekeys refilled, the device list refreshed).
     System,
     /// Nothing to show (a duplicate, a dropped or unreadable envelope).
@@ -1274,6 +1277,13 @@ impl<N: Net> Messenger<N> {
                 let Some((author, id)) = target(p.target.as_ref()) else {
                     return nothing;
                 };
+                // In a group, only those its roles let pin (§6.6, checked by clients).
+                if let Ok(group) = self.load_group(chat)
+                    && let Ok(roles) = songbird_groups::ds::roles_in(group.extensions())
+                    && !roles.may_pin(&songbird_types::AccountId::from_bytes(*account))
+                {
+                    return nothing;
+                }
                 // Only a message of this chat is pinned here.
                 if self
                     .store

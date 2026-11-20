@@ -199,6 +199,37 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0155 — Devices enforce group roles: verified member accounts
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Context: roles (§6.6) were enforced only by the server; a device took any commit the server
+  fanned out, because the MLS tree names devices, not accounts (D-0147 recorded the gap).
+- Decision:
+  1. `POST /v1/groups/state` ends with each member device's account, for members only.
+  2. The device keeps a per-group device→account map (in the encrypted store), refreshed from
+     that answer, and uses a pair only after finding the device in the account's signed device
+     list (a device no longer listed is dead and has no account). The map is warmed on joining
+     and after every merged commit, so a later removal can still be checked.
+  3. Before merging a member's commit, the device computes the change in accounts (before,
+     after, gained, lost, left, server removals) exactly as `ds` does and runs
+     `roles::authorize`. A refused commit is not merged; the app says the device stopped
+     following the group. A commit removing this device is accepted (the server merged it; the
+     device cannot follow the group any further either way).
+  4. Group messages from an account the roles do not let send are dropped; pins from an
+     account that may not pin are ignored.
+- Rejected: carrying accounts in leaf credentials (changes the credential every server and
+  harness checks) or in each commit's change-log entry (unreadable to a device that joins
+  later, and the log's key is not settled).
+- Evidence: every A2 group test (creation, adds, removals, leaving, links, requests,
+  communities, channels, calls, polls) passes with the check active (14); a joiner's verified
+  map names the creator's device and account; P05 (14) and P07 (7) pass with the extended state
+  answer.
+- Consequences: a server can make a device refuse a valid commit only by leaving its committer
+  out of the answer, which every member would notice; it cannot make one accept a commit the
+  roles forbid. The change log ("View member changes") is still open.
+
 ## D-0154 — Disappearing messages, polls, pins, safety numbers, mutes and GIFs in real chats
 
 - Date: 2026-11-20

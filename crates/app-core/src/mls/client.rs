@@ -15,6 +15,8 @@
 //!
 //! Group state is saved to the encrypted store after every change.
 
+use std::collections::{BTreeSet, HashMap};
+
 use openmls::prelude::tls_codec::Deserialize as _;
 use openmls::prelude::*;
 use songbird_content::schema::{Content, DataMessage, Text, content::Body, data_message};
@@ -697,10 +699,172 @@ impl<N: Net> Messenger<N> {
         if !songbird_groups::ds::extensions_allowed(staged.group_context(), Some(&ds)) {
             return Ok(Received::Nothing);
         }
-        staged.into_group(&self.mls).map_err(|_| Error::Storage)?;
+        let joined = staged.into_group(&self.mls).map_err(|_| Error::Storage)?;
         self.save_mls()?;
         self.store.ensure_group_chat(&gid)?;
+        self.warm_accounts(&gid, &joined).await;
         Ok(Received::Joined { group: gid })
+    }
+
+    /// The accounts of `devices` in group `gid` (D-0155): from this device's cache, else from
+    /// the server's group state; every pair checked against the account's signed device list
+    /// (a device no longer listed has no account: it is dead). Devices the server leaves out are
+    /// left out here.
+    async fn member_accounts(
+        &mut self,
+        gid: &[u8; 16],
+        devices: &BTreeSet<[u8; 16]>,
+    ) -> Result<HashMap<[u8; 16], [u8; 16]>> {
+        let key = format!("group_accounts.{}", hex(gid));
+        let mut cache: HashMap<[u8; 16], [u8; 16]> = self
+            .store
+            .secret(&key)?
+            .map(|b| {
+                b.as_chunks::<32>()
+                    .0
+                    .iter()
+                    .filter_map(|c| {
+                        let (d, a) = c.split_first_chunk::<16>()?;
+                        Some((*d, <[u8; 16]>::try_from(a).ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if devices.iter().any(|d| !cache.contains_key(d)) {
+            let mut body = vec![1];
+            body.extend_from_slice(gid);
+            let (status, state) = self.net.api("POST", "/v1/groups/state", body).await?;
+            if status == 200 {
+                for (d, a) in state_accounts(&state)? {
+                    if devices.contains(&d) && !cache.contains_key(&d) {
+                        cache.insert(d, a);
+                    }
+                }
+            }
+        }
+        let mut out = HashMap::new();
+        for d in devices {
+            let Some(a) = cache.get(d).copied() else {
+                continue;
+            };
+            let mut listed = self.store.devices(&a)?.iter().any(|(x, _)| x == d);
+            if !listed {
+                listed = self
+                    .devices_of(&a, true)
+                    .await
+                    .is_ok_and(|v| v.iter().any(|(x, _)| x == d));
+            }
+            if listed {
+                out.insert(*d, a);
+            } else {
+                cache.remove(d);
+            }
+        }
+        let mut b = Vec::with_capacity(cache.len() * 32);
+        for (d, a) in &cache {
+            b.extend_from_slice(d);
+            b.extend_from_slice(a);
+        }
+        self.store.put_secret(&key, &b)?;
+        Ok(out)
+    }
+
+    /// Learns (and verifies) the accounts of every member device now; failures leave the cache
+    /// as it was.
+    async fn warm_accounts(&mut self, gid: &[u8; 16], group: &MlsGroup) {
+        let devices: BTreeSet<[u8; 16]> = group
+            .members()
+            .filter_map(|m| <[u8; 16]>::try_from(m.credential.serialized_content()).ok())
+            .collect();
+        let _ = self.member_accounts(gid, &devices).await;
+    }
+
+    /// Whether a member's commit is one `committer`'s role allows (`roles::authorize`, the rule
+    /// the server ran), in accounts this device verified.
+    async fn commit_allowed(
+        &mut self,
+        gid: &[u8; 16],
+        group: &MlsGroup,
+        staged: &StagedCommit,
+        committer: &[u8; 16],
+    ) -> Result<bool> {
+        let device_of = |c: &Credential| <[u8; 16]>::try_from(c.serialized_content()).ok();
+        let leaves: HashMap<u32, [u8; 16]> = group
+            .members()
+            .filter_map(|m| Some((m.index.u32(), device_of(&m.credential)?)))
+            .collect();
+        let mut self_removed = BTreeSet::new();
+        let mut server_removed = BTreeSet::new();
+        let mut removed = BTreeSet::new();
+        for q in staged.queued_proposals() {
+            match (q.proposal(), q.sender()) {
+                (Proposal::SelfRemove, Sender::Member(i)) => {
+                    self_removed.insert(i.u32());
+                    removed.insert(i.u32());
+                }
+                (Proposal::Remove(r), Sender::External(_)) => {
+                    server_removed.insert(r.removed().u32());
+                    removed.insert(r.removed().u32());
+                }
+                (Proposal::Remove(r), _) => {
+                    removed.insert(r.removed().u32());
+                }
+                _ => {}
+            }
+        }
+        let added: Vec<[u8; 16]> = staged
+            .add_proposals()
+            .filter_map(|a| device_of(a.add_proposal().key_package().leaf_node().credential()))
+            .collect();
+        let mut wanted: BTreeSet<[u8; 16]> = leaves.values().copied().collect();
+        wanted.extend(added.iter().copied());
+        wanted.insert(*committer);
+        let accounts = self.member_accounts(gid, &wanted).await?;
+        let Some(actor) = accounts.get(committer).copied() else {
+            return Ok(false);
+        };
+        let acct = |d: &[u8; 16]| accounts.get(d).copied().map(AccountId::from_bytes);
+        let mut c = songbird_groups::roles::Change::default();
+        let mut removed_devices = BTreeSet::new();
+        for idx in &removed {
+            let Some(d) = leaves.get(idx) else {
+                return Ok(false);
+            };
+            removed_devices.insert(*d);
+            if let Some(a) = acct(d) {
+                if server_removed.contains(idx) {
+                    c.external.insert(a);
+                } else if self_removed.contains(idx) {
+                    c.left.insert(a);
+                } else {
+                    c.lost.insert(a);
+                }
+            }
+        }
+        for d in leaves.values() {
+            if let Some(a) = acct(d) {
+                c.before.insert(a);
+                if !removed_devices.contains(d) {
+                    c.after.insert(a);
+                }
+            }
+        }
+        for d in &added {
+            if let Some(a) = acct(d) {
+                c.gained.insert(a);
+                c.after.insert(a);
+            }
+        }
+        let (Ok(old), Ok(new)) = (
+            songbird_groups::ds::roles_in(group.extensions()),
+            songbird_groups::ds::roles_in(staged.group_context().extensions()),
+        ) else {
+            return Ok(false);
+        };
+        Ok(
+            songbird_groups::roles::authorize(&AccountId::from_bytes(actor), &old, &new, &c)
+                .is_ok(),
+        )
     }
 
     #[allow(
@@ -738,6 +902,26 @@ impl<N: Net> Messenger<N> {
                 if !songbird_groups::ds::extensions_allowed(staged.group_context(), ds.as_ref()) {
                     return Ok(Received::Nothing);
                 }
+                // A member's commit must be one its committer's role allows (§6.6): checked
+                // here as the server checked it, from accounts this device verified itself.
+                // (A commit removing this device ends the group here whatever it holds: the
+                // server merged it, and this device can follow the group no further.)
+                let me = group.own_leaf_index().u32();
+                let removes_me = staged.remove_proposals().any(|r| r.remove_proposal().removed().u32() == me)
+                    || staged.queued_proposals().any(|q| {
+                        matches!((q.proposal(), q.sender()), (Proposal::SelfRemove, Sender::Member(i)) if i.u32() == me)
+                    });
+                if !join && !removes_me {
+                    let committer: Option<[u8; 16]> =
+                        sender_device.as_deref().and_then(|d| d.try_into().ok());
+                    let allowed = match committer {
+                        Some(c) => self.commit_allowed(&gid, &group, &staged, &c).await?,
+                        None => false,
+                    };
+                    if !allowed {
+                        return Ok(Received::GroupRulesBroken { group: gid });
+                    }
+                }
                 group
                     .merge_staged_commit(&self.mls, *staged)
                     .map_err(|_| Error::Storage)?;
@@ -748,6 +932,9 @@ impl<N: Net> Messenger<N> {
                     self.save_mls()?;
                     return Ok(Received::RemovedFromGroup { group: gid });
                 }
+                // Who is who now, while this device may still ask (a later commit removing a
+                // member is checked from it).
+                self.warm_accounts(&gid, &group).await;
                 if join {
                     return Ok(Received::GroupUpdated {
                         group: gid,
@@ -796,6 +983,12 @@ impl<N: Net> Messenger<N> {
                         .is_ok_and(|v| v.iter().any(|(d, _)| *d == device));
                 }
                 if !listed {
+                    return Ok(Received::Nothing);
+                }
+                // Only those the group's roles let send (announcement groups, channels).
+                if let Ok(roles) = songbird_groups::ds::roles_in(group.extensions())
+                    && !roles.may_send(&AccountId::from_bytes(account))
+                {
                     return Ok(Received::Nothing);
                 }
                 let account = &account;
@@ -864,6 +1057,25 @@ fn content_data(c: &Content) -> Result<&DataMessage> {
         Some(Body::Data(d)) => Ok(d),
         _ => Err(Error::Malformed),
     }
+}
+
+/// The member accounts a `/v1/groups/state` answer ends with (D-0155): after `epoch | info |
+/// tree | meta_v | meta`, `n u16 | n × (device | account)`. An answer without them names none.
+fn state_accounts(state: &[u8]) -> Result<Vec<([u8; 16], [u8; 16])>> {
+    let mut r = crate::crypto::Reader::new(state);
+    let _epoch = r.u64()?;
+    let _info = r.bytes32(4 << 20)?;
+    let _tree = r.bytes32(4 << 20)?;
+    let _meta_v = r.u64()?;
+    let _meta = r.bytes32(16 << 10)?;
+    let Ok(n) = r.u16() else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(usize::from(n));
+    for _ in 0..n {
+        out.push((r.array()?, r.array()?));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

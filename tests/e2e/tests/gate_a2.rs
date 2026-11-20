@@ -1620,6 +1620,19 @@ async fn timers_pins_polls_and_group_events() {
         .await
         .unwrap();
     assert_eq!(pump_app(&mut bob).await, Received::Joined { group: gid });
+    // Joining, Bob learned (and checked against Alice's signed device list) whose device is
+    // whose: what he checks every later commit's roles with (D-0155).
+    let known = bob
+        .core
+        .store
+        .secret(&format!("group_accounts.{}", hex::encode(gid)))
+        .unwrap()
+        .unwrap();
+    assert!(
+        known
+            .chunks_exact(32)
+            .any(|c| c[..16] == alice.core.local().device && c[16..] == alice.account)
+    );
     assert!(matches!(
         pump_app(&mut bob).await,
         Received::GroupUpdated { .. }
