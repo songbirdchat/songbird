@@ -12,6 +12,17 @@ ui="$here/../ui"
 rust="$here/build/rust"
 : "${ANDROID_HOME:?set ANDROID_HOME to the Android SDK}"
 
+# C and C++ crates (aws-lc, libwebrtc's glue) build with the NDK's clang for API 26, the app's
+# minimum (D-0175): NSH sets the linker only.
+ndk=${ANDROID_NDK_HOME:-$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)}
+llvm=$(ls -d "$ndk"/toolchains/llvm/prebuilt/* | head -1)/bin
+export CC_aarch64_linux_android="$llvm/aarch64-linux-android26-clang"
+export CXX_aarch64_linux_android="$llvm/aarch64-linux-android26-clang++"
+export AR_aarch64_linux_android="$llvm/llvm-ar"
+export ANDROID_NDK_HOME="$ndk"
+# SQLCipher's crypto: AWS-LC's libcrypto for the target, never OpenSSL (D-0137, D-0175).
+eval "$("$here/../../scripts/build-aws-lc-libcrypto.sh" aarch64-linux-android)"
+
 # 1. The Rust app, as nsh packages it.
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT

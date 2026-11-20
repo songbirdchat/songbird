@@ -212,6 +212,13 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
     0.3.21 is vendored (`apps/vendor/webrtc-sys-build`, Apache-2.0, `PATCH.md`) with one
     change: `LK_CUSTOM_WEBRTC_<target>` first. `scripts/fetch-libwebrtc.sh` exports both, so
     every target still links only its pinned, checksum-verified archive.
+  - **SQLCipher off Apple**: `scripts/build-aws-lc-libcrypto.sh` builds AWS-LC's libcrypto for
+    the target from the very source `aws-lc-sys` ships (CMake, the NDK's toolchain) and exports
+    `<TARGET>_OPENSSL_LIB_DIR`/`_INCLUDE_DIR`, which `libsqlite3-sys` reads per target (the
+    D-0137 step; no OpenSSL anywhere). Android builds arm64-v8a only (LiveKit's libwebrtc), with
+    the NDK's clang for API 26 named for C and C++ crates. The Android libwebrtc archive has
+    headers that differ only in case; the fetch script overwrites them on a case-insensitive disk.
+  - **Verified**: the app runs on the iOS simulator and the Android emulator (arm64, API 36).
   - **Screen sharing on phones** needs ReplayKit or MediaProjection: the desktop capturer is
     built for computers only, and the call screen hides "Share screen" on iOS and Android.
   - **APNs token**: NSH's app delegate doesn't take the token callbacks, so the device crate
