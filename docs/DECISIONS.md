@@ -211,7 +211,7 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
   state instead of overwriting it with its own defaults. Locked chats stay device-only: a lock
   protects whoever holds this device, and the passcode never leaves it.
 - Consequences: the records server sees one more opaque record per chat that has state; it
-  learns nothing of which chat (keys are encrypted with the records key, D-0047).
+  learns nothing of which chat (the logical key is inside the encrypted record, D-0102).
 
 ## D-0162 — Locked chats open with the app passcode; real storage and network usage
 
