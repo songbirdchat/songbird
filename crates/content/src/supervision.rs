@@ -294,12 +294,73 @@ pub fn link_code(policy_key: &[u8; 32], link_secret: &[u8; 32], child: &[u8; 16]
     format!("{:06}", u32::from_be_bytes(n) % 1_000_000)
 }
 
+/// The eight digits a parent's device shows to approve one new contact for the child (D-0166):
+/// an HMAC under a key from the link secret over the child and the contact, so only the two
+/// linked devices can make or check it, and a code for one contact never approves another.
+/// Shown in person; nothing goes through the server.
+///
+/// # Errors
+/// [`Error::Crypto`] if the key can't be derived (it can).
+pub fn approval_code(
+    link_secret: &[u8; 32],
+    child: &[u8; 16],
+    contact: &[u8; 16],
+) -> Result<String, Error> {
+    use aws_lc_rs::hmac;
+    let mut k = Zeroizing::new([0u8; 32]);
+    hkdf::Salt::new(hkdf::HKDF_SHA256, b"songbird.v1/supervision")
+        .extract(link_secret)
+        .expand(&[b"contact-approval"], hkdf::HKDF_SHA256)
+        .and_then(|o| o.fill(k.as_mut()))
+        .map_err(|_| Error::Crypto)?;
+    let key = hmac::Key::new(hmac::HMAC_SHA256, k.as_ref());
+    let mut msg = b"songbird.v1/contact-approval\0".to_vec();
+    msg.extend_from_slice(child);
+    msg.extend_from_slice(contact);
+    let tag = hmac::sign(&key, &msg);
+    let mut n = [0u8; 8];
+    n.copy_from_slice(tag.as_ref().get(..8).ok_or(Error::Crypto)?);
+    Ok(format!("{:08}", u64::from_be_bytes(n) % 100_000_000))
+}
+
+/// Whether `typed` (spaces ignored) is the approval code for this contact, in constant time.
+#[must_use]
+pub fn approval_matches(
+    link_secret: &[u8; 32],
+    child: &[u8; 16],
+    contact: &[u8; 16],
+    typed: &str,
+) -> bool {
+    let typed: String = typed.chars().filter(|c| !c.is_whitespace()).collect();
+    approval_code(link_secret, child, contact).is_ok_and(|want| {
+        typed.len() == want.len()
+            && aws_lc_rs::constant_time::verify_slices_are_equal(typed.as_bytes(), want.as_bytes())
+                .is_ok()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, reason = "tests")]
 
     use super::*;
     use songbird_proto::supervision::{HIDDEN, Policy};
+
+    #[test]
+    fn an_approval_code_is_for_one_contact_and_one_link() {
+        let (secret, child) = ([1u8; 32], [2u8; 16]);
+        let code = approval_code(&secret, &child, &[3; 16]).unwrap();
+        assert_eq!(code.len(), 8);
+        assert!(approval_matches(
+            &secret,
+            &child,
+            &[3; 16],
+            &format!("{} {}", &code[..4], &code[4..])
+        ));
+        assert!(!approval_matches(&secret, &child, &[4; 16], &code));
+        assert!(!approval_matches(&[9; 32], &child, &[3; 16], &code));
+        assert!(!approval_matches(&secret, &child, &[3; 16], ""));
+    }
 
     #[test]
     fn every_member_state_has_an_age_between_13_and_16() {

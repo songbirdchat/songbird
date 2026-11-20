@@ -47,6 +47,8 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 songbird-camera = { path = "../camera" }
 # Real QR codes (D-0110): the link code, invites, safety numbers. No `image`/`svg`: no deps.
 qrcode = { version = "0.14.1", default-features = false }
+# Quiet hours in the child's local time (D-0166): the system's zone through iana-time-zone.
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nsh-platform-linux = { version = "0.6.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }

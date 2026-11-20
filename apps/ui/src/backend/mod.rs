@@ -36,6 +36,7 @@ pub mod plans;
 pub mod presence;
 pub mod profile;
 pub mod records;
+pub mod rules;
 pub mod supervision;
 pub mod tunnel;
 pub mod usage;
@@ -226,6 +227,7 @@ pub fn erase_local() {
     ] {
         Storage::remove_item(k);
     }
+    rules::forget();
 }
 
 /// Forgets this device's account locally (the server keeps it).

@@ -2369,7 +2369,11 @@ signature = Ed25519(policy key, "songbird.v1/supervision\0" ‖ every byte befor
 `client_rules` is AES-256-GCM-SIV ciphertext under a key from the link secret (HKDF, salt
 `"songbird.v1/supervision"`, info `"client-rules"`; AAD `"songbird.v1/client-rules\0" ‖ child ‖
 be64(version)`): approving each new contact, declining calls from non-contacts, nudges off, quiet
-hours. Only the two devices read it; the child's app enforces it and shows it.
+hours. Only the two devices read it; the child's app enforces it and shows it (D-0166). A new
+contact is approved in person: the child's phone shows `SONGBIRD:APPROVE:<account hex>:<username>`,
+the parent's phone shows eight digits, `HMAC-SHA256(HKDF-SHA256(salt "songbird.v1/supervision",
+link secret, info "contact-approval"), "songbird.v1/contact-approval\0" ‖ child ‖ contact)`, the
+first 8 bytes big-endian mod 10^8, which the child types.
 
 | Request | Who | Answers |
 | --- | --- | --- |

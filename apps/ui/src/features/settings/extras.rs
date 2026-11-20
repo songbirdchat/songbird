@@ -478,11 +478,134 @@ pub fn parental() {
                     ],
                 )
             }))
+            .child(when(linked, || {
+                section(
+                    "Contacts",
+                    vec![Row::new("Approve a contact")
+                        .icon(Icon::QrCode)
+                        .subtitle("Scan the code on your child's phone.")
+                        .chevron()
+                        .on_press(approve_contact)
+                        .build()],
+                )
+            }))
             .child(section(
                 "See it from their side",
                 vec![Row::new("Preview what your child sees").icon(Icon::Eye).chevron().on_press(child_view).build()],
             ))
             .child(super::foot("A child can't remove these rules alone, but can always delete their own account. The rules end when you unlink, or by themselves when your child reaches the age of digital consent in your country (13 to 16 in the EU)."))
+            .into_element()
+    });
+}
+
+/// The parent's phone approves one new contact for the child (D-0166): it scans the code the
+/// child's phone shows and shows eight digits made from the link secret, for the child to type.
+/// Nothing goes through the server.
+fn approve_contact() {
+    super::push("Approve a contact", || {
+        let scanned = signal(None::<([u8; 16], String)>);
+        let session = crate::camera::use_session(
+            songbird_camera::Purpose::ScanCode,
+            move || scanned.get().is_none(),
+            move |text| {
+                if let Some(features::devices::codes::Scanned::Approve { account, username }) =
+                    features::devices::codes::parse(&text)
+                {
+                    scanned.set(Some((account, username)));
+                }
+            },
+        );
+        view()
+            .items_center()
+            .px_6()
+            .pt_6()
+            .gap_4()
+            .child(dynamic(move || {
+                let now = scanned.get();
+                let session = session.clone();
+                untracked(move || match now {
+                    None => view()
+                        .items_center()
+                        .gap_4()
+                        .child(body("Hold your phone to your child's and scan the code they show.").text_center().max_w(px(420.0)))
+                        .child(crate::camera::camera_view(&session, 280.0, "Point at the code on your child's phone"))
+                        .into_element(),
+                    Some((account, username)) => {
+                        let digits = sup::parent_link()
+                            .and_then(|l| {
+                                songbird_content::supervision::approval_code(&l.secret, &l.child, &account).ok()
+                            })
+                            .unwrap_or_default();
+                        let spaced = format!("{} {}", &digits[..4.min(digits.len())], &digits[4.min(digits.len())..]);
+                        view()
+                            .items_center()
+                            .gap_4()
+                            .child(body(format!("Approve @{username}?")).font_weight(FontWeight::SEMIBOLD))
+                            .child(muted("If you know who this is, let your child type these digits on their phone.").text_center().max_w(px(420.0)))
+                            .child(numeric_code(spaced).label(format!("Approval code {digits}")))
+                            .child(btn("Done", Variant::Primary, BtnSize::Lg, || crate::nav::pop()))
+                            .child(btn("Scan another", Variant::Ghost, BtnSize::Md, move || scanned.set(None)))
+                            .into_element()
+                    }
+                })
+            }))
+            .child(muted("A code approves this one person only, and only for your child's phone.").text_center().max_w(px(420.0)))
+            .into_element()
+    });
+}
+
+/// The child's phone: a new contact waits for the parent's approval (D-0166). The parent's
+/// phone scans the code here and shows eight digits to type.
+pub fn ask_approval() {
+    super::push("Ask your parent", || {
+        let Some((account, username)) = crate::backend::rules::pending() else {
+            return view()
+                .p_6()
+                .child(muted("Nothing is waiting for approval."))
+                .into_element();
+        };
+        let code = features::devices::codes::approve_code(&account, &username);
+        let typed = signal(String::new());
+        let failed = signal(None::<String>);
+        let name = username.clone();
+        view()
+            .items_center()
+            .px_6()
+            .pt_6()
+            .gap_4()
+            .child(body(format!("Your parent's rules ask them to approve each new contact. To message @{username}, ask them now.")).text_center().max_w(px(420.0)))
+            .child(
+                view()
+                    .role(AccessibilityRole::Image)
+                    .label("Approval request, for your parent's phone to scan")
+                    .child(qr_code(&code, 220.0)),
+            )
+            .child(muted("On their phone: You → Parental controls → Approve a contact. Then type the digits it shows.").text_center().max_w(px(420.0)))
+            .child(view().w_full().max_w(px(320.0)).child(field("8 digits", typed)))
+            .child(when(
+                move || failed.get().is_some(),
+                move || {
+                    status_line(
+                        || StatusTone::Problem,
+                        || Icon::Alert,
+                        move || failed.get().unwrap_or_default().into(),
+                    )
+                },
+            ))
+            .child(btn("Approve and message", Variant::Primary, BtnSize::Lg, move || {
+                match crate::backend::rules::approve(&account, &typed.get_untracked()) {
+                    Ok(()) => {
+                        let name = name.clone();
+                        crate::backend::run(async move {
+                            let chat = crate::backend::chat::start_with_username(&name).await?;
+                            crate::nav::pop_to_root();
+                            features::chat::open(chat);
+                            Ok(())
+                        });
+                    }
+                    Err(p) => failed.set(Some(p.0)),
+                }
+            }))
             .into_element()
     });
 }
@@ -1106,7 +1229,11 @@ fn child_view() {
             move || Some(crate::backend::is_live() && crate::backend::registered()),
             |live, _info| async move {
                 if live {
-                    sup::fetch().await.map_err(|p| p.0)
+                    let p = sup::fetch().await.map_err(|p| p.0)?;
+                    if let Some(p) = &p {
+                        crate::backend::rules::keep(p);
+                    }
+                    Ok::<_, String>(p)
                 } else {
                     Ok(None)
                 }

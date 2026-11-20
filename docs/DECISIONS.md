@@ -199,6 +199,29 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0166 — The parent's app-side rules are enforced on the child's app
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: the child's app keeps the signed policy (checked against the key scanned at linking
+  at every read; a newer version only; fetched at start and every 30 minutes) and enforces the
+  sealed client rules (PROTOCOL §10.6):
+  - **Calls only from contacts:** an offer from someone who hasn't shared their profile with
+    the child is answered busy.
+  - **Nudges off:** none shows, none can be sent.
+  - **Quiet hours:** no notifications inside the window, in the device's local time.
+  - **Each new contact needs approval, in person:** starting a chat with someone new shows a
+    code (`SONGBIRD:APPROVE:<account>:<username>`); the parent's phone scans it and shows eight
+    digits, `HMAC(HKDF(link secret, "contact-approval"), child ‖ contact)`, which the child
+    types. Nothing goes through the server, so it never learns who parents whom or who is
+    approved. Five wrong codes make the next try wait a minute, doubling. Approvals stay on the
+    child's device until supervision ends.
+  A policy that ends supervision (or its date passing) lifts every rule and forgets approvals.
+- Consequences: these rules are the child's app's to enforce, as §10.6 says: a child who
+  modifies their phone can get around them. The server-enforced flags (no requests, group
+  approval, hidden) hold regardless.
+
 ## D-0165 — Backups hold app-core's chats; schedule, media and a second copy are real
 
 - Date: 2026-11-20

@@ -231,6 +231,10 @@ pub fn demo_from_env() {
 }
 
 fn notify(s: Store, chat: u64, event: &Event, focus: Focus, sink: &dyn Fn(Notice)) {
+    // A supervised child's quiet hours (D-0166): nothing notifies.
+    if crate::backend::rules::quiet_now() {
+        return;
+    }
     let Some(c) = s.chat(chat) else { return };
     if let Some(n) = s.settings.with_untracked(|st| decide(event, &c, st, focus)) {
         sink(n);

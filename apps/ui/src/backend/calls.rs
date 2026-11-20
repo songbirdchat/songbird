@@ -390,6 +390,14 @@ pub async fn signal(
             if !super::chat::owns(chat) {
                 return;
             }
+            // A supervised child's "calls only from contacts" (D-0166): answered busy.
+            if group.is_none()
+                && super::rules::unknown_calls_blocked()
+                && m.store.profile_key(&from).ok().flatten().is_none()
+            {
+                let _ = m.busy_call(&from, &call).await;
+                return;
+            }
             if current.is_some() || ui::live::busy() {
                 if group.is_none() {
                     let _ = m.busy_call(&from, &call).await;

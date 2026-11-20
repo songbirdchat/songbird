@@ -18,6 +18,9 @@ pub const CHILD: &str = "SONGBIRD:CHILD:";
 /// The parent's signed first policy and the link secret: `SONGBIRD:POLICY:<secret hex>:<policy
 /// hex>` (the policy names the key).
 pub const POLICY: &str = "SONGBIRD:POLICY:";
+/// A child's request to approve a new contact (D-0166): `SONGBIRD:APPROVE:<contact account
+/// hex>:<username>`, for the parent's phone to scan.
+pub const APPROVE: &str = "SONGBIRD:APPROVE:";
 /// The longest policy a code carries, in bytes (a policy with the most client rules).
 pub const MAX_POLICY: usize = 1 + 16 + 32 + 8 + 1 + 8 + 2 + 512 + 64;
 /// The longest channel ID a link code carries, in bytes (as the provisioning parser accepts).
@@ -52,6 +55,19 @@ pub enum Scanned {
         /// The encoded policy.
         policy: Vec<u8>,
     },
+    /// A child's request to approve a contact: the contact's account and username.
+    Approve {
+        /// The contact's account ID.
+        account: [u8; 16],
+        /// The username the child typed.
+        username: String,
+    },
+}
+
+/// The code a child's phone shows to have a new contact approved.
+#[must_use]
+pub fn approve_code(account: &[u8; 16], username: &str) -> String {
+    format!("{APPROVE}{}:{username}", hex_upper(account))
 }
 
 /// The link code a new device shows.
@@ -107,6 +123,19 @@ pub fn parse(text: &str) -> Option<Scanned> {
         return Some(Scanned::Child {
             account,
             unlink_at_s: date.parse().ok()?,
+        });
+    }
+    if let Some(rest) = strip_prefix_ignore_case(text, APPROVE) {
+        let (account, username) = rest.split_once(':')?;
+        let account: [u8; 16] = unhex(account)?.try_into().ok()?;
+        let ok = !username.is_empty()
+            && username.len() <= 64
+            && username
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.');
+        return ok.then(|| Scanned::Approve {
+            account,
+            username: username.to_owned(),
         });
     }
     if let Some(rest) = strip_prefix_ignore_case(text, POLICY) {
@@ -276,5 +305,20 @@ mod tests {
         ] {
             assert_eq!(parse(&bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn approval_requests_parse_strictly() {
+        let code = approve_code(&[0xab; 16], "ana.b_1");
+        assert_eq!(
+            parse(&code),
+            Some(Scanned::Approve {
+                account: [0xab; 16],
+                username: "ana.b_1".into()
+            })
+        );
+        assert_eq!(parse(&approve_code(&[0xab; 16], "a b")), None);
+        assert_eq!(parse(&approve_code(&[0xab; 16], "")), None);
+        assert_eq!(parse("SONGBIRD:APPROVE:ABCD:ana"), None);
     }
 }

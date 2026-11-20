@@ -2422,6 +2422,7 @@ pub async fn receive_attention(payload: &[u8]) {
             let chat = ui_id(&account);
             // Nudges off (globally or for them), or blocked: nothing shows.
             let allowed = s.settings.with_untracked(|x| x.nudges)
+                && !super::rules::nudges_off()
                 && s.contact(chat).is_some_and(|c| !c.nudges_off && !c.blocked);
             if owns(chat) && allowed {
                 s.push_message(chat, Some(chat), Body::Nudge);
@@ -2660,6 +2661,12 @@ async fn start_with(username: &str, link: Option<[u8; 16]>) -> Result<ChatId, su
         .ok_or_else(|| super::problem("The server's answer was incomplete."))?;
     if live().with_untracked(|l| l.account.as_deref().and_then(hex16)) == Some(account) {
         return Err(super::problem("That's you."));
+    }
+    // A supervised child's new contact waits for the parent's approval (D-0166).
+    if !owns(ui_id(&account))
+        && !super::rules::may_start(&account, username.trim().trim_start_matches('@'))
+    {
+        return Err(super::problem(super::rules::NEEDS_APPROVAL));
     }
     // Resolve their devices now, so a changed or missing identity shows here.
     {

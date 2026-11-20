@@ -470,6 +470,7 @@ pub async fn finish_child(c: ChildLinking, r: Revealed) -> Result<Policy, Proble
         birth_month: c.birth_month,
         country: c.country,
     });
+    super::rules::keep(&r.policy);
     Ok(r.policy)
 }
 

@@ -847,6 +847,10 @@ impl Store {
     /// to their devices (`backend::nudge`, PROTOCOL §10.5) and shows a line here only (a nudge
     /// is not a stored message); a demo chat shows the line.
     pub fn nudge(&self, chat: ChatId) {
+        if crate::backend::rules::nudges_off() {
+            crate::ui::toast("Nudges are off by your parent's rules.");
+            return;
+        }
         if crate::backend::chat::owns(chat) {
             crate::backend::nudge::send(chat);
             self.push_message(chat, None, Body::Nudge);

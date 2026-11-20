@@ -98,6 +98,8 @@ pub fn App() -> impl IntoElement {
     backend::chat_state::install(s);
     // The backup settings, saved on this device, and backups on their schedule (D-0165).
     backend::backup::install(s);
+    // A supervised child's rules, kept fresh (D-0166).
+    backend::rules::install();
     // A status whose real expiry passed while the app was closed goes now.
     s.schedule_status_expiry();
     camera::install_for_app();

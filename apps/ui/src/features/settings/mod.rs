@@ -13,6 +13,7 @@ mod appearance;
 mod centre;
 pub(crate) mod chats;
 mod extras;
+pub use extras::ask_approval;
 mod links;
 mod notifications;
 mod privacy;

@@ -142,8 +142,19 @@ fn body() -> impl IntoElement {
                                         return;
                                     }
                                     crate::backend::run(async move {
-                                        let chat = crate::backend::chat::start_with_username(&name)
-                                            .await?;
+                                        let chat = match crate::backend::chat::start_with_username(
+                                            &name,
+                                        )
+                                        .await
+                                        {
+                                            Err(p)
+                                                if p.0 == crate::backend::rules::NEEDS_APPROVAL =>
+                                            {
+                                                features::settings::ask_approval();
+                                                return Ok(());
+                                            }
+                                            r => r?,
+                                        };
                                         nav::pop_to_root();
                                         features::chat::open(chat);
                                         Ok(())
