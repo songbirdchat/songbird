@@ -3,7 +3,7 @@
 
 use std::{cell::RefCell, collections::HashMap};
 
-use nsh_core::{element::ImageSrc, prelude::*};
+use nsh_core::element::ImageSrc;
 use songbird_app_core::packs::Pack;
 use songbird_content::pack::Kind;
 

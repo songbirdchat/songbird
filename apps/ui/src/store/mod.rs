@@ -834,16 +834,14 @@ impl Store {
         }
     }
 
-    /// Nudges the other person of a direct chat. The real path: when the
-    /// account is live, `Content.attention {NUDGE}` to their devices
-    /// (`backend::nudge`), which sends nothing until app-core knows them.
-    /// The chat shows it either way. mock: the line in the chat is the
-    /// mock's; a real nudge is not a stored message (PROTOCOL §10.5).
+    /// Nudges the other person of a direct chat. A real chat sends `Content.attention {NUDGE}`
+    /// to their devices (`backend::nudge`, PROTOCOL §10.5) and shows a line here only (a nudge
+    /// is not a stored message); a demo chat shows the line.
     pub fn nudge(&self, chat: ChatId) {
-        if let Some(peer) = self.peer(chat) {
-            let _ = crate::backend::nudge::send(
-                crate::backend::presence::peer_of(*self, peer.id).as_ref(),
-            );
+        if crate::backend::chat::owns(chat) {
+            crate::backend::nudge::send(chat);
+            self.push_message(chat, None, Body::Nudge);
+            return;
         }
         self.send(chat, Body::Nudge, None);
     }

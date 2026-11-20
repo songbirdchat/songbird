@@ -72,6 +72,8 @@ pub trait Net {
     async fn fetch_post(&self, path: &str) -> Result<u16>;
     /// An ephemeral event to one device (typing): never stored, dropped first under pressure.
     async fn ephemeral(&self, device: DeviceIdBytes, payload: Vec<u8>) -> Result<()>;
+    /// An attention event (a nudge) to one device, in the server's attention class (§10.5).
+    async fn attention(&self, device: DeviceIdBytes, payload: Vec<u8>) -> Result<()>;
     /// A group message: one shared body the server fans out to the group's roster (§6.5).
     async fn send_group(
         &self,
@@ -183,6 +185,13 @@ pub enum Received {
     /// A commit in a group broke the group's rules (a change the committer's role does not
     /// allow): this device did not follow it, and stops following the group.
     GroupRulesBroken { group: [u8; 16] },
+    /// A contact's presence (online, away, busy, or offline with last seen; §10.5).
+    Presence {
+        account: [u8; 16],
+        presence: songbird_content::presence::Presence,
+    },
+    /// A contact nudged this account (only from the attention class, [`Messenger::receive_attention`]).
+    Nudge { account: [u8; 16] },
     /// A system notice was handled (prekeys refilled, the device list refreshed).
     System,
     /// Nothing to show (a duplicate, a dropped or unreadable envelope).
@@ -1206,6 +1215,133 @@ impl<N: Net> Messenger<N> {
         }
     }
 
+    /// The contacts presence may reach (§10.5): accounts that shared their profile key, with
+    /// their devices and access keys. Their device lists are read from the store (fetched for an
+    /// account not seen yet).
+    pub async fn presence_peers(&mut self) -> Result<Vec<([u8; 16], Vec<[u8; 16]>, [u8; 16])>> {
+        let mut out = Vec::new();
+        for c in self.store.chats()? {
+            if c.group || c.id == self.local.account {
+                continue;
+            }
+            let Some(key) = self.store.profile_key(&c.id)? else {
+                continue;
+            };
+            if self.store.is_blocked(&c.id)? {
+                continue;
+            }
+            let devices: Vec<[u8; 16]> = match self.devices_of(&c.id, false).await {
+                Ok(d) => d.into_iter().map(|(d, _)| d).collect(),
+                Err(_) => continue,
+            };
+            out.push((c.id, devices, songbird_keys::sealed::access_key(&key)));
+        }
+        Ok(out)
+    }
+
+    /// Seals `content` for one device of `account` in a Signal session (sealed sender): what an
+    /// ephemeral event (presence) or an attention event carries.
+    pub async fn seal_for(
+        &mut self,
+        account: &[u8; 16],
+        device: &[u8; 16],
+        content: &Content,
+    ) -> Result<Vec<u8>> {
+        let (padded, _) = songbird_content::seal(content, None).map_err(|_| Error::Malformed)?;
+        let devices: Vec<([u8; 16], [u8; 32])> = self
+            .devices_of(account, false)
+            .await?
+            .into_iter()
+            .filter(|(d, _)| d == device)
+            .collect();
+        if devices.is_empty() {
+            return Err(Error::Verify);
+        }
+        self.ensure_sessions(account, &devices).await?;
+        let sealed = self
+            .sessions
+            .encrypt(&self.local, &(*account, *device), &padded)?;
+        self.save_sessions_of(account, &devices)?;
+        Ok(sealed)
+    }
+
+    /// This account's presence as a `Content` to seal.
+    pub fn presence_content(p: &songbird_content::presence::Presence) -> Result<Content> {
+        Ok(Content {
+            version: songbird_content::VERSION,
+            required_version: 1,
+            message_id: random::<16>()?.to_vec(),
+            sent_at_ms: now_ms(),
+            body: Some(Body::Presence(p.clone())),
+        })
+    }
+
+    /// Nudges a contact: an attention event sealed for each of their devices (§10.5). The server
+    /// drops it when over a budget, blocked or offline; nothing tells whether it arrived.
+    pub async fn nudge(&mut self, account: &[u8; 16]) -> Result<usize> {
+        let content = Content {
+            version: songbird_content::VERSION,
+            required_version: 1,
+            message_id: random::<16>()?.to_vec(),
+            sent_at_ms: now_ms(),
+            body: Some(Body::Attention(songbird_content::presence::Attention {
+                kind: i32::from(songbird_content::presence::AttentionKind::Nudge),
+            })),
+        };
+        let devices: Vec<[u8; 16]> = self
+            .devices_of(account, false)
+            .await?
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        let mut sent = 0;
+        for d in devices {
+            let sealed = self.seal_for(account, &d, &content).await?;
+            self.net.attention(d, sealed).await?;
+            sent += 1;
+        }
+        Ok(sent)
+    }
+
+    /// An event from the attention class (§10.5): a nudge from a contact. Anything else, and
+    /// anything from a blocked account, is nothing.
+    pub async fn receive_attention(&mut self, envelope: &[u8]) -> Result<Received> {
+        let Ok(inner) = Sessions::open(&self.local, envelope) else {
+            return Ok(Received::Nothing);
+        };
+        let (account, device) = (inner.account, inner.device);
+        if account == self.local.account || self.store.is_blocked(&account)? {
+            return Ok(Received::Nothing);
+        }
+        let identity = self
+            .devices_of(&account, false)
+            .await
+            .ok()
+            .and_then(|v| v.into_iter().find(|(d, _)| *d == device).map(|(_, k)| k));
+        let Ok(dec) = self
+            .sessions
+            .decrypt(&self.local, &mut self.prekeys, inner, identity)
+        else {
+            return Ok(Received::Nothing);
+        };
+        self.store
+            .save_sessions(&self.sessions, &(account, device))?;
+        if dec.new_session {
+            self.store.save_prekeys(&self.prekeys)?;
+        }
+        let Ok(opened) = songbird_content::open(&dec.plaintext) else {
+            return Ok(Received::Nothing);
+        };
+        match opened.content.body {
+            Some(Body::Attention(a))
+                if a.kind == i32::from(songbird_content::presence::AttentionKind::Nudge) =>
+            {
+                Ok(Received::Nudge { account })
+            }
+            _ => Ok(Received::Nothing),
+        }
+    }
+
     /// Whether `id` is one of this device's groups (else a 1:1 chat's account).
     pub fn is_group(&self, id: &[u8; 16]) -> bool {
         self.load_group(id).is_ok()
@@ -1798,6 +1934,10 @@ impl<N: Net> Messenger<N> {
                     ),
                 )
             }
+            Some(Body::Presence(p)) if account != self.local.account => Ok(Received::Presence {
+                account,
+                presence: p.clone(),
+            }),
             Some(Body::Typing(t)) if account != self.local.account => Ok(Received::Typing {
                 account,
                 started: t.started,

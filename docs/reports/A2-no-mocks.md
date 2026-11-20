@@ -41,6 +41,8 @@ Status: ☐ open · ☑ done (with the commit).
 
 - ☑ Sticker packs from links, installed packs in the picker, stickers in real chats (D-0159)
 
+- ☑ Broadcast lists send; presence and nudges to real contacts (D-0160)
+
 ## Open, by what they need
 
 **a (app only, or an existing endpoint):**
@@ -51,8 +53,6 @@ Status: ☐ open · ☑ done (with the commit).
 - lock chat unlocked with the app passcode
 
 **b (app-core):**
-- broadcast lists
-- presence and nudges to contacts
 - security notifications (KT)
 - chat list state synced (records)
 - network usage counted

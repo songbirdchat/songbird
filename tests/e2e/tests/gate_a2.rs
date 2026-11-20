@@ -150,6 +150,17 @@ impl Net for TestNet {
             .map_err(|_| songbird_app_core::Error::Network)
     }
 
+    async fn attention(
+        &self,
+        device: DeviceIdBytes,
+        payload: Vec<u8>,
+    ) -> songbird_app_core::Result<()> {
+        self.ws
+            .attention(DeviceId::from_bytes(device), Bytes::from(payload))
+            .await
+            .map_err(|_| songbird_app_core::Error::Network)
+    }
+
     async fn send(
         &self,
         idempotency_key: [u8; 16],
@@ -1790,6 +1801,11 @@ async fn a_view_once_photo_is_shown_once_then_gone() {
 
 /// Makes a sticker pack on the server as a pack creator's app would (P06's construction):
 /// answers its link.
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    reason = "test sizes and 6-bit indices"
+)]
 async fn make_pack(p: &Person, assets: &[Vec<u8>]) -> String {
     use songbird_app_core::messenger::Net as _;
     use songbird_content::attachment::{self, Suite};
@@ -1951,4 +1967,69 @@ async fn sticker_packs_install_from_a_link_and_stickers_travel() {
     // Removing it.
     bob.core.remove_pack(&pack.id).unwrap();
     assert!(bob.core.packs().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn presence_and_nudges_reach_contacts_sealed() {
+    use songbird_app_core::messenger::Net as _;
+    use songbird_content::presence::{Presence, State};
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    // Contacts both ways (each holds the other's profile key).
+    alice.core.send_text(&bob.account, "hi").await.unwrap();
+    assert!(matches!(pump_app(&mut bob).await, Received::Message(_)));
+    bob.core.send_text(&alice.account, "hi").await.unwrap();
+    let mut got = pump_app(&mut alice).await;
+    while !matches!(got, Received::Message(_)) {
+        got = pump_app(&mut alice).await;
+    }
+    // Presence reaches exactly the contacts who shared their profile key, with their devices.
+    let peers = alice.core.presence_peers().await.unwrap();
+    assert_eq!(peers.len(), 1);
+    let (account, devices, _) = &peers[0];
+    assert_eq!(*account, bob.account);
+    let p = Presence {
+        state: State::Online.into(),
+        last_seen_ms: 0,
+        wants_reply: true,
+    };
+    let content = Messenger::<TestNet>::presence_content(&p).unwrap();
+    let sealed = alice
+        .core
+        .seal_for(&bob.account, &devices[0], &content)
+        .await
+        .unwrap();
+    alice
+        .core
+        .net()
+        .ephemeral(devices[0], sealed)
+        .await
+        .unwrap();
+    assert_eq!(
+        next_ephemeral(&mut bob).await,
+        Received::Presence {
+            account: alice.account,
+            presence: p
+        }
+    );
+    // A nudge goes in the attention class and is taken only from there.
+    assert_eq!(alice.core.nudge(&bob.account).await.unwrap(), 1);
+    let payload = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), bob.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let Event::Attention { payload } = ev {
+            break payload;
+        }
+    };
+    assert_eq!(
+        bob.core.receive_attention(&payload).await.unwrap(),
+        Received::Nudge {
+            account: alice.account
+        }
+    );
+    // The same payload as an ordinary event is no nudge.
+    assert_eq!(bob.core.receive(&payload).await.unwrap(), Received::Nothing);
 }

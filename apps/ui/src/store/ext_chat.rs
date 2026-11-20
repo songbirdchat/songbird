@@ -197,11 +197,13 @@ impl Store {
         });
     }
 
-    /// The other person nudges back a moment after the user nudges them
-    /// (mock: shows the incoming nudge and its shake).
-    // mock: a real nudge arrives from the network.
+    /// Nudges; in a demo chat the other person nudges back a moment later (a real chat's
+    /// nudges arrive from the network, `backend::chat::nudged`).
     pub fn nudge_with_echo(&self, chat: ChatId) {
         self.nudge(chat);
+        if crate::backend::chat::owns(chat) {
+            return;
+        }
         let store = *self;
         set_timeout(Duration::from_millis(2600), move || {
             if let Some(peer) = store.peer(chat).filter(|p| !p.nudges_off && !p.blocked) {

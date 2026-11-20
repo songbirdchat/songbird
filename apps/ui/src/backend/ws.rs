@@ -112,6 +112,10 @@ pub fn connect() {
                     Event::Ephemeral { payload } => {
                         let _ = super::chat::receive(&payload).await;
                     }
+                    // Nudges: taken only from the attention class (§10.5).
+                    Event::Attention { payload } => {
+                        super::chat::receive_attention(&payload).await;
+                    }
                     Event::Disconnected { .. } => live().update(|l| l.link = Link::Retrying),
                     Event::Failed { code } => {
                         live().update(|l| {

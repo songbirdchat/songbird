@@ -127,9 +127,14 @@ pub fn broadcasts() {
         let creating = signal(false);
         let name = signal(String::new());
         let chosen = signal(Vec::<ContactId>::new());
+        let sending = signal(None::<u64>);
+        let send_open = signal(false);
+        let draft = signal(String::new());
         let people = s.contacts.with_untracked(|cs| {
             cs.iter()
-                .filter(|c| !c.blocked && c.id < 16)
+                .filter(|c| {
+                    !c.blocked && (crate::store::demo() || crate::backend::chat::owns(c.id))
+                })
                 .map(|c| (c.id, c.name.clone()))
                 .collect::<Vec<_>>()
         });
@@ -148,6 +153,10 @@ pub fn broadcasts() {
                         Row::new(b.name.clone())
                             .icon(Icon::Megaphone)
                             .subtitle(names.join(", "))
+                            .on_press(move || {
+                                sending.set(Some(id));
+                                send_open.set(true);
+                            })
                             .trailing(
                                 icon_btn(Icon::Trash, format!("Delete {}", b.name), move || s.delete_broadcast(id))
                                     .text_color(move || c::destructive()),
@@ -164,6 +173,30 @@ pub fn broadcasts() {
                 BtnSize::Md,
                 move || creating.set(true),
             )))
+            .child(app_sheet(
+                send_open,
+                "Send to the list",
+                view()
+                    .gap_3()
+                    .px_4()
+                    .pb_4()
+                    .child(field("Message", draft).max_length(4_000))
+                    .child(
+                        btn("Send to each person", Variant::Primary, BtnSize::Lg, move || {
+                            let Some(id) = sending.get_untracked() else { return };
+                            let text = draft.get_untracked().trim().to_string();
+                            let (sent, skipped) = s.send_broadcast(id, &text);
+                            draft.set(String::new());
+                            sending.set(None);
+                            send_open.set(false);
+                            toast(match (sent, skipped) {
+                                (n, 0) => format!("Sent to {n} people"),
+                                (n, k) => format!("Sent to {n}; {k} haven't saved you as a contact"),
+                            });
+                        })
+                        .disabled(move || draft.with(|d| d.trim().is_empty())),
+                    ),
+            ))
             .child(app_sheet(
                 creating,
                 "New broadcast list",

@@ -183,8 +183,7 @@ fn open_broadcast() {
     });
 }
 
-/// Picks two or more recipients. The real app makes a broadcast list
-/// (A6); the mock confirms and goes back.
+/// Picks two or more recipients and makes a broadcast list of them.
 fn broadcast() -> impl IntoElement {
     let s = store();
     let picked = signal(HashSet::<ContactId>::new());
@@ -275,9 +274,17 @@ fn broadcast() -> impl IntoElement {
                 )
                 .child(
                     btn("Create", Variant::Primary, BtnSize::Md, move || {
-                        let n = count();
+                        let members: Vec<ContactId> = picked.with_untracked(|p| p.iter().copied().collect());
+                        let n = members.len();
+                        let name = members
+                            .iter()
+                            .take(3)
+                            .map(|m| s.contact_name(Some(*m)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        s.create_broadcast(name, members);
                         nav::pop();
-                        toast(format!("Broadcast list created with {n} people"));
+                        toast(format!("Broadcast list created with {n} people. Send to it from You → Broadcast lists."));
                     })
                     .disabled(move || count() < 2),
                 ),

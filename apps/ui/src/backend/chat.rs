@@ -120,6 +120,8 @@ pub fn ui_id(bytes: &[u8; 16]) -> u64 {
 }
 
 thread_local! {
+    /// Whether presence's contacts are read again periodically.
+    static PRESENCE_TIMER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Whether the disappearing-message sweep runs.
     static SWEEPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Real groups by UI chat ID (D-0146).
@@ -595,6 +597,18 @@ impl Net for AppNet {
             .map_err(|_| songbird_app_core::Error::Network)
     }
 
+    async fn attention(
+        &self,
+        device: DeviceIdBytes,
+        payload: Vec<u8>,
+    ) -> songbird_app_core::Result<()> {
+        let client = super::ws::client().ok_or(songbird_app_core::Error::Network)?;
+        client
+            .attention(DeviceId::from_bytes(device), payload.into())
+            .await
+            .map_err(|_| songbird_app_core::Error::Network)
+    }
+
     async fn send(
         &self,
         idempotency_key: [u8; 16],
@@ -705,6 +719,17 @@ pub async fn start() -> Result<(), super::Problem> {
         show_all(s, &m);
     }
     super::calls::show_links(&m);
+    if let Some(s) = crate::store::try_store() {
+        super::presence::refresh(s);
+        // New contacts (a profile key shared since) start getting presence within minutes.
+        if !PRESENCE_TIMER.replace(true) {
+            Owner::detached().run(|| {
+                set_interval(std::time::Duration::from_secs(300), move || {
+                    super::presence::refresh(s);
+                });
+            });
+        }
+    }
     super::packs::show(&m);
     clear_media_cache();
     // Disappearing messages go on time, even with the app left open.
@@ -1429,6 +1454,11 @@ pub async fn receive(envelope: &[u8]) -> bool {
                     ),
                 );
             }
+            true
+        }
+        Ok(Received::Presence { account, presence }) => {
+            drop(guard);
+            super::presence::received(account, &presence);
             true
         }
         Ok(Received::TimerChanged { chat, by, secs }) => {
@@ -2314,6 +2344,58 @@ pub fn send_sticker(
             }
         }
     });
+}
+
+/// Whether a real contact saved the user (shared their profile key): only they get broadcasts.
+pub fn is_contact(chat: ChatId) -> bool {
+    let Some(account) = account_of(chat) else {
+        return false;
+    };
+    let lock = core();
+    let Ok(guard) = lock.try_lock() else {
+        return true;
+    };
+    guard
+        .as_ref()
+        .and_then(|m| m.store.profile_key(&account).ok().flatten())
+        .is_some()
+}
+
+/// Sends a nudge to a real chat's other person.
+pub fn nudge(chat: ChatId) {
+    let Some(account) = account_of(chat) else {
+        return;
+    };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        m.nudge(&account)
+            .await
+            .map(|_| ())
+            .map_err(|_| super::problem("The nudge couldn't be sent."))
+    });
+}
+
+/// An attention event (a nudge) from the delivery connection.
+pub async fn receive_attention(payload: &[u8]) {
+    let lock = core();
+    let mut guard = lock.lock().await;
+    let Some(m) = guard.as_mut() else { return };
+    if let Ok(Received::Nudge { account }) = m.receive_attention(payload).await {
+        drop(guard);
+        if let Some(s) = crate::store::try_store() {
+            let chat = ui_id(&account);
+            // Nudges off (globally or for them), or blocked: nothing shows.
+            let allowed = s.settings.with_untracked(|x| x.nudges)
+                && s.contact(chat).is_some_and(|c| !c.nudges_off && !c.blocked);
+            if owns(chat) && allowed {
+                s.push_message(chat, Some(chat), Body::Nudge);
+            }
+        }
+    }
 }
 
 /// Marks every real chat read (Chats → Mark all as read).

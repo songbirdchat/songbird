@@ -199,6 +199,35 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0160 — Broadcast lists, presence and nudges on the real backend
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Broadcast lists** send: a list's message goes to each person separately, as a 1:1
+    message in their chat with the user, and only to people who shared their profile key (the
+    lists' own promise: "only people who saved you as a contact get it"); the others are counted
+    and named in the toast. Lists can hold real contacts (the picker offered only demo ones), and
+    New chat → New broadcast list now makes the list it announced. Sending each person a direct
+    message (rather than one send in the broadcast lane) keeps each copy in its own chat; the
+    broadcast lane's single send is not used yet.
+  - **Presence** (§10.5): the presence rules already in the app (`Presencer`) now reach real
+    contacts: app-core lists the contacts who shared their profile key with their devices and
+    access keys (`presence_peers`), seals each payload for each device in its Signal session
+    (`seal_for`), and the app sends the sealed batch as before. Presence received updates the
+    contact, and a contact who asks gets one answer. The contacts are read when app-core opens
+    and every five minutes.
+  - **Nudges** go sealed per device in the attention class (`Messenger::nudge`, new
+    `Net::attention`), and are taken only from it (`receive_attention`): the same payload as an
+    ordinary ephemeral event is not a nudge. A nudge shows unless nudges are off globally or for
+    that person, or they are blocked. A real nudge is a line in the chat, never a stored message;
+    the demo's "nudge back" stays in demo chats only.
+- Evidence: `gate_a2::presence_and_nudges_reach_contacts_sealed` (presence reaches exactly the
+  contact who shared a profile key; a sealed presence arrives as it was sent; a nudge arrives
+  only through the attention class) and the whole A2 gate (18); `apps/ui` 213 tests.
+- Not exercised: `PUT /v1/ephemeral/sealed` from the app (P09's gate covers the endpoint).
+
 ## D-0159 — Sticker packs on the device; stickers in real chats
 
 - Date: 2026-11-20

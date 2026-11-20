@@ -591,6 +591,30 @@ impl Store {
         self.ext_update(|x| x.broadcasts.push(Broadcast { id, name, members }));
     }
 
+    /// Sends `text` to each person on broadcast list `id`, separately, in their chat with the
+    /// user. In real chats only people who saved the user as a contact (they shared their
+    /// profile key) get it; answers (sent, left out).
+    pub fn send_broadcast(&self, id: u64, text: &str) -> (usize, usize) {
+        let members = self.ext().with_untracked(|x| {
+            x.broadcasts
+                .iter()
+                .find(|b| b.id == id)
+                .map(|b| b.members.clone())
+                .unwrap_or_default()
+        });
+        let (mut sent, mut skipped) = (0, 0);
+        for m in members {
+            let chat = self.direct_chat(m);
+            if crate::backend::chat::owns(chat) && !crate::backend::chat::is_contact(chat) {
+                skipped += 1;
+                continue;
+            }
+            self.send(chat, super::Body::Text(text.to_owned()), None);
+            sent += 1;
+        }
+        (sent, skipped)
+    }
+
     pub fn delete_broadcast(&self, id: u64) {
         self.ext_update(|x| x.broadcasts.retain(|b| b.id != id));
     }
