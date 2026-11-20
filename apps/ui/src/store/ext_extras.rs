@@ -374,7 +374,20 @@ impl Store {
         extras().update(|e| e.cancels_at_period_end = true);
     }
 
+    /// Turns renewal back on while the paid period lasts (D-0169): billing starts a new
+    /// subscription whose first charge is the day the period would have renewed.
     pub fn resume_renewal(&self) {
+        if live_ready() {
+            crate::backend::run(async move {
+                crate::backend::plans::resume().await?;
+                extras().update(|e| e.cancels_at_period_end = false);
+                crate::ui::toast(
+                    "Renewal is back on. Nothing is charged before your plan would renew.",
+                );
+                Ok(())
+            });
+            return;
+        }
         extras().update(|e| e.cancels_at_period_end = false);
     }
 

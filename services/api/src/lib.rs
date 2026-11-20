@@ -1090,6 +1090,7 @@ impl App {
                 t.history(&self.registry, &self.hot, &account, &body).await
             }
             (&Method::POST, "/v1/kt/audit") => t.audit(&self.hot, &account, &body).await,
+            (&Method::POST, "/v1/kt/roots") => t.roots(&self.hot, &account, &body).await,
             _ => return Err(Refusal::Status(StatusCode::NOT_FOUND)),
         };
         Ok(match out {

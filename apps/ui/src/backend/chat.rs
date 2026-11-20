@@ -736,6 +736,10 @@ pub async fn start() -> Result<(), super::Problem> {
     }
     super::calls::show_links(&m);
     if let Some(s) = crate::store::try_store() {
+        // A crash report from last time, sent only if the user allows them (D-0170).
+        super::crash::flush(s);
+    }
+    if let Some(s) = crate::store::try_store() {
         super::chat_state::reload(s);
     }
     if let Some(s) = crate::store::try_store() {

@@ -780,6 +780,7 @@ What the directory records about each account:
 | `POST /v1/kt/lookup` | `{"account": hex, "kind": "identity" \| "device_list" \| "username"}` | 200 `{"salt", "head", "proof"}`; 404 (nothing published); 400; 429 |
 | `POST /v1/kt/history` | the same | 200 `{"salt", "head", "most_recent": 64, "proof"}`; 404; 400; 429 |
 | `POST /v1/kt/audit` | `{"from", "to"}` (at most 1,000 epochs apart) | 200 `{"proof"}`; 400 for epochs out of order or beyond the directory; 429 |
+| `POST /v1/kt/roots` | the same | 200 `{"roots": [hex, …]}`, every epoch's root from `from` to `to` as the publisher recorded it (D-0171); 404 if one is missing; 400; 429 |
 
 **What clients do** (with `akd_core`'s verifiers, `lookup_verify`, `key_history_verify` and
 `audit_verify`):
@@ -788,7 +789,8 @@ What the directory records about each account:
 - Before trusting a contact's identity key or device list, verify a lookup proof for the
   contact's label (`kind || account`) against a verified head. The proven value must equal
   `HMAC(salt, context || kind || SHA-256(key or list in hand))`.
-- Verify an audit proof between the last head seen and a newer one. Two signed heads that no audit
+- Verify an audit proof between the last head seen and a newer one, with every root in between
+  from `/v1/kt/roots` (the first and last must be the two signed heads' roots; D-0171). Two signed heads that no audit
   proof joins are evidence of a fork: show it and stop trusting the server.
 - Owners check their own key history regularly. A version they did not publish is the warning.
 
@@ -2966,6 +2968,7 @@ providers' credentials. It never sees an account.
 | `POST /v1/billing/mollie/checkout` | the app | `{"plan": "plus" \| "family", "interval": "month" \| "year", "subscriber": <64 hex>}` | 200 `{"checkout": <Mollie URL>}`; 409 `exists`; 409 `revoked` (refunded or charged back: the app starts over with a new subscriber secret) |
 | `POST /v1/billing/mollie/webhook` | Mollie | `id=tr_…` (form) | 200 (unknown IDs too); 503 retry |
 | `POST /v1/billing/mollie/state`, `/cancel` | the app | `{"subscriber"}` | state `{"plan", "interval", "paid_through", "renews", "revoked"}`; cancel 204; 404 |
+| `POST /v1/billing/mollie/resume` | the app | `{"subscriber"}` | 204: a new subscription on the customer's mandate, its first charge the day the paid period would renew (D-0169); 404; 409 `revoked`, `expired`, `renews`, `mandate` |
 
 **Rows.** `sub` under `HMAC(billing secret, provider ‖ 0 ‖ ID)[..16]`, where the ID is Apple's
 original transaction ID, Google's purchase token, or the app's Mollie subscriber secret: the

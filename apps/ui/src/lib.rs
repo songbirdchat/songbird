@@ -89,6 +89,8 @@ fn camera_components_linux(components: &nsh_platform_linux::Components) {
 /// or the app, and the layers over everything (calls, toasts).
 #[component]
 pub fn App() -> impl IntoElement {
+    // A panic leaves a scrubbed report on this device (sent only if allowed; D-0170).
+    backend::crash::install();
     let s = Store::new();
     store::install(s);
     // Settings saved on this device, and the encrypted records synced from

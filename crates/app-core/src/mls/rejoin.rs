@@ -119,12 +119,10 @@ impl<N: Net> Messenger<N> {
         gid: &[u8; 16],
         group: &MlsGroup,
         staged: &StagedCommit,
-    ) -> bool {
-        let Some(leaf) = staged.update_path_leaf_node() else {
-            return false;
-        };
+    ) -> Option<[u8; 16]> {
+        let leaf = staged.update_path_leaf_node()?;
         let Ok(device) = DeviceId::from_slice(leaf.credential().serialized_content()) else {
-            return false;
+            return None;
         };
         let in_group = group
             .members()
@@ -141,14 +139,14 @@ impl<N: Net> Messenger<N> {
         )
         .ok();
         if in_group || removed.is_none_or(|r| !r.is_empty()) {
-            return false;
+            return None;
         }
         let devices: BTreeSet<[u8; 16]> = group
             .members()
             .filter_map(|m| <[u8; 16]>::try_from(m.credential.serialized_content()).ok())
             .collect();
         let Ok(accounts) = self.member_accounts(gid, &devices).await else {
-            return false;
+            return None;
         };
         let accounts: BTreeSet<[u8; 16]> = accounts.into_values().collect();
         for a in accounts {
@@ -157,9 +155,81 @@ impl<N: Net> Messenger<N> {
                 .await
                 .is_ok_and(|v| v.iter().any(|(d, _)| d == device.as_bytes()))
             {
-                return true;
+                return Some(a);
             }
         }
-        false
+        None
+    }
+
+    /// After this account's new device joined: hands it the change log's key and the group's
+    /// title (a member's device has both; the tree carries neither), then removes this
+    /// account's leaves whose devices it no longer lists (a reinstalled phone's old leaf).
+    pub(crate) async fn after_own_join(&mut self, gid: &[u8; 16]) {
+        use songbird_content::schema::{DataMessage, GroupUpdate, data_message, group_update};
+        if let Ok(Some(key)) = self.log_key(gid) {
+            let update = GroupUpdate {
+                kind: group_update::Kind::DeviceJoined.into(),
+                actor: self.local.account.to_vec(),
+                subjects: Vec::new(),
+                value: self.group_title(gid).unwrap_or_default(),
+                log_key: key.to_vec(),
+            };
+            let data = DataMessage {
+                group_id: gid.to_vec(),
+                kind: Some(data_message::Kind::GroupUpdate(update)),
+                ..Default::default()
+            };
+            let _ = self.send_group_data(gid, data, "").await;
+        }
+        let _ = self.prune_own_dead_leaves(gid).await;
+    }
+
+    /// Removes the leaves in `gid` whose devices no member account's signed device list names
+    /// any more (a reinstalled or unlinked device's old leaf), this account's own list read
+    /// fresh. Only lists this device verifies count, so the server can't make it remove a
+    /// device someone still lists. Answers how many went.
+    ///
+    /// # Errors
+    /// The server or the commit refused.
+    pub async fn prune_own_dead_leaves(&mut self, gid: &[u8; 16]) -> Result<usize> {
+        let me = self.local.account;
+        let mut listed: BTreeSet<[u8; 16]> = self
+            .devices_of(&me, true)
+            .await?
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
+        let group = self.load_group(gid)?;
+        let devices: BTreeSet<[u8; 16]> = group
+            .members()
+            .filter_map(|m| <[u8; 16]>::try_from(m.credential.serialized_content()).ok())
+            .collect();
+        let accounts: BTreeSet<[u8; 16]> = self
+            .member_accounts(gid, &devices)
+            .await?
+            .into_values()
+            .filter(|a| *a != me)
+            .collect();
+        for a in accounts {
+            // A fresh read: a device another account just linked must not look dead.
+            for (d, _) in self.devices_of(&a, true).await? {
+                listed.insert(d);
+            }
+        }
+        let own = self.local.device;
+        let dead: Vec<LeafNodeIndex> = group
+            .members()
+            .filter(|m| {
+                <[u8; 16]>::try_from(m.credential.serialized_content())
+                    .is_ok_and(|d| !listed.contains(&d) && d != own)
+            })
+            .map(|m| m.index)
+            .collect();
+        if dead.is_empty() {
+            return Ok(0);
+        }
+        let n = dead.len();
+        self.commit(gid, Vec::new(), dead, None).await?;
+        Ok(n)
     }
 }

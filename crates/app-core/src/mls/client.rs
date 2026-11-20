@@ -439,7 +439,7 @@ impl<N: Net> Messenger<N> {
     }
 
     /// One commit with adds and removals (and any queued proposals), sent and merged on 200.
-    async fn commit(
+    pub(crate) async fn commit(
         &mut self,
         gid: &[u8; 16],
         adds: Vec<KeyPackage>,
@@ -1117,9 +1117,12 @@ impl<N: Net> Messenger<N> {
                 // member account's new device (§6.3 rule 5, D-0167), checked against the signed
                 // device lists of the accounts in the group.
                 let by_link = join && Self::join_allowed(&group, &staged, &aad, from_epoch);
-                let own_device =
-                    join && !by_link && self.own_account_join(&gid, &group, &staged).await;
-                if join && !by_link && !own_device {
+                let own_device = if join && !by_link {
+                    self.own_account_join(&gid, &group, &staged).await
+                } else {
+                    None
+                };
+                if join && !by_link && own_device.is_none() {
                     return Ok(Received::Nothing);
                 }
                 let ds = self
@@ -1162,8 +1165,12 @@ impl<N: Net> Messenger<N> {
                 // Who is who now, while this device may still ask (a later commit removing a
                 // member is checked from it).
                 self.warm_accounts(&gid, &group).await;
-                if own_device {
-                    // A member's new device: the same person, no line in the chat.
+                if let Some(account) = own_device {
+                    // A member's new device: the same person, no line in the chat. This
+                    // account's own devices hand it what it can't read from the tree (D-0171).
+                    if account == self.local.account {
+                        self.after_own_join(&gid).await;
+                    }
                     return Ok(Received::System);
                 }
                 if join {
@@ -1353,7 +1360,7 @@ fn log_aad(gid: &[u8; 16], from_epoch: u64) -> Vec<u8> {
 
 /// The member accounts a `/v1/groups/state` answer ends with (D-0155): after `epoch | info |
 /// tree | meta_v | meta`, `n u16 | n × (device | account)`. An answer without them names none.
-fn state_accounts(state: &[u8]) -> Result<Vec<([u8; 16], [u8; 16])>> {
+pub(crate) fn state_accounts(state: &[u8]) -> Result<Vec<([u8; 16], [u8; 16])>> {
     let mut r = crate::crypto::Reader::new(state);
     let _epoch = r.u64()?;
     let _info = r.bytes32(4 << 20)?;

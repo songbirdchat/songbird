@@ -355,6 +355,9 @@ message GroupUpdate {
     KIND_SETTINGS_CHANGED = 10;
     KIND_CHANNEL_CREATED = 11;
     KIND_CHANNEL_SUBSCRIBERS_CHANGED = 12;
+    // A member account's own new device joined (D-0171): no line in the chat; carries the
+    // title and the change log's key from the account's other device.
+    KIND_DEVICE_JOINED = 13;
   }
   Kind kind = 1;
   bytes actor = 2;              // 16 bytes

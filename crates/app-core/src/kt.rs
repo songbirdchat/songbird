@@ -12,14 +12,24 @@
 //! - **Notices**: new devices on a known account, a list the log contradicts, and a fork are
 //!   queued here for the app to show ([`Messenger::take_notices`]).
 //!
-//! Audit proofs between heads need every epoch's root, which the server does not serve one by
-//! one: auditors check those (`POST /v1/kt/audit`); apps rely on forward-only heads.
+//! - **Audits** (D-0171): when the newest head moves forward, the device checks akd's
+//!   append-only proof from the head it kept to the new one, with every epoch's root in between
+//!   (`POST /v1/kt/roots`), whose two ends must be the signed heads' roots. A proof that fails is
+//!   a fork.
+//! - **The log's keys** come with release builds (`SONGBIRD_KT_LOG_KEY`, `SONGBIRD_KT_VRF_KEY`
+//!   at build time); a development build without them trusts the first keys it reads.
 
 use akd::proto::specs::types as pb;
 use protobuf::Message as _;
 
 use crate::messenger::{Messenger, Net, hex, json, unhex};
 use crate::{Error, Result};
+
+/// The log's keys this build trusts (hex), set at build time for releases.
+const SHIPPED_LOG_KEY: Option<&str> = option_env!("SONGBIRD_KT_LOG_KEY");
+const SHIPPED_VRF_KEY: Option<&str> = option_env!("SONGBIRD_KT_VRF_KEY");
+/// The most epochs one audit request spans (the server's limit).
+const AUDIT_SPAN: u64 = 1_000;
 
 /// The directory's kind code for device lists.
 const DEVICE_LIST: u8 = 2;
@@ -132,8 +142,16 @@ impl<N: Net> Messenger<N> {
             .unwrap_or_default())
     }
 
-    /// The log's (VRF key, log key), pinned on first read.
+    /// The log's (VRF key, log key): the build's, or in a development build without them, the
+    /// first ones read (pinned).
     async fn kt_keys(&mut self) -> Result<(Vec<u8>, [u8; 32])> {
+        if let (Some(log), Some(vrf)) = (SHIPPED_LOG_KEY, SHIPPED_VRF_KEY) {
+            return Ok((crate::messenger::unhex_vec(vrf)?, unhex(log)?));
+        }
+        if !cfg!(debug_assertions) {
+            // A release build without its keys checks nothing rather than trusting the server.
+            return Err(Error::Verify);
+        }
         if let Some(k) = self.store.secret("kt_keys")?
             && k.len() > 32
         {
@@ -159,8 +177,8 @@ impl<N: Net> Messenger<N> {
     }
 
     /// Checks a head and keeps the newest: an older epoch, or the same epoch with another
-    /// root, is a fork.
-    fn accept_head(&self, epoch: u64, root: [u8; 32]) -> Result<()> {
+    /// root, is a fork; a newer one must follow from the kept one by an audit proof.
+    async fn accept_head(&mut self, epoch: u64, root: [u8; 32]) -> Result<()> {
         if let Some(h) = self.store.secret("kt_head")?
             && h.len() == 40
         {
@@ -180,10 +198,79 @@ impl<N: Net> Messenger<N> {
             if epoch == seen {
                 return Ok(());
             }
+            match self.audit(seen, seen_root, epoch, root).await {
+                Ok(()) => {}
+                Err(Error::Verify) => {
+                    self.notice(Notice::Fork)?;
+                    return Err(Error::Verify);
+                }
+                // Not checkable now (offline, throttled): the old head stays, checked next time.
+                Err(e) => return Err(e),
+            }
         }
         let mut b = epoch.to_be_bytes().to_vec();
         b.extend_from_slice(&root);
         self.store.put_secret("kt_head", &b)
+    }
+
+    /// Checks that epoch `to` (root `to_root`) extends epoch `from` (root `from_root`): akd's
+    /// append-only proofs over every epoch's root, a span at a time.
+    async fn audit(
+        &mut self,
+        from: u64,
+        from_root: [u8; 32],
+        to: u64,
+        to_root: [u8; 32],
+    ) -> Result<()> {
+        let mut start = from;
+        let mut start_root = from_root;
+        while start < to {
+            let end = to.min(start + AUDIT_SPAN);
+            let body = serde_json::json!({ "from": start, "to": end })
+                .to_string()
+                .into_bytes();
+            let (status, b) = self.net.api("POST", "/v1/kt/roots", body.clone()).await?;
+            if status != 200 {
+                return Err(Error::Server(status));
+            }
+            let v = json(&b)?;
+            let roots: Vec<[u8; 32]> = v
+                .get("roots")
+                .and_then(serde_json::Value::as_array)
+                .ok_or(Error::Malformed)?
+                .iter()
+                .map(|r| unhex::<32>(r.as_str().unwrap_or_default()))
+                .collect::<Result<_>>()?;
+            let want_end = if end == to { Some(to_root) } else { None };
+            if roots.first() != Some(&start_root)
+                || want_end.is_some_and(|r| roots.last() != Some(&r))
+                || u64::try_from(roots.len()).ok() != Some(end - start + 1)
+            {
+                return Err(Error::Verify);
+            }
+            let (status, b) = self.net.api("POST", "/v1/kt/audit", body).await?;
+            if status != 200 {
+                return Err(Error::Server(status));
+            }
+            let v = json(&b)?;
+            let proof = crate::messenger::unhex_vec(
+                v.get("proof")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            )?;
+            if proof.len() > 64 << 20 {
+                return Err(Error::Malformed);
+            }
+            let proof =
+                pb::AppendOnlyProof::parse_from_bytes(&proof).map_err(|_| Error::Malformed)?;
+            let proof = akd::AppendOnlyProof::try_from(&proof).map_err(|_| Error::Malformed)?;
+            akd::auditor::audit_verify::<akd::WhatsAppV1Configuration>(roots.clone(), proof)
+                .await
+                .map_err(|_| Error::Verify)?;
+            start_root = *roots.last().ok_or(Error::Malformed)?;
+            start = end;
+        }
+        Ok(())
     }
 
     /// Checks that the log publishes exactly `list` (its signed bytes) as `account`'s device
@@ -210,7 +297,7 @@ impl<N: Net> Messenger<N> {
         let head = crate::messenger::unhex_vec(s("head"))?;
         let proof = crate::messenger::unhex_vec(s("proof"))?;
         let (epoch, root) = open_head(&head, &log)?;
-        self.accept_head(epoch, root)?;
+        self.accept_head(epoch, root).await?;
         if proof.len() > 4 << 20 {
             return Err(Error::Malformed);
         }

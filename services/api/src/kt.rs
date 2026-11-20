@@ -9,6 +9,7 @@
 //! | `POST /v1/kt/lookup` | `{"account", "kind"}` → the salt, the signed head, a lookup proof |
 //! | `POST /v1/kt/history` | `{"account", "kind"}` → the salt, the signed head, a history proof (newest 64) |
 //! | `POST /v1/kt/audit` | `{"from", "to"}` → an append-only proof between two epochs (at most 1,000 apart) |
+//! | `POST /v1/kt/roots` | `{"from", "to"}` → every epoch's root from `from` to `to`, for the audit (D-0171) |
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -270,6 +271,28 @@ impl Transparency {
                 Err(_) => Outcome::Unavailable,
             },
             Err(_) => Outcome::NotFound,
+        }
+    }
+
+    /// `POST /v1/kt/roots`: the roots of epochs `from..=to` as the publisher recorded them, so a
+    /// device can check an audit proof between two signed heads (D-0171). Unsigned: the proof
+    /// ties each root to the next, and the two ends to signed heads.
+    pub async fn roots(&self, hot: &ValkeyConn, requester: &AccountId, body: &[u8]) -> Outcome {
+        if let Err(o) = self.throttle(hot, requester).await {
+            return o;
+        }
+        let Ok(b) = serde_json::from_slice::<AuditBody>(body) else {
+            return Outcome::Malformed("request");
+        };
+        if b.from == 0 || b.from >= b.to || b.to - b.from > MAX_AUDIT_SPAN {
+            return Outcome::Malformed("epochs");
+        }
+        match self.store.roots(b.from, b.to).await {
+            Ok(Some(r)) => Outcome::Json(serde_json::json!({
+                "roots": r.iter().map(hex::encode).collect::<Vec<_>>(),
+            })),
+            Ok(None) => Outcome::NotFound,
+            Err(_) => Outcome::Unavailable,
         }
     }
 

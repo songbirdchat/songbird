@@ -532,6 +532,7 @@ pub mod group_update {
         SettingsChanged = 10,
         ChannelCreated = 11,
         ChannelSubscribersChanged = 12,
+        DeviceJoined = 13,
     }
 }
 

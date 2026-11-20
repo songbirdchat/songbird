@@ -199,6 +199,55 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0171 — Audits on the device; the new device gets the log key; dead leaves go
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Audits.** The KT publisher records every epoch's root as it publishes (and the current
+    one first on each pass, so a crash leaves no gap); `POST /v1/kt/roots` serves them. When a
+    device's head moves forward it checks akd's append-only proof over those roots, whose two
+    ends must be the signed heads' roots; a failure is a fork, noticed and refused.
+  - **Pinned log keys.** Release builds carry the log and VRF keys
+    (`SONGBIRD_KT_LOG_KEY`, `SONGBIRD_KT_VRF_KEY` at build time); a release without them checks
+    nothing rather than trust the server. Development builds pin the first keys they read.
+  - **The new device's log key and title.** When a member account's new device joins, that
+    account's other devices send a `DEVICE_JOINED` group update (a new kind, 13) carrying the
+    change log's key and the title; no line shows.
+  - **Dead leaves.** After following its account's new device, a device removes every leaf
+    whose device no member account's signed list names (read fresh), never its own. Only lists
+    it verifies count, so the server can't make it remove a device someone still lists.
+- Consequences: the D-0167 and D-0168 gaps are closed. Calls through the proxy, keychain storage
+  of device secrets, and client-side parental rules on modified phones stay as they were.
+
+## D-0170 — Crash reports: opt-in, scrubbed, sealed, unlinked
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: a panic hook writes one report on the device: version, platform, the UTC day, the
+  panic's message and place, and Songbird's own function names on the stack, each scrubbed
+  (quoted text, IDs, long numbers, tokens, usernames, emails, URLs and paths replaced; only a
+  `.rs` file name and line kept). At the next start it goes only if "Send crash reports" is on,
+  as an **unsigned** support ticket of kind `crash` sealed to the support key (the server
+  keeps ciphertext, no account, no device; signed crash tickets are refused); either way the
+  file is deleted. The support channel's throttle and 90-day deletion apply.
+- Consequences: staff read crash reports with the support key, like tickets.
+
+## D-0169 — A cancelled renewal can be resumed
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: `POST /v1/billing/mollie/resume` turns renewal back on while the paid period lasts.
+  Mollie can't reactivate a cancelled subscription, so billing starts a new one on the
+  customer's mandate, its first charge the day the paid period would have renewed (never
+  before tomorrow): nothing is charged twice. One resume per paid period at a time; cancelling
+  again allows another. Refused when revoked, expired (buy again), already renewing, or when
+  Mollie refuses the mandate (pay again by checkout). If recording fails, the new subscription
+  is cancelled at once. StoreKit and Play resume in their own pages (native hosts, later).
+
 ## D-0168 — Key transparency checked on the device; security notices shown
 
 - Date: 2026-11-20

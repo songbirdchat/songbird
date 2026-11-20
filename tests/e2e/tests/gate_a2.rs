@@ -2125,9 +2125,10 @@ async fn a_voice_note_arrives_with_its_waveform_and_is_marked_played() {
     }
 }
 
-/// D-0167: a member account's new device joins the account's group by external commit (§6.3
-/// rule 5); the other members follow it only because it is on that account's signed device
-/// list. Messages then reach it, and it can send. Another account's device can't join.
+/// D-0167, D-0171: a member account's new device joins the account's group by external commit
+/// (§6.3 rule 5); the other members follow it only because it is on that account's signed device
+/// list. The account's own device hands it the change log's key and the title, and removes the
+/// account's leaf of a device no longer listed (a reinstall). Another account's device can't join.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_device_joins_its_accounts_groups() {
     let Some((app, mut alice, mut bob, _stop)) = stack().await else {
@@ -2141,7 +2142,76 @@ async fn a_new_device_joins_its_accounts_groups() {
     assert_eq!(pump_app(&mut bob).await, Received::Joined { group: gid });
     let _ = pump_app(&mut bob).await; // the title
 
-    // Alice links a second device (the registry's link, then her signed list names it).
+    // An old device of Alice's joins; Alice's phone hands it the key and the title.
+    let (mut old, old_device) = link_device(&app, &mut alice, &[]).await;
+    old.core.join_own_group(&gid).await.unwrap();
+    assert_eq!(pump(&mut alice).await, Received::System);
+    assert_eq!(pump(&mut bob).await, Received::System);
+    assert_eq!(
+        pump_app(&mut old).await,
+        Received::GroupUpdated {
+            group: gid,
+            title: "Family".into()
+        }
+    );
+    assert!(old.core.log_key(&gid).unwrap().is_some());
+    assert_eq!(old.core.group_title(&gid).unwrap(), "Family");
+    let _ = pump_app(&mut bob).await; // the same handover, nothing new for Bob
+    assert_eq!(bob.core.group_devices(&gid).unwrap().len(), 3);
+
+    // The old device goes from her list (a reinstall); her new device joins. Alice's phone
+    // follows, then removes the old leaf.
+    let (mut phone, _) = link_device(&app, &mut alice, &[old_device]).await;
+    phone.core.join_own_group(&gid).await.unwrap();
+    assert!(phone.core.in_group(&gid).unwrap());
+    assert_eq!(pump(&mut alice).await, Received::System);
+    let devices: Vec<[u8; 16]> = alice.core.group_devices(&gid).unwrap();
+    assert_eq!(devices.len(), 3, "the old leaf is gone");
+    assert!(!devices.contains(old_device.as_bytes()));
+    let mut want = devices.clone();
+    want.sort_unstable();
+    for p in [&mut bob, &mut phone] {
+        // The join, the handover and the removal, in whatever order they come.
+        for _ in 0..6 {
+            let mut have = p.core.group_devices(&gid).unwrap();
+            have.sort_unstable();
+            if have == want && p.core.log_key(&gid).unwrap().is_some() {
+                break;
+            }
+            let _ = pump(p).await;
+        }
+        let mut have = p.core.group_devices(&gid).unwrap();
+        have.sort_unstable();
+        assert_eq!(have, want);
+    }
+    assert!(phone.core.log_key(&gid).unwrap().is_some());
+
+    let id = bob.core.send_group_text(&gid, "Hi both").await.unwrap();
+    let Received::Message(m) = pump_app(&mut phone).await else {
+        panic!("a group message on the new device")
+    };
+    assert_eq!((m.id, m.text.as_str()), (id, "Hi both"));
+    let id = phone
+        .core
+        .send_group_text(&gid, "From my laptop")
+        .await
+        .unwrap();
+    let Received::Message(m) = pump_app(&mut bob).await else {
+        panic!("a group message from the new device")
+    };
+    assert_eq!((m.author, m.id), (alice.account, id));
+
+    // Another account's device: the server refuses its state, so it can't join.
+    let gid2 = alice.core.create_group("Just us", &[]).await.unwrap();
+    assert!(matches!(
+        bob.core.join_own_group(&gid2).await,
+        Err(songbird_app_core::Error::Server(404))
+    ));
+}
+
+/// Links a new device to `owner`'s account and signs a list naming every enabled device but
+/// `without`.
+async fn link_device(app: &App, owner: &mut Person, without: &[DeviceId]) -> (Person, DeviceId) {
     let device = DeviceId::random().unwrap();
     let (_, auth_seed) = DeviceKey::generate(device).unwrap();
     let auth = DeviceKey::from_seed(device, &auth_seed).unwrap();
@@ -2149,7 +2219,7 @@ async fn a_new_device_joins_its_accounts_groups() {
     let token = random32();
     app.registry
         .create_link_token(
-            &DeviceId::from_bytes(alice.core.local().device),
+            &DeviceId::from_bytes(owner.core.local().device),
             &token,
             &device,
             Duration::from_secs(600),
@@ -2168,15 +2238,16 @@ async fn a_new_device_joins_its_accounts_groups() {
         )
         .await
         .unwrap();
-    alice
+    let drop: Vec<[u8; 16]> = without.iter().map(|d| *d.as_bytes()).collect();
+    owner
         .core
-        .publish_device_list(&alice.account_key, |_, _| true)
+        .publish_device_list(&owner.account_key, |d, _| !drop.contains(d))
         .await
         .unwrap();
     let r = Registered {
         n: NewAccount {
-            account: AccountId::from_bytes(alice.account),
-            identity: alice.account_key.public_key().as_ref().try_into().unwrap(),
+            account: AccountId::from_bytes(owner.account),
+            identity: owner.account_key.public_key().as_ref().try_into().unwrap(),
             device,
             auth_key: auth.public_key(),
             allowance: 3,
@@ -2184,39 +2255,8 @@ async fn a_new_device_joins_its_accounts_groups() {
         account_key: Ed25519KeyPair::from_seed_unchecked(&random32()).unwrap(),
         auth_seed,
     };
-    let (api, ws) = (alice.core.net().addr, alice.core.net().ws_addr);
-    let mut phone = linked(r, identity, api, ws).await;
-
-    phone.core.join_own_group(&gid).await.unwrap();
-    assert!(phone.core.in_group(&gid).unwrap());
-    // Both members follow the join (no line in the chat: it's Alice).
-    assert_eq!(pump(&mut alice).await, Received::System);
-    assert_eq!(pump(&mut bob).await, Received::System);
-    assert_eq!(bob.core.group_devices(&gid).unwrap().len(), 3);
-    assert_eq!(alice.core.group_devices(&gid).unwrap().len(), 3);
-
-    let id = bob.core.send_group_text(&gid, "Hi both").await.unwrap();
-    let Received::Message(m) = pump_app(&mut phone).await else {
-        panic!("a group message on the new device")
-    };
-    assert_eq!((m.id, m.text.as_str()), (id, "Hi both"));
-    let _ = pump_app(&mut alice).await;
-    let id = phone
-        .core
-        .send_group_text(&gid, "From my laptop")
-        .await
-        .unwrap();
-    let Received::Message(m) = pump_app(&mut bob).await else {
-        panic!("a group message from the new device")
-    };
-    assert_eq!((m.author, m.id), (alice.account, id));
-
-    // Another account's device: the server refuses its state, so it can't join.
-    let gid2 = alice.core.create_group("Just us", &[]).await.unwrap();
-    assert!(matches!(
-        bob.core.join_own_group(&gid2).await,
-        Err(songbird_app_core::Error::Server(404))
-    ));
+    let (api, ws) = (owner.core.net().addr, owner.core.net().ws_addr);
+    (linked(r, identity, api, ws).await, device)
 }
 
 /// A device linked to an existing account: its own keys, no new account.
@@ -2372,6 +2412,24 @@ async fn key_transparency_vouches_for_device_lists_and_new_devices_are_noticed()
     );
     let list = fetch_list(&bob, alice.account).await;
     assert!(bob.core.kt_check_list(&alice.account, &list).await.unwrap());
+
+    // D-0171: a server whose epochs don't follow from the head Bob kept (its recorded roots
+    // rewritten) fails the audit: a fork, noticed and refused.
+    alice
+        .core
+        .publish_device_list(&alice.account_key, |_, _| true)
+        .await
+        .unwrap();
+    publisher.publish_pending(&app.registry, 100).await.unwrap();
+    for e in 1..=20 {
+        kt_store(&alice).put_root(e, &[7; 32]).await.unwrap();
+    }
+    let list = fetch_list(&bob, alice.account).await;
+    assert_eq!(
+        bob.core.kt_check_list(&alice.account, &list).await,
+        Err(songbird_app_core::Error::Verify)
+    );
+    assert!(bob.core.take_notices().unwrap().contains(&Notice::Fork));
 }
 
 /// An account's signed device list, as the server serves it.

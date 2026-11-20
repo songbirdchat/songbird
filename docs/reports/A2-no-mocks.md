@@ -57,6 +57,10 @@ Status: ☐ open · ☑ done (with the commit).
 
 - ☑ Key transparency checked on the device; security notices shown (D-0168)
 
+- ☑ A cancelled renewal resumes (D-0169); crash reports, opt-in, scrubbed and unlinked (D-0170)
+
+- ☑ KT audits on the device and pinned log keys; the new device's log key; dead leaves removed (D-0171)
+
 ## Open, by what they need
 
 **a (app only, or an existing endpoint):**
@@ -84,7 +88,5 @@ call media (libwebrtc's mobile archives are pinned, the native hosts are not wir
 - background backup scheduling
 
 **d (backend gaps):**
-- resume a cancelled renewal (billing)
 - a public channel directory (public channels await the owner's legal review, D-0065 §4)
-- crash reports (opt-in, scrubbed)
 - the WhatsApp bridge (Prompt 14's legal gate)

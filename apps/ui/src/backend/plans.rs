@@ -107,6 +107,12 @@ fn billing_problem(status: u16, body: &[u8]) -> Problem {
     problem(match (status, word.as_str()) {
         (402, _) => "The payment hasn't gone through yet. It can take a few minutes.",
         (409, "exists") => "This device already has a subscription. Manage it below.",
+        (409, "renews") => "Your plan already renews.",
+        (409, "expired") => "This plan has ended. Choose a plan to start again.",
+        (409, "revoked") => "This payment was refunded or charged back, so it can't renew.",
+        (409, "mandate") => {
+            "The payment provider needs you to pay again. Choose a plan to start again."
+        }
         (429, "cap") => "This subscription has had all its plans for this month.",
         (404, _) => "No subscription found for this device.",
         (503, _) => "The payment provider isn't answering. Try again in a moment.",
@@ -202,6 +208,20 @@ pub async fn cancel() -> Result<(), Problem> {
     }
 }
 
+/// Turns renewal back on after a cancellation, while the paid period lasts (D-0169).
+pub async fn resume() -> Result<(), Problem> {
+    let (st, body) = billing(
+        "/v1/billing/mollie/resume",
+        &serde_json::json!({ "subscriber": subscriber() }),
+    )
+    .await?;
+    if (200..300).contains(&st) {
+        Ok(())
+    } else {
+        Err(billing_problem(st, &body))
+    }
+}
+
 /// The token keys this build trusts: `(key ID, public key hex)`. A release build ships them
 /// (filled at release from the deployment's `[api.tokens]`, D-0134) and refuses any other, so a
 /// server cannot hand one user a key of their own and recognise their tokens. Empty in
@@ -261,7 +281,7 @@ async fn pinned() -> Result<(u8, [u8; 32]), Problem> {
 }
 
 /// The support key: the shipped one, or in a development build the first one seen.
-async fn support_key() -> Result<[u8; 32], Problem> {
+pub(super) async fn support_key() -> Result<[u8; 32], Problem> {
     if let Some(k) = SHIPPED_SUPPORT_KEY {
         return wire::unhex(k)
             .and_then(|b| b.try_into().ok())

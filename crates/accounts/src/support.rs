@@ -33,7 +33,7 @@ pub const MAX_MESSAGES: u64 = 50;
 pub struct TicketRow {
     /// Its ID.
     pub id: [u8; 16],
-    /// `help`, `appeal` or `billing`.
+    /// `help`, `appeal`, `billing` or `crash`.
     pub kind: String,
     /// The attached account, if any.
     pub account: Option<AccountId>,
