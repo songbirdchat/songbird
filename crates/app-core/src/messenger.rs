@@ -1901,6 +1901,10 @@ pub fn attachments_of(content: &[u8]) -> Vec<schema::AttachmentPointer> {
         Some(Body::Data(DataMessage {
             kind: Some(data_message::Kind::Message(m)),
             ..
+        })) if m.attachments.is_empty() => m.sticker.and_then(|s| s.data).into_iter().collect(),
+        Some(Body::Data(DataMessage {
+            kind: Some(data_message::Kind::Message(m)),
+            ..
         })) => m.attachments,
         _ => Vec::new(),
     }
@@ -1991,6 +1995,8 @@ pub(crate) fn data_row(
             .filter(|t| !t.is_empty())
             .or_else(|| m.attachments.first().map(attachment_label))
             .or_else(|| m.location.as_ref().map(|_| "Location".to_owned()))
+            .or_else(|| m.sticker.as_ref().map(|s| format!("{} Sticker", s.emoji)))
+            .or_else(|| m.poll.as_ref().map(|p| format!("Poll: {}", p.question)))
             .unwrap_or_default(),
         _ => String::new(),
     };

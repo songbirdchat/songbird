@@ -705,6 +705,7 @@ pub async fn start() -> Result<(), super::Problem> {
         show_all(s, &m);
     }
     super::calls::show_links(&m);
+    super::packs::show(&m);
     clear_media_cache();
     // Disappearing messages go on time, even with the app left open.
     if !SWEEPING.replace(true) {
@@ -814,7 +815,11 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
     };
     let body = body_of(row);
     IDS.with_borrow_mut(|m| m.insert(id, (row.author, row.id)));
-    let media = matches!(body, Body::Image { .. } | Body::File { .. });
+    let media = matches!(
+        body,
+        Body::Image { .. } | Body::File { .. } | Body::Video { .. } | Body::ViewOnce { .. }
+    ) || (matches!(body, Body::Sticker { .. })
+        && songbird_app_core::packs::sticker_in(&row.content).is_some_and(|(_, _, img)| img));
     if media {
         MEDIA.with_borrow_mut(|m| m.insert(id, (row.author, row.id)));
     }
@@ -1176,6 +1181,19 @@ fn kind_of(mime: &str) -> String {
 fn body_of(row: &MessageRow) -> Body {
     if row.content.is_empty() {
         return Body::Deleted;
+    }
+    if let Some((pack, emoji, _)) = songbird_app_core::packs::sticker_in(&row.content) {
+        let name = if pack == songbird_app_core::packs::BUILTIN_PACK_ID {
+            "Songbird friends".to_string()
+        } else {
+            crate::store::ext_groups::groups_state().with_untracked(|g| {
+                g.packs
+                    .iter()
+                    .find(|p| super::packs::pack_id(p.id) == Some(pack))
+                    .map_or_else(|| "a sticker pack".to_string(), |p| p.name.clone())
+            })
+        };
+        return Body::Sticker { emoji, pack: name };
     }
     if let Some(p) = songbird_app_core::messenger::attachments_of(&row.content)
         .into_iter()
@@ -2224,6 +2242,77 @@ pub fn load_member_changes(chat: ChatId) {
             r.0.insert(chat, lines);
         });
         Ok(())
+    });
+}
+
+/// Sends a sticker in a real chat: the built-in pack's (`pack` `None`) or an installed pack's
+/// asset `object`.
+pub fn send_sticker(
+    s: Store,
+    chat: ChatId,
+    pack: Option<u64>,
+    object: u32,
+    emoji: String,
+    name: String,
+) {
+    let Some(target) = core_chat(chat) else {
+        return;
+    };
+    let pack_id = match pack {
+        Some(ui) => match super::packs::pack_id(ui) {
+            Some(id) => Some(id),
+            None => return,
+        },
+        None => None,
+    };
+    let ui = s.push_message(
+        chat,
+        None,
+        Body::Sticker {
+            emoji: emoji.clone(),
+            pack: name,
+        },
+    );
+    if let Some(ui_pack) = pack
+        && let Some(src) = super::packs::image(ui_pack, object)
+    {
+        shown().update(|m| {
+            m.0.insert(ui, src);
+        });
+    }
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        let me = m.local().account;
+        match m
+            .send_sticker(&target, pack_id.as_ref(), object, &emoji)
+            .await
+        {
+            Ok(id) => {
+                let status = m
+                    .store
+                    .message(&me, &id)
+                    .ok()
+                    .flatten()
+                    .map_or(Status::Sent, |r| r.status);
+                drop(guard);
+                OUTGOING.with_borrow_mut(|o| o.insert(ui, id));
+                IDS.with_borrow_mut(|x| x.insert(ui, (me, id)));
+                if pack_id.is_some() {
+                    MEDIA.with_borrow_mut(|x| x.insert(ui, (me, id)));
+                }
+                set_status(s, &id, status);
+                Ok(())
+            }
+            Err(_) => {
+                drop(guard);
+                s.fail(chat, ui);
+                Err(super::problem("The sticker couldn't be sent."))
+            }
+        }
     });
 }
 

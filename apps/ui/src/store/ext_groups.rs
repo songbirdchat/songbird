@@ -269,8 +269,10 @@ pub struct Pack {
     pub kind: PackKind,
     pub name: String,
     pub by: String,
-    /// What the picker shows (emoji stand in for the artwork).
+    /// Each item's emoji (a demo pack's stand-in for its artwork).
     pub items: Vec<String>,
+    /// An installed (real) pack's asset numbers, item by item; empty for a demo pack.
+    pub objects: Vec<u32>,
 }
 
 /// A pack being added from a link.
@@ -285,10 +287,10 @@ pub struct PackInstall {
 pub fn parse_pack_link(link: &str) -> Result<String, &'static str> {
     let rest = link
         .trim()
-        .strip_prefix("https://songbird.chat/pack/")
+        .strip_prefix("https://songbird.chat/pack#")
         .ok_or("This isn't a Songbird pack link.")?;
     let (id, key) = rest
-        .split_once('#')
+        .split_once('.')
         .ok_or("This link has no pack key. Ask for the full link.")?;
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err("This isn't a Songbird pack link.");
@@ -306,6 +308,7 @@ fn seed_packs() -> Vec<Pack> {
         name: name.into(),
         by: by.into(),
         items: items.iter().map(|s| s.to_string()).collect(),
+        objects: Vec::new(),
     };
     vec![
         pack(
@@ -508,7 +511,12 @@ impl Default for GroupsState {
         Self {
             invites: Vec::new(),
             history: Vec::new(),
-            packs: seed_packs(),
+            // A real account starts with none installed; the demo with sample packs.
+            packs: if crate::store::demo() {
+                seed_packs()
+            } else {
+                Vec::new()
+            },
             installing: None,
             deleted_files: HashSet::new(),
             usage: NetworkUsage {
@@ -806,6 +814,7 @@ impl Store {
     // -------------------------------------------------------------- packs
 
     pub fn move_pack(&self, id: u64, up: bool) {
+        crate::backend::packs::move_pack(id, up);
         groups_state().update(|g| {
             let Some(i) = g.packs.iter().position(|p| p.id == id) else {
                 return;
@@ -827,16 +836,19 @@ impl Store {
     }
 
     pub fn remove_pack(&self, id: u64) {
+        crate::backend::packs::remove(id);
         groups_state().update(|g| g.packs.retain(|p| p.id != id));
     }
 
-    /// Adds a pack from its link: fetches and decrypts it, showing
-    /// progress. Returns the link's problem, if any.
-    ///
-    /// mock: app-core fetches the manifest and assets anonymously
-    /// (D-0083); here a timer walks the progress.
+    /// Adds a pack from its link: fetches and decrypts it, showing progress. Returns the
+    /// link's problem, if any. A real account's app-core fetches the manifest and assets with no
+    /// account (D-0083, D-0159); the demo walks its progress on a timer.
     pub fn install_pack(&self, link: String, kind: PackKind) -> Result<(), &'static str> {
         let id = parse_pack_link(&link)?;
+        if crate::backend::packs::live() {
+            crate::backend::packs::install(link);
+            return Ok(());
+        }
         let state = groups_state();
         state.update(|g| {
             g.installing = Some(PackInstall {
@@ -868,6 +880,7 @@ impl Store {
                             .iter()
                             .map(|s| s.to_string())
                             .collect(),
+                        objects: Vec::new(),
                     });
                 }
             });
@@ -979,12 +992,12 @@ mod tests {
     #[test]
     fn pack_links() {
         assert_eq!(
-            parse_pack_link("https://songbird.chat/pack/ab12#k3y-long-enough"),
+            parse_pack_link("https://songbird.chat/pack#ab12.k3y-long-enough"),
             Ok("ab12".into())
         );
-        assert!(parse_pack_link("https://songbird.chat/pack/ab12").is_err());
-        assert!(parse_pack_link("https://example.com/pack/ab12#key12345").is_err());
-        assert!(parse_pack_link("https://songbird.chat/pack/a/b#key12345").is_err());
+        assert!(parse_pack_link("https://songbird.chat/pack#ab12").is_err());
+        assert!(parse_pack_link("https://example.com/pack#ab12.key12345").is_err());
+        assert!(parse_pack_link("https://songbird.chat/pack#a/b.key12345").is_err());
     }
 
     #[test]

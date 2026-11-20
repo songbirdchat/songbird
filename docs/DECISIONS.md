@@ -199,6 +199,32 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0159 — Sticker packs on the device; stickers in real chats
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Installing** from `https://songbird.chat/pack#<id>.<key>` (§7.4): app-core fetches the
+    manifest and every asset with no account, opens each with keys derived from the pack key,
+    checks each asset against the manifest's commitment, and keeps the pack (key, manifest,
+    assets) in the SQLCipher store (schema 7). Packs are listed, reordered and removed there; a
+    real account starts with none (the sample packs are the demo's).
+  - **Sending** an installed pack's sticker carries the pack ID, key and emoji, and the asset as
+    an encrypted attachment (`StickerRef.data`), so the receiver needs nothing installed; the
+    receiver shows the artwork.
+  - **The built-in "Songbird friends" pack** is emoji: its stickers carry a fixed public pack ID
+    (`songbird-friends`), an all-zero key that hides nothing, and no data; each device draws
+    the emoji. Before this, built-in stickers could not be sent to real chats.
+  - The UI's pack link format was not the protocol's (`/pack/<id>#<key>`); it is now.
+  - Received videos and view-once messages are registered as media (D-0158 had missed it, so
+    they could not be opened).
+- Evidence: `gate_a2::sticker_packs_install_from_a_link_and_stickers_travel` (a pack made on
+  the server as P06 makes it, installed from its link with every asset checked; a sticker
+  reaches someone with nothing installed, with its image; a built-in sticker; removal);
+  `apps/ui` 214 tests.
+- Consequences: making a pack on the device (uploading one's own artwork) is not offered yet.
+
 ## D-0158 — View-once photos and videos; real video playback
 
 - Date: 2026-11-20

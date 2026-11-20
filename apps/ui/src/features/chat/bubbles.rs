@@ -1964,25 +1964,53 @@ fn sticker_body(cv: Conv, item: ItemMemo) -> AnyElement {
             untracked(|| super::scene::autoplay(cv.chat, id, &sticker));
         }
     });
+    // A sticker from an installed pack carries its artwork (real chats); the built-in pack's
+    // are emoji drawn here.
+    let art = computed(move || {
+        let m = id.get();
+        crate::backend::chat::is_media(m).then(|| {
+            crate::backend::chat::load_photo(m);
+            crate::backend::chat::media_src(m)
+        })
+    });
     view()
         .flex_row()
         .items_end()
         .gap_1()
-        .child(
-            text(move || info.with(|i| i.0.clone()))
-                .text_size(px(96.0))
-                .line_height(px(112.0))
-                .px_1()
-                .label(move || {
-                    info.with(|i| {
-                        if sound.get() {
-                            format!("Sound sticker from {}", i.1)
-                        } else {
-                            format!("Sticker from {}", i.1)
-                        }
-                    })
+        .child(dynamic(move || {
+            let a = art.get();
+            untracked(move || {
+                a.flatten().map(|src| {
+                    image(src)
+                        .size(px(128.0))
+                        .object_fit(ResizeMode::Contain)
+                        .label(move || info.with(|i| format!("Sticker from {}", i.1)))
+                        .role(AccessibilityRole::Image)
+                        .into_element()
                 })
-                .role(AccessibilityRole::Image),
+            })
+        }))
+        .child(
+            text(move || {
+                if art.with(|a| matches!(a, Some(Some(_)))) {
+                    String::new()
+                } else {
+                    info.with(|i| i.0.clone())
+                }
+            })
+            .text_size(px(96.0))
+            .line_height(px(112.0))
+            .px_1()
+            .label(move || {
+                info.with(|i| {
+                    if sound.get() {
+                        format!("Sound sticker from {}", i.1)
+                    } else {
+                        format!("Sticker from {}", i.1)
+                    }
+                })
+            })
+            .role(AccessibilityRole::Image),
         )
         .child(when(
             move || sound.get(),

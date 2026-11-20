@@ -62,7 +62,7 @@ fn viewed_key(author: &[u8; 16], id: &[u8; 16]) -> String {
 }
 
 /// The schema version this code writes.
-pub const SCHEMA: i64 = 6;
+pub const SCHEMA: i64 = 7;
 
 /// Outgoing message status, as the UI shows it (`crates/content`'s levels, plus the local ones).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -153,6 +153,8 @@ pub struct MessageRow {
 type Grouped = Option<(([u8; 16], [u8; 16]), Vec<Session>)>;
 /// A kept franking proof: the stamp, the franking key, the content as received.
 pub type Frank = (Vec<u8>, Vec<u8>, Vec<u8>);
+/// An installed pack as kept: (id, pack key, the manifest's encoding).
+pub type StoredPack = ([u8; 16], Zeroizing<[u8; 32]>, Vec<u8>);
 /// A message in a chat: (chat, author, id).
 pub type ChatMessage = ([u8; 16], [u8; 16], [u8; 16]);
 /// A pinned message: (author, id, pinned until, ms).
@@ -293,6 +295,11 @@ impl Store {
             ))?;
             db(tx.commit())?;
         }
+        self.migrate_later(v)
+    }
+
+    /// Schema steps 5 and later (call links, chat state, packs).
+    fn migrate_later(&mut self, v: i64) -> Result<()> {
         if v < 5 {
             // Call links this device made (PROTOCOL §8.4, §8.7): the root (the link itself) and
             // the admin token, which only this store holds.
@@ -323,7 +330,125 @@ impl Store {
             ))?;
             db(tx.commit())?;
         }
+        if v < 7 {
+            // Installed packs (PROTOCOL §7.4): the pack key, the opened manifest and every asset,
+            // kept encrypted here like everything else.
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "CREATE TABLE packs (id BLOB PRIMARY KEY, key BLOB NOT NULL, manifest BLOB NOT NULL,
+                     position INTEGER NOT NULL);
+                 CREATE TABLE pack_items (id BLOB NOT NULL, object INTEGER NOT NULL, bytes BLOB NOT NULL,
+                     PRIMARY KEY (id, object));
+                 PRAGMA user_version = 7;",
+            ))?;
+            db(tx.commit())?;
+        }
         Ok(())
+    }
+
+    /// Keeps an installed pack (its key, its manifest's encoding and every asset); installing
+    /// it again replaces it.
+    pub fn put_pack(
+        &mut self,
+        id: &[u8; 16],
+        key: &[u8; 32],
+        manifest: &[u8],
+        items: &[(u32, Vec<u8>)],
+    ) -> Result<()> {
+        let tx = db(self.db.transaction())?;
+        let position: i64 = db(tx.query_row(
+            "SELECT COALESCE(MAX(position), 0) + 1 FROM packs",
+            [],
+            |r| r.get(0),
+        ))?;
+        db(tx.execute("DELETE FROM pack_items WHERE id = ?1", [&id[..]]))?;
+        db(tx.execute(
+            "INSERT INTO packs (id, key, manifest, position) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (id) DO UPDATE SET key = ?2, manifest = ?3",
+            params![&id[..], &key[..], manifest, position],
+        ))?;
+        for (object, bytes) in items {
+            db(tx.execute(
+                "INSERT INTO pack_items (id, object, bytes) VALUES (?1, ?2, ?3)",
+                params![&id[..], i64::from(*object), bytes],
+            ))?;
+        }
+        db(tx.commit())
+    }
+
+    /// Installed packs in their order: (id, key, manifest encoding).
+    pub fn packs(&self) -> Result<Vec<StoredPack>> {
+        let mut st = db(self
+            .db
+            .prepare("SELECT id, key, manifest FROM packs ORDER BY position"))?;
+        let rows = db(st.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        }))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, key, manifest) = db(row)?;
+            if let (Ok(id), Ok(key)) = (<[u8; 16]>::try_from(id), <[u8; 32]>::try_from(key)) {
+                out.push((id, Zeroizing::new(key), manifest));
+            }
+        }
+        Ok(out)
+    }
+
+    /// One asset of an installed pack.
+    pub fn pack_item(&self, id: &[u8; 16], object: u32) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let b: Option<Vec<u8>> = db(self
+            .db
+            .query_row(
+                "SELECT bytes FROM pack_items WHERE id = ?1 AND object = ?2",
+                params![&id[..], i64::from(object)],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(b.map(Zeroizing::new))
+    }
+
+    /// Removes an installed pack and its assets.
+    pub fn remove_pack(&self, id: &[u8; 16]) -> Result<()> {
+        db(self
+            .db
+            .execute("DELETE FROM pack_items WHERE id = ?1", [&id[..]]))?;
+        db(self
+            .db
+            .execute("DELETE FROM packs WHERE id = ?1", [&id[..]]))
+        .map(|_| ())
+    }
+
+    /// Moves an installed pack one place up or down.
+    pub fn move_pack(&mut self, id: &[u8; 16], up: bool) -> Result<()> {
+        let order: Vec<Vec<u8>> = {
+            let mut st = db(self.db.prepare("SELECT id FROM packs ORDER BY position"))?;
+            let rows = db(st.query_map([], |r| r.get::<_, Vec<u8>>(0)))?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(|_| Error::Storage)?
+        };
+        let Some(i) = order.iter().position(|x| x.as_slice() == id.as_slice()) else {
+            return Ok(());
+        };
+        let j = if up {
+            i.checked_sub(1)
+        } else {
+            Some(i + 1).filter(|j| *j < order.len())
+        };
+        let Some(j) = j else { return Ok(()) };
+        let mut order = order;
+        order.swap(i, j);
+        let tx = db(self.db.transaction())?;
+        for (n, x) in order.iter().enumerate() {
+            db(tx.execute(
+                "UPDATE packs SET position = ?2 WHERE id = ?1",
+                params![x, i64::try_from(n).unwrap_or(i64::MAX)],
+            ))?;
+        }
+        db(tx.commit())
     }
 
     /// A chat's disappearing timer in seconds (0: off).

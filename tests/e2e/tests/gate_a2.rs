@@ -1787,3 +1787,168 @@ async fn a_view_once_photo_is_shown_once_then_gone() {
     assert!(bob.core.view_once_opened(&alice.account, &id).unwrap());
     assert!(bob.core.file(&alice.account, &id, 0).await.is_err());
 }
+
+/// Makes a sticker pack on the server as a pack creator's app would (P06's construction):
+/// answers its link.
+async fn make_pack(p: &Person, assets: &[Vec<u8>]) -> String {
+    use songbird_app_core::messenger::Net as _;
+    use songbird_content::attachment::{self, Suite};
+    use songbird_content::pack::{Item, Kind, Manifest, object_key};
+    let pack_key = [0x5au8; 32];
+    let mut objects = Vec::new();
+    let mut items = Vec::new();
+    for (i, a) in assets.iter().enumerate() {
+        let n = u16::try_from(i + 1).unwrap();
+        let (_, salt) = attachment::fresh().unwrap();
+        let mut ct = Vec::new();
+        let digest = attachment::encrypt(
+            Suite::DEFAULT,
+            &object_key(&pack_key, n).unwrap(),
+            &salt,
+            a.len() as u64,
+            &mut &a[..],
+            &mut ct,
+        )
+        .unwrap();
+        objects.push(ct);
+        items.push(Item {
+            object: u32::from(n),
+            content_type: "image/webp".into(),
+            size: a.len() as u64,
+            digest: digest.to_vec(),
+            emoji: vec!["🐦".into()],
+            ..Item::default()
+        });
+    }
+    let manifest = Manifest {
+        version: 1,
+        kind: Kind::Stickers.into(),
+        title: "Songbirds".into(),
+        author: "Gate".into(),
+        cover: 1,
+        items,
+    }
+    .seal()
+    .unwrap();
+    let (_, salt) = attachment::fresh().unwrap();
+    let mut mct = Vec::new();
+    attachment::encrypt(
+        Suite::DEFAULT,
+        &object_key(&pack_key, 0).unwrap(),
+        &salt,
+        manifest.len() as u64,
+        &mut &manifest[..],
+        &mut mct,
+    )
+    .unwrap();
+    objects.insert(0, mct);
+    let hash = hex::encode(aws_lc_rs::digest::digest(
+        &aws_lc_rs::digest::SHA256,
+        &[0x77u8; 32],
+    ));
+    let sizes: Vec<String> = objects.iter().map(|o| o.len().to_string()).collect();
+    let net = p.core.net();
+    let (st, b) = net
+        .api(
+            "POST",
+            "/v1/packs",
+            format!(r#"{{"sizes":[{}],"token":"{hash}"}}"#, sizes.join(",")).into_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(st, 201);
+    let pack = serde_json::from_slice::<serde_json::Value>(&b).unwrap()["pack"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for (n, o) in objects.iter().enumerate() {
+        let (st, _) = net
+            .upload("PUT", &format!("/v1/packs/{pack}/{n}"), o.clone())
+            .await
+            .unwrap();
+        assert_eq!(st, 201);
+    }
+    assert_eq!(
+        net.api("POST", &format!("/v1/packs/{pack}/complete"), Vec::new())
+            .await
+            .unwrap()
+            .0,
+        201
+    );
+    let key: String = {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut s = String::new();
+        let (mut acc, mut bits) = (0u32, 0u32);
+        for b in pack_key {
+            acc = (acc << 8) | u32::from(b);
+            bits += 8;
+            while bits >= 6 {
+                bits -= 6;
+                s.push(char::from(A[((acc >> bits) & 63) as usize]));
+            }
+        }
+        if bits > 0 {
+            s.push(char::from(A[((acc << (6 - bits)) & 63) as usize]));
+        }
+        s
+    };
+    format!("https://songbird.chat/pack#{pack}.{key}")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sticker_packs_install_from_a_link_and_stickers_travel() {
+    use songbird_app_core::packs::{BUILTIN_PACK_ID, sticker_in};
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    alice.core.send_text(&bob.account, "hi").await.unwrap();
+    assert!(matches!(pump_app(&mut bob).await, Received::Message(_)));
+    let assets = vec![vec![1u8; 2_000], vec![2u8; 3_000]];
+    let link = make_pack(&alice, &assets).await;
+    // Bob installs it from the link: every asset fetched, opened and checked.
+    let pack = bob.core.install_pack(&link).await.unwrap();
+    assert_eq!((pack.title.as_str(), pack.items.len()), ("Songbirds", 2));
+    assert_eq!(bob.core.packs().unwrap().len(), 1);
+    assert_eq!(
+        &*bob.core.pack_item(&pack.id, 2).unwrap().unwrap(),
+        &assets[1][..]
+    );
+    // A sticker from it reaches Alice with its image, though she installed nothing.
+    let id = bob
+        .core
+        .send_sticker(&alice.account, Some(&pack.id), 2, "🐦")
+        .await
+        .unwrap();
+    let mut got = pump_app(&mut alice).await;
+    while !matches!(got, Received::Message(_)) {
+        got = pump_app(&mut alice).await;
+    }
+    let Received::Message(row) = got else {
+        unreachable!()
+    };
+    assert_eq!(sticker_in(&row.content), Some((pack.id, "🐦".into(), true)));
+    assert_eq!(
+        &*alice.core.file(&bob.account, &id, 0).await.unwrap(),
+        &assets[1][..]
+    );
+    // A built-in sticker is just its emoji, drawn by each device.
+    alice
+        .core
+        .send_sticker(&bob.account, None, 0, "🦉")
+        .await
+        .unwrap();
+    let mut got = pump_app(&mut bob).await;
+    while !matches!(got, Received::Message(_)) {
+        got = pump_app(&mut bob).await;
+    }
+    let Received::Message(row) = got else {
+        unreachable!()
+    };
+    assert_eq!(
+        sticker_in(&row.content),
+        Some((BUILTIN_PACK_ID, "🦉".into(), false))
+    );
+    // Removing it.
+    bob.core.remove_pack(&pack.id).unwrap();
+    assert!(bob.core.packs().unwrap().is_empty());
+}

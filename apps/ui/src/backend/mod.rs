@@ -30,6 +30,7 @@ pub mod chat;
 pub mod link;
 pub mod lock;
 pub mod nudge;
+pub mod packs;
 pub mod plans;
 pub mod presence;
 pub mod profile;

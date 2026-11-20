@@ -39,11 +39,12 @@ Status: ☐ open · ☑ done (with the commit).
 
 - ☑ Retries: the outbox flushed every 15 s, offline sends kept, group operations retried after 409, 429, 503 (D-0157)
 
+- ☑ Sticker packs from links, installed packs in the picker, stickers in real chats (D-0159)
+
 ## Open, by what they need
 
 **a (app only, or an existing endpoint):**
 - proxy for HTTP requests too
-- installed sticker packs in the picker
 - backup frequency, include media and second destination
 - Google Drive, OneDrive and Dropbox stores (the crate has them; OAuth needs the owner's apps)
 - parental rules enforced on the child's app
@@ -53,7 +54,6 @@ Status: ☐ open · ☑ done (with the commit).
 - broadcast lists
 - presence and nudges to contacts
 - security notifications (KT)
-- sticker packs from links (`/v1/packs`)
 - chat list state synced (records)
 - network usage counted
 - storage per chat

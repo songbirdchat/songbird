@@ -711,6 +711,72 @@ fn gif_grid(cv: Conv, open: Signal<bool>) -> View {
         .child(footnote("Searches go through Songbird's privacy proxy: the GIF provider never sees who you are."))
 }
 
+/// Installed sticker packs (real chats): their artwork, sent as stickers.
+fn installed_stickers(cv: Conv, open: Signal<bool>) -> View {
+    let packs = computed(|| {
+        crate::store::ext_groups::groups_state().with(|g| {
+            g.packs
+                .iter()
+                .filter(|p| {
+                    p.kind == crate::store::ext_groups::PackKind::Stickers && !p.objects.is_empty()
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    });
+    view().child(dynamic(move || {
+        let list = packs.get();
+        untracked(move || {
+            if !crate::backend::chat::owns(cv.chat) {
+                return view().into_element();
+            }
+            view()
+                .children(list.into_iter().map(move |p| {
+                    let (pid, name) = (p.id, p.name.clone());
+                    let label = format!("Sticker from {}", p.name);
+                    view().child(section_title(p.name.clone())).child(
+                        view()
+                            .flex_row()
+                            .flex_wrap()
+                            .px_3()
+                            .pb_2()
+                            .justify_center()
+                            .children(p.objects.iter().copied().zip(p.items.clone()).map(
+                                move |(object, emoji)| {
+                                    let name = name.clone();
+                                    let src = crate::backend::packs::image(pid, object);
+                                    pressable()
+                                        .on_press(move || {
+                                            open.set(false);
+                                            crate::backend::chat::send_sticker(
+                                                cv.s,
+                                                cv.chat,
+                                                Some(pid),
+                                                object,
+                                                emoji.clone(),
+                                                name.clone(),
+                                            );
+                                        })
+                                        .accessibility_label(label.clone())
+                                        .size(px(64.0))
+                                        .p_1()
+                                        .rounded(move || radius::control())
+                                        .hover(|st| st.bg(move || c::accent()))
+                                        .child(src.map(|s| {
+                                            image(s)
+                                                .w_full()
+                                                .h_full()
+                                                .object_fit(ResizeMode::Contain)
+                                        }))
+                                },
+                            )),
+                    )
+                }))
+                .into_element()
+        })
+    }))
+}
+
 /// The built-in stickers and installed sound-sticker packs.
 fn stickers_grid(
     cv: Conv,
@@ -721,11 +787,24 @@ fn stickers_grid(
     view()
         .child(emoji_grid(&STICKERS, 40.0, move |e| {
             open.set(false);
+            if crate::backend::chat::owns(cv.chat) {
+                let object = STICKERS.iter().position(|x| *x == e).unwrap_or(0);
+                crate::backend::chat::send_sticker(
+                    cv.s,
+                    cv.chat,
+                    None,
+                    u32::try_from(object).unwrap_or(0),
+                    e.into(),
+                    "Songbird friends".into(),
+                );
+                return;
+            }
             cv.send_body(Body::Sticker {
                 emoji: e.into(),
                 pack: "Songbird friends".into(),
             });
         }))
+        .child(installed_stickers(cv, open))
         .child(dynamic(move || {
             let packs = sound_packs.get();
             untracked(move || {
