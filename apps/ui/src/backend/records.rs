@@ -20,7 +20,8 @@
 
 use std::cell::RefCell;
 
-use nsh_core::{prelude::*, storage::Storage, time::unix_ms};
+use super::vault::Storage;
+use nsh_core::{prelude::*, time::unix_ms};
 use songbird_proto::storage::{self as wire, Head, ID_LEN, Ids, Record, Write};
 use songbird_sync::{Remote, Replica, StorageKey, SyncError, WriteOutcome};
 
@@ -263,6 +264,7 @@ pub const SYNCED: &[(&str, Get, Set)] = &[
 pub const DEVICE: &[(&str, Get, Set)] = &[
     flag!("app_lock", s.app_lock),
     field!("app_lock_after", x.app_lock_after, lock, p_lock),
+    flag!("app_lock_biometrics", x.app_lock_biometrics),
     flag!("block_screenshots", s.block_screenshots),
     flag!("hide_in_switcher", s.hide_in_switcher),
     flag!("enter_sends", s.enter_sends),
@@ -1106,9 +1108,14 @@ mod headless {
         // Synced settings are in the replica (to sync when the account is live); device ones
         // apart, never in it.
         let saved = storage.entries();
+        // Kept under the vault key (D-0172): sealed in app storage.
+        let sealed = saved.get(super::K_STATE).ok_or("no replica")?;
+        assert!(sealed.starts_with("v1:"));
         let replica = songbird_sync::Replica::load(
-            &crate::backend::wire::unhex(saved.get(super::K_STATE).ok_or("no replica")?)
-                .ok_or("hex")?,
+            &crate::backend::wire::unhex(
+                &crate::backend::vault::reveal(super::K_STATE, sealed).ok_or("sealed")?,
+            )
+            .ok_or("hex")?,
         )
         .map_err(|e| e.to_string())?;
         assert_eq!(replica.get("s/typing"), Some(&b"0"[..]));

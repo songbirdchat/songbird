@@ -1,0 +1,44 @@
+[package]
+name = "songbird-device"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Songbird on the device's own services: secure storage, biometrics, screen protection, photos, location, icons (D-0172)"
+
+# Its own workspace, as apps/ui: the app's crates are outside the server workspace.
+[workspace]
+
+[dependencies]
+zeroize = "1.9.1"
+getrandom = "0.3"
+
+# macOS and iOS: the Keychain (Security.framework, no OpenSSL) and objc2 for the rest, the
+# same objc2 family and versions as NSH's platform crates.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+security-framework = { version = "3.7.0", default-features = false }
+objc2 = "0.6.5"
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSError", "NSString", "NSObject", "NSArray", "NSData", "NSDate", "NSValue", "NSNotification", "NSThread"] }
+objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext", "LAError", "LABiometryType"] }
+
+# Android: the Keystore and BiometricPrompt in Songbird's Gradle host, over JNI.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+# Windows: DPAPI and Windows Hello; the version NSH links.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Security_Credentials_UI", "Foundation"] }
+
+# Linux: the Secret Service (GNOME Keyring, KWallet) over D-Bus, pure Rust crypto.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "5", default-features = false, features = ["rt-tokio-crypto-rust"] }
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+doc_markdown = "allow"

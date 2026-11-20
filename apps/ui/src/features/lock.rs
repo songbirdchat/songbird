@@ -2,8 +2,9 @@
 //! (`backend::lock`). Locked at start when the lock is on, and again when
 //! the app comes back after the delay the user chose; the lock screen sits
 //! over everything until the passcode is right. Calls still ring over it
-//! (the call layer is above). Face ID and fingerprints come with the native
-//! host projects (D-0101 question 5).
+//! (the call layer is above). With "Unlock with Face ID" on (D-0172), the
+//! system's biometric prompt shows at once and on a button; a missed match
+//! counts nothing against the passcode's tries.
 //!
 //! Motion: the lock screen fades in over `motion::FAST` (immediately, with
 //! reduced motion) and fades out when unlocked; a wrong passcode turns the
@@ -126,6 +127,27 @@ fn lock_screen() -> AnyElement {
             }
         });
     };
+    // Biometrics (D-0172): asked at once, and on the button. Not while the passcode's wait runs.
+    let bio = s_bio();
+    let try_bio = move || {
+        if bio.is_none() || checking.get_untracked() || mono() < wait_until.get_untracked() {
+            return;
+        }
+        checking.set(true);
+        spawn(async move {
+            let ok = crate::backend::biometric::verify("open Songbird")
+                .await
+                .is_ok();
+            checking.set(false);
+            if ok {
+                lock::reset_failures();
+                locked().set(Locked(false));
+            }
+        });
+    };
+    if bio.is_some() && left == 0 {
+        set_timeout(Duration::from_millis(250), try_bio);
+    }
     // A full passcode is checked at once.
     effect(move || {
         if code.with(|c| c.len() == 6) {
@@ -183,9 +205,27 @@ fn lock_screen() -> AnyElement {
                         }
                     },
                     message,
+                ))
+                .child(when(
+                    move || bio.is_some(),
+                    move || {
+                        btn(
+                            format!("Use {}", bio.map_or("biometrics", |k| k.label())),
+                            Variant::Ghost,
+                            BtnSize::Md,
+                            try_bio,
+                        )
+                        .into_element()
+                    },
                 )),
         )
         .into_element()
+}
+
+/// The biometric that opens the lock, when the user turned it on and the device offers one.
+fn s_bio() -> Option<songbird_device::biometrics::Kind> {
+    let on = store().ext().with_untracked(|x| x.app_lock_biometrics);
+    on.then(crate::backend::biometric::kind).flatten()
 }
 
 /// Rewrites the countdown every second until `until` (on the screen's

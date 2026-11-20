@@ -18,7 +18,8 @@
 
 use std::cell::RefCell;
 
-use nsh_core::{prelude::*, storage::Storage};
+use super::vault::Storage;
+use nsh_core::prelude::*;
 use songbird_content::supervision::{ClientRules, approval_matches, open_rules};
 use songbird_proto::supervision::{Policy, UNLINK};
 

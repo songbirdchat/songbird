@@ -25,7 +25,8 @@
 
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use nsh_core::{prelude::*, storage::Storage, time::unix_ms};
+use super::vault::Storage;
+use nsh_core::{prelude::*, time::unix_ms};
 use songbird_app_core::{
     crypto::X25519Pair,
     messenger::{DeviceIdBytes, Messenger, Net, Received},

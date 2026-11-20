@@ -18,7 +18,8 @@
 //! StoreKit 2 and Play Billing need the native hosts (deferred, like push): there the proof is
 //! the store's signed transaction or purchase token instead of the subscriber secret.
 
-use nsh_core::{platform::HttpRequest, storage::Storage};
+use super::vault::Storage;
+use nsh_core::platform::HttpRequest;
 use serde_json::Value;
 use songbird_keys::provisioning::{Domain, ProvisioningKey, open_with, seal_with};
 use songbird_tokens::family::Invite;

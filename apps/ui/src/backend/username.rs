@@ -4,7 +4,7 @@
 //! makes a new key and handle; the old link stops working. Changing the
 //! username deletes the link on the server, so a new one is made.
 
-use nsh_core::storage::Storage;
+use super::vault::Storage;
 use songbird_proto::username_link::UsernameLink;
 
 use super::{Problem, live, problem, wire};

@@ -199,6 +199,31 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0172 — The device's own services: device secrets in the secure store; biometric unlock
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: a new crate, `apps/device` (`songbird-device`), holds every call into the
+  platforms' own services, like `songbird-camera` (D-0110): objc2 and Security.framework on
+  Apple, JNI to `chat.songbird.device.DeviceBridge` in the Gradle host on Android, the `windows`
+  crate on Windows, D-Bus on Linux. `unsafe` stays in its platform modules.
+  - **Device secrets at rest** (the identity and device seeds, the message store's key, the
+    recovery key, the profile key, the records' replica, the passcode's hash, the subscriber
+    secret, Family and seat tokens, support tickets, supervision links, the backup
+    destination's sign-in): encrypted in app storage under a **vault key** (AES-256-GCM, the
+    key name as associated data), which the system keeps: the Keychain (iOS: this device only,
+    after first unlock, never in backups; macOS: the login keychain, as a development build
+    can't use the data-protection keychain), the Android Keystore (a non-exportable AES key,
+    StrongBox where present, wraps it), DPAPI (wraps it), the Secret Service. Values written
+    before are encrypted on first read. A Linux without a keyring keeps them as before, and
+    the app can tell (`vault::protected`).
+  - **Biometric unlock**: "Unlock with Face ID / Touch ID / fingerprint / Windows Hello" in App
+    lock, turned on only after a match. The lock screen prompts at once and on a button; a
+    miss counts nothing against the passcode's tries, and the passcode always works. Linux has
+    no system biometrics, so the option doesn't show there.
+- Consequences: the D-0165 note (secrets in app storage until the keychain) is closed.
+
 ## D-0171 — Audits on the device; the new device gets the log key; dead leaves go
 
 - Date: 2026-11-20

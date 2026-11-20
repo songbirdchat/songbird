@@ -11,7 +11,8 @@
 
 use std::collections::HashMap;
 
-use nsh_core::{element::ImageSrc, picker::PickRequest, prelude::*, storage::Storage};
+use super::vault::Storage;
+use nsh_core::{element::ImageSrc, picker::PickRequest, prelude::*};
 use songbird_app_core::blob::{AVATAR, open_blob, seal_blob};
 
 use super::{Problem, problem, wire};

@@ -25,6 +25,7 @@
 pub mod account;
 pub mod avatar;
 pub mod backup;
+pub mod biometric;
 pub mod calls;
 pub mod chat;
 pub mod chat_state;
@@ -43,10 +44,12 @@ pub mod supervision;
 pub mod tunnel;
 pub mod usage;
 pub mod username;
+pub mod vault;
 pub mod wire;
 mod ws;
 
-use nsh_core::{platform::HttpRequest, prelude::*, storage::Storage, time::unix_ms};
+use self::vault::Storage;
+use nsh_core::{platform::HttpRequest, prelude::*, time::unix_ms};
 use serde_json::Value;
 
 pub use ws::{connect, disconnect};

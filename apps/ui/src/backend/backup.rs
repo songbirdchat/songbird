@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use nsh_core::{prelude::*, storage::Storage};
+use super::vault::Storage;
+use nsh_core::prelude::*;
 use serde_json::Value;
 use songbird_backup_format::object::Seen;
 use songbird_backup_format::reader::{Backup, MemoryStaging};

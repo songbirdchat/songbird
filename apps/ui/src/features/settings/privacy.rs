@@ -420,7 +420,7 @@ pub fn app_lock() {
         view()
             .child(view().pt_4().child(group(vec![toggle_row(
                 "Lock with a passcode",
-                Some("Songbird asks for six digits when you open it. They stay on this device. Face ID and fingerprints are coming."),
+                Some("Songbird asks for six digits when you open it. They stay on this device."),
                 on,
                 move |v| {
                     if v {
@@ -430,6 +430,36 @@ pub fn app_lock() {
                     }
                 },
             )])))
+            .child(when(
+                move || on() && crate::backend::biometric::kind().is_some(),
+                move || {
+                    let kind = crate::backend::biometric::kind()
+                        .map_or("biometrics", |k| k.label());
+                    view()
+                        .pt_4()
+                        .child(group(vec![toggle_row(
+                            format!("Unlock with {kind}"),
+                            Some("Your passcode still opens Songbird, and is needed after too many tries."),
+                            move || ext.with(|x| x.app_lock_biometrics),
+                            move |v| {
+                                if !v {
+                                    s.ext_update(|x| x.app_lock_biometrics = false);
+                                    return;
+                                }
+                                // Turned on only after a match: proof the owner is here.
+                                spawn(async move {
+                                    if crate::backend::biometric::verify("turn on biometric unlock")
+                                        .await
+                                        .is_ok()
+                                    {
+                                        s.ext_update(|x| x.app_lock_biometrics = true);
+                                    }
+                                });
+                            },
+                        )]))
+                        .into_element()
+                },
+            ))
             .child(when(on, move || {
                 section_plain(
                     "Lock automatically",

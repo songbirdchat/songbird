@@ -21,7 +21,8 @@
 
 use std::cell::RefCell;
 
-use nsh_core::{prelude::*, storage::Storage};
+use super::vault::Storage;
+use nsh_core::prelude::*;
 use songbird_content::profile::{
     self as content, MAX_ABOUT, MAX_EMOJI, MAX_NAME, MAX_STATUS, ProfilePlain, Status,
 };

@@ -25,7 +25,8 @@
 
 use std::time::Duration;
 
-use nsh_core::{platform::HttpRequest, prelude::*, storage::Storage};
+use super::vault::Storage;
+use nsh_core::{platform::HttpRequest, prelude::*};
 use serde_json::Value;
 use songbird_keys::provisioning::{self, ProvisioningKey};
 use songbird_keys::xeddsa::Signer;

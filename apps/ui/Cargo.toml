@@ -42,6 +42,8 @@ aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-
 songbird-calls-media = { path = "../calls-media" }
 # Voice notes (D-0161): the microphone through cpal, 16 kHz mono WAV.
 songbird-recorder = { path = "../recorder" }
+# The device's own services (D-0172): the secure store, biometrics, screen protection, …
+songbird-device = { path = "../device" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # The camera (D-0110): one interface over each platform's camera; all `unsafe` lives there.
 songbird-camera = { path = "../camera" }

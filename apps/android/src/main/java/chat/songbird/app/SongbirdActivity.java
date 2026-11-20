@@ -5,6 +5,7 @@ import android.os.Bundle;
 
 import chat.songbird.camera.CameraBridge;
 import chat.songbird.camera.CameraPreview;
+import chat.songbird.device.DeviceBridge;
 import com.longbridge.nsh.NshView;
 import com.longbridge.nsh.SongbirdHost;
 
@@ -28,6 +29,7 @@ public final class SongbirdActivity extends Activity {
         view = new NshView(this);
         SongbirdHost.standalone(view);
         CameraBridge.attach(this);
+        DeviceBridge.attach(this);
         view.registerComponent("songbird/camera", CameraPreview::new);
         setContentView(view);
         view.handleNotificationIntent(getIntent());
@@ -72,6 +74,7 @@ public final class SongbirdActivity extends Activity {
     @Override
     protected void onDestroy() {
         CameraBridge.detach(this);
+        DeviceBridge.detach(this);
         view.destroy();
         super.onDestroy();
     }

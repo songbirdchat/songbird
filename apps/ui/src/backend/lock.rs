@@ -6,8 +6,9 @@
 
 use std::num::NonZeroU32;
 
+use super::vault::Storage;
 use aws_lc_rs::pbkdf2;
-use nsh_core::{prelude::*, storage::Storage};
+use nsh_core::prelude::*;
 
 use super::wire;
 

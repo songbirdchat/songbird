@@ -20,7 +20,7 @@
 //! The parent never sees messages, calls or contacts: a policy is the only
 //! thing the parent writes.
 
-use nsh_core::storage::Storage;
+use super::vault::Storage;
 use serde_json::{Value, json};
 use songbird_content::supervision::{
     ClientRules, PolicyKey, consent_age, link_code, link_commit, open_rules, seal_rules, unlink_at,

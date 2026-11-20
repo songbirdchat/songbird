@@ -15,7 +15,7 @@
 //! **Never by surprise** (D-0101 question 9): the first nudge this device
 //! ever sends is confirmed first; the answer is kept on this device.
 
-use nsh_core::storage::Storage;
+use super::vault::Storage;
 #[cfg(test)]
 use songbird_content::{
     Content,

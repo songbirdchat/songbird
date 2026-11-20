@@ -162,6 +162,8 @@ pub struct SettingsExt {
     /// The online audience follows last seen (WhatsApp's "Same as last seen").
     pub online_same_as_last_seen: bool,
     pub app_lock_after: LockAfter,
+    /// The app lock also opens with Face ID, Touch ID, a fingerprint or Windows Hello (D-0172).
+    pub app_lock_biometrics: bool,
     pub security_notifications: bool,
     pub ringtone: &'static str,
     pub message_tone: &'static str,
@@ -188,6 +190,7 @@ impl Default for SettingsExt {
             status_emoji: "💬".into(),
             online_same_as_last_seen: false,
             app_lock_after: LockAfter::Immediately,
+            app_lock_biometrics: false,
             security_notifications: true,
             ringtone: "Songbird",
             message_tone: "Chirp",
