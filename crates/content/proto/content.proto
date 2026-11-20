@@ -360,6 +360,7 @@ message GroupUpdate {
   bytes actor = 2;              // 16 bytes
   repeated bytes subjects = 3;  // at most 1,024 accounts, 16 bytes each
   string value = 4;             // a new title or description, at most 4,096 bytes
+  bytes log_key = 5;            // the group's change-log key (32 bytes) for those just added (D-0156)
 }
 
 // Restricted chat (WhatsApp's advanced chat privacy). Every participant's app refuses to export

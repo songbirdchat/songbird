@@ -153,6 +153,10 @@ pub fn invite_summary(s: &InviteSettings) -> String {
 
 // ------------------------------------------------------------------ member changes
 
+/// Real groups' change logs as read from app-core, newest first.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RealChanges(pub std::collections::HashMap<ChatId, Vec<MemberChange>>);
+
 /// One line of a group's member change log.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemberChange {
@@ -581,11 +585,12 @@ impl Store {
         }
     }
 
-    /// The member change log, newest first: the recorded changes, then
-    /// the history before this session.
-    ///
-    /// mock: app-core reads the group's verified change log (D-0070).
+    /// The member change log, newest first. A real group's comes from its encrypted change
+    /// log (D-0156, read when the page opens); a demo group's is made up from its members.
     pub fn member_history(&self, chat: ChatId) -> Vec<MemberChange> {
+        if crate::backend::chat::owns(chat) {
+            return global::<RealChanges>().with(|r| r.0.get(&chat).cloned().unwrap_or_default());
+        }
         let Some(c) = self.chat(chat) else {
             return Vec::new();
         };

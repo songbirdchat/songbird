@@ -511,6 +511,8 @@ pub struct GroupUpdate {
     pub subjects: Vec<Vec<u8>>,
     #[prost(string, tag = "4")]
     pub value: String,
+    #[prost(bytes = "vec", tag = "5")]
+    pub log_key: Vec<u8>,
 }
 
 pub mod group_update {

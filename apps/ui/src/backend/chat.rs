@@ -1933,6 +1933,69 @@ pub fn accept_identity(contact: ContactId) {
     });
 }
 
+/// Reads a real group's change log (D-0156) into "Member changes", newest first.
+pub fn load_member_changes(chat: ChatId) {
+    let Some(gid) = group_of(chat) else { return };
+    super::run(async move {
+        let (log, me) = {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let m = guard
+                .as_mut()
+                .ok_or_else(|| super::problem("Not connected yet."))?;
+            let me = m.local().account;
+            (m.change_log(&gid).await, me)
+        };
+        let log = log.map_err(|_| super::problem("The member changes couldn't be loaded."))?;
+        let Some(s) = crate::store::try_store() else {
+            return Ok(());
+        };
+        let name = |a: &[u8; 16], start: bool| {
+            if *a == me {
+                if start { "You" } else { "you" }.to_string()
+            } else {
+                s.contact_name(Some(ui_id(a)))
+            }
+        };
+        let list = |v: &[[u8; 16]]| {
+            v.iter()
+                .map(|a| name(a, false))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        use songbird_content::schema::group_update::Kind as K;
+        let lines: Vec<crate::store::ext_groups::MemberChange> = log
+            .iter()
+            .rev()
+            .filter_map(|c| {
+                let who = name(&c.actor, true);
+                let text = match c.kind {
+                    K::Created => format!("{who} created the group"),
+                    K::MembersAdded => format!("{who} added {}", list(&c.subjects)),
+                    K::MembersRemoved => format!("{who} removed {}", list(&c.subjects)),
+                    K::MemberLeft if c.subjects.is_empty() => {
+                        format!("{who} committed someone's leaving")
+                    }
+                    K::MemberLeft => format!("{} left", list(&c.subjects)),
+                    K::MemberJoinedByLink => format!("{who} joined using the invite link"),
+                    K::RoleChanged => format!("{who} changed {}'s role", list(&c.subjects)),
+                    K::SettingsChanged => format!("{who} changed the group's settings"),
+                    K::TitleChanged => format!("{who} changed the group's name"),
+                    _ => return None,
+                };
+                Some(crate::store::ext_groups::MemberChange {
+                    at: minutes(c.at_ms),
+                    text,
+                })
+            })
+            .collect();
+        global::<crate::store::ext_groups::RealChanges>().update(|r| {
+            r.0.insert(chat, lines);
+        });
+        Ok(())
+    });
+}
+
 /// Marks every real chat read (Chats → Mark all as read).
 pub fn mark_all_read(s: Store) {
     let chats: Vec<ChatId> = s.chats.with_untracked(|cs| {

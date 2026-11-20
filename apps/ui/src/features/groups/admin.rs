@@ -403,6 +403,8 @@ fn change_icon(line: &str) -> Icon {
 
 /// Who joined, left, was added, removed or made admin, newest first.
 pub fn member_changes_page(chat: ChatId) {
+    // A real group's log is fetched and opened on this device each time the page opens.
+    crate::backend::chat::load_member_changes(chat);
     nav::push(format!("changes:{chat}"), move || {
         let s = store();
         let changes = computed(move || s.member_history(chat));

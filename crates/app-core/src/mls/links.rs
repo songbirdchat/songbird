@@ -126,7 +126,9 @@ impl<N: Net> Messenger<N> {
             .and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok())
             .ok_or(Error::NoSession)?;
         let exts = super::client::context_extensions(roles, &ds)?;
-        self.commit_with(gid, Vec::new(), Vec::new(), Some(exts))
+        // A link's proof key in the roles: a settings change in the log.
+        let line = super::client::LogLine::settings();
+        self.commit_with(gid, Vec::new(), Vec::new(), Some(exts), Some(line))
             .await
     }
 

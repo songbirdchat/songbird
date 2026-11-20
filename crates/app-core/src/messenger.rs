@@ -203,6 +203,8 @@ pub struct Messenger<N> {
     /// Groups (D-0145): OpenMLS state and this device's group signing key.
     pub(crate) mls: crate::mls::DeviceProvider,
     pub(crate) mls_signer: crate::mls::crypto::DeviceSigner,
+    /// Creating a group: its "created" update hands out the change log's key.
+    pub(crate) creating: bool,
 }
 
 pub(crate) fn now_ms() -> u64 {
@@ -349,6 +351,7 @@ impl<N: Net> Messenger<N> {
             system_key,
             mls,
             mls_signer,
+            creating: false,
         })
     }
 

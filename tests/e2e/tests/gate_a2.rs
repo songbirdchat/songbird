@@ -937,6 +937,17 @@ async fn typing_reports_and_blocks_work_for_real() {
 }
 
 /// The next envelope that is not a system notice (prekeys or KeyPackages low).
+/// The next event after the change-log key a member hands out when someone joins by link
+/// (D-0156), which arrives as an untitled group update.
+async fn pump_past_key(p: &mut Person) -> Received {
+    loop {
+        let r = pump_app(p).await;
+        if !matches!(&r, Received::GroupUpdated { title, .. } if title.is_empty()) {
+            return r;
+        }
+    }
+}
+
 async fn pump_app(p: &mut Person) -> Received {
     loop {
         let r = pump(p).await;
@@ -1114,7 +1125,10 @@ async fn invite_links_and_join_requests() {
         .approve_request(&gid2, &bob.account)
         .await
         .unwrap();
-    assert_eq!(pump_app(&mut bob).await, Received::Joined { group: gid2 });
+    assert_eq!(
+        pump_past_key(&mut bob).await,
+        Received::Joined { group: gid2 }
+    );
     assert_eq!(alice.core.join_requests(&gid2).await.unwrap().len(), 0);
 }
 
@@ -1150,7 +1164,7 @@ async fn channels_and_communities() {
         .send_group_text(&ch, "Road closed on Monday")
         .await
         .unwrap();
-    let Received::Message(m) = pump_app(&mut bob).await else {
+    let Received::Message(m) = pump_past_key(&mut bob).await else {
         panic!("a post")
     };
     assert_eq!((m.id, m.chat), (post, ch));
@@ -1692,4 +1706,46 @@ async fn safety_numbers_match_and_verification_is_kept() {
     alice.core.set_verified(&bob.account, true).unwrap();
     assert!(alice.core.safety(&bob.account).await.unwrap().1);
     assert!(!alice.core.identity_changed(&bob.account).await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_change_log_is_written_encrypted_and_read_by_members() {
+    use songbird_content::schema::group_update::Kind;
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    let gid = alice
+        .core
+        .create_group("Choir", &[bob.account])
+        .await
+        .unwrap();
+    assert_eq!(pump_app(&mut bob).await, Received::Joined { group: gid });
+    // The "created" update hands Bob the change log's key.
+    assert!(matches!(
+        pump_app(&mut bob).await,
+        Received::GroupUpdated { .. }
+    ));
+    assert_eq!(
+        bob.core.log_key(&gid).unwrap().as_deref(),
+        alice.core.log_key(&gid).unwrap().as_deref()
+    );
+    // The add is in the log, written by Alice, readable by Bob (the server cannot read it).
+    let log = bob.core.change_log(&gid).await.unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(
+        (log[0].kind, log[0].actor, log[0].subjects.clone()),
+        (Kind::MembersAdded, alice.account, vec![bob.account])
+    );
+    // A removal is logged too.
+    alice
+        .core
+        .remove_members(&gid, &[bob.account])
+        .await
+        .unwrap();
+    let log = alice.core.change_log(&gid).await.unwrap();
+    assert_eq!(
+        log.iter().map(|c| c.kind).collect::<Vec<_>>(),
+        vec![Kind::MembersAdded, Kind::MembersRemoved]
+    );
+    assert_eq!(log[1].subjects, vec![bob.account]);
 }

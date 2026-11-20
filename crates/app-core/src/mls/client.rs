@@ -19,7 +19,9 @@ use std::collections::{BTreeSet, HashMap};
 
 use openmls::prelude::tls_codec::Deserialize as _;
 use openmls::prelude::*;
-use songbird_content::schema::{Content, DataMessage, Text, content::Body, data_message};
+use songbird_content::schema::{
+    Content, DataMessage, Text, content::Body, data_message, group_update,
+};
 use songbird_groups::roles::{Policy, ROLES_EXTENSION, Roles};
 use songbird_groups::wire::Bundle;
 use songbird_proto::envelope::Stamp;
@@ -327,15 +329,24 @@ impl<N: Net> Messenger<N> {
         self.store.ensure_group_chat(&gid)?;
         self.store
             .put_secret(&format!("group_title.{}", hex(&gid)), title.as_bytes())?;
+        // The change log's key (D-0156): made here, handed to everyone added.
+        self.store
+            .put_secret(&format!("group_log_key.{}", hex(&gid)), &*random::<32>()?)?;
         if !members.is_empty() {
-            self.add_members(&gid, members).await?;
+            // The "created" update below carries the key; no separate announcement.
+            self.creating = true;
+            let added = self.add_members(&gid, members).await;
+            self.creating = false;
+            added?;
         }
         // The title (and that the group exists) as a group update everyone reads.
         let update = songbird_content::schema::GroupUpdate {
-            kind: songbird_content::schema::group_update::Kind::Created.into(),
+            kind: group_update::Kind::Created.into(),
             actor: self.local.account.to_vec(),
             subjects: members.iter().map(|m| m.to_vec()).collect(),
             value: title.into(),
+            // The change log's key, for everyone added (D-0156).
+            log_key: self.log_key(&gid)?.map(|k| k.to_vec()).unwrap_or_default(),
         };
         let data = DataMessage {
             group_id: gid.to_vec(),
@@ -352,7 +363,14 @@ impl<N: Net> Messenger<N> {
         for a in accounts {
             kps.extend(self.key_packages_of(a).await?);
         }
-        self.commit(gid, kps, Vec::new()).await
+        let line = LogLine::new(group_update::Kind::MembersAdded, accounts);
+        self.commit(gid, kps, Vec::new(), Some(line)).await?;
+        // Those added get the change log's key (inside the group, after the commit).
+        if !self.creating && !accounts.is_empty() {
+            self.announce_log_key(gid, group_update::Kind::MembersAdded, accounts)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Removes every device of `accounts` from a group (an admin who outranks them; the server
@@ -375,7 +393,8 @@ impl<N: Net> Messenger<N> {
         if leaves.is_empty() {
             return Ok(());
         }
-        self.commit(gid, Vec::new(), leaves).await
+        let line = LogLine::new(group_update::Kind::MembersRemoved, accounts);
+        self.commit(gid, Vec::new(), leaves, Some(line)).await
     }
 
     /// Commits proposals others queued (a member leaving): no role is needed (§6.7).
@@ -384,7 +403,33 @@ impl<N: Net> Messenger<N> {
         if group.pending_proposals().next().is_none() {
             return Ok(());
         }
-        self.commit(gid, Vec::new(), Vec::new()).await
+        // Who leaves: the senders of the queued `SelfRemove`s.
+        let leaves: HashMap<u32, [u8; 16]> = group
+            .members()
+            .filter_map(|m| {
+                Some((
+                    m.index.u32(),
+                    <[u8; 16]>::try_from(m.credential.serialized_content()).ok()?,
+                ))
+            })
+            .collect();
+        let leaving: BTreeSet<[u8; 16]> = group
+            .pending_proposals()
+            .filter_map(|q| match (q.proposal(), q.sender()) {
+                (Proposal::SelfRemove, Sender::Member(i)) => leaves.get(&i.u32()).copied(),
+                _ => None,
+            })
+            .collect();
+        let accounts: Vec<[u8; 16]> = self
+            .member_accounts(gid, &leaving)
+            .await
+            .unwrap_or_default()
+            .into_values()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let line = LogLine::new(group_update::Kind::MemberLeft, &accounts);
+        self.commit(gid, Vec::new(), Vec::new(), Some(line)).await
     }
 
     pub(crate) fn load_group(&self, gid: &[u8; 16]) -> Result<MlsGroup> {
@@ -399,8 +444,9 @@ impl<N: Net> Messenger<N> {
         gid: &[u8; 16],
         adds: Vec<KeyPackage>,
         removes: Vec<LeafNodeIndex>,
+        line: Option<LogLine>,
     ) -> Result<()> {
-        self.commit_with(gid, adds, removes, None).await
+        self.commit_with(gid, adds, removes, None, line).await
     }
 
     /// [`Self::commit`], also changing the group's context extensions (roles, link keys).
@@ -410,8 +456,10 @@ impl<N: Net> Messenger<N> {
         adds: Vec<KeyPackage>,
         removes: Vec<LeafNodeIndex>,
         exts: Option<Extensions<GroupContext>>,
+        line: Option<LogLine>,
     ) -> Result<()> {
         let mut group = self.load_group(gid)?;
+        let from_epoch = group.epoch().as_u64();
         let builder = group
             .commit_builder()
             .propose_adds(adds)
@@ -436,11 +484,16 @@ impl<N: Net> Messenger<N> {
         let commit = tls(&commit)?;
         let welcome = welcome.map(|w| tls(&w)).transpose()?;
         let info = tls(&info.ok_or(Error::Malformed)?)?;
+        // The change log's entry for this commit (D-0156), when this device holds the key.
+        let log = match line {
+            Some(line) => self.log_entry(gid, from_epoch, &line)?,
+            None => None,
+        };
         let bundle = Bundle {
             commit: &commit,
             welcome: welcome.as_deref(),
             group_info: &info,
-            log: None,
+            log: log.as_deref(),
         }
         .encode();
         let mut body = vec![1];
@@ -769,6 +822,175 @@ impl<N: Net> Messenger<N> {
         Ok(out)
     }
 
+    /// The group's change-log key (D-0156), if this device has it.
+    pub fn log_key(&self, gid: &[u8; 16]) -> Result<Option<Zeroizing<[u8; 32]>>> {
+        Ok(self
+            .store
+            .secret(&format!("group_log_key.{}", hex(gid)))?
+            .and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok())
+            .map(Zeroizing::new))
+    }
+
+    /// Hands the change log's key to the group (those just added or joined read it).
+    async fn announce_log_key(
+        &mut self,
+        gid: &[u8; 16],
+        kind: group_update::Kind,
+        subjects: &[[u8; 16]],
+    ) -> Result<()> {
+        let Some(key) = self.log_key(gid)? else {
+            return Ok(());
+        };
+        let update = songbird_content::schema::GroupUpdate {
+            kind: kind.into(),
+            actor: self.local.account.to_vec(),
+            subjects: subjects.iter().map(|s| s.to_vec()).collect(),
+            value: String::new(),
+            log_key: key.to_vec(),
+        };
+        let data = DataMessage {
+            group_id: gid.to_vec(),
+            kind: Some(data_message::Kind::GroupUpdate(update)),
+            ..Default::default()
+        };
+        self.send_group_data(gid, data, "").await.map(|_| ())
+    }
+
+    /// This commit's change-log entry: `nonce [12] | ChaCha20-Poly1305(log key, nonce,
+    /// 1 | at_ms u64 | GroupUpdate, aad = "songbird.v1/change-log-entry\0" | group |
+    /// from_epoch)`, signed by this device's leaf key as §6.7 says.
+    fn log_entry(
+        &self,
+        gid: &[u8; 16],
+        from_epoch: u64,
+        line: &LogLine,
+    ) -> Result<Option<Vec<u8>>> {
+        use aws_lc_rs::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
+        use openmls_traits::signatures::Signer as _;
+        use prost::Message as _;
+        let Some(key) = self.log_key(gid)? else {
+            return Ok(None);
+        };
+        let update = songbird_content::schema::GroupUpdate {
+            kind: line.kind.into(),
+            actor: self.local.account.to_vec(),
+            subjects: line.subjects.iter().map(|s| s.to_vec()).collect(),
+            value: String::new(),
+            log_key: Vec::new(),
+        };
+        let mut plain = vec![1];
+        plain.extend_from_slice(&now_ms().to_be_bytes());
+        plain.extend_from_slice(&update.encode_to_vec());
+        let sealing = LessSafeKey::new(
+            UnboundKey::new(&CHACHA20_POLY1305, &*key).map_err(|_| Error::Malformed)?,
+        );
+        let nonce = random::<12>()?;
+        sealing
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(*nonce),
+                Aad::from(log_aad(gid, from_epoch)),
+                &mut plain,
+            )
+            .map_err(|_| Error::Malformed)?;
+        let mut ciphertext = nonce.to_vec();
+        ciphertext.extend_from_slice(&plain);
+        if ciphertext.len() > songbird_groups::wire::MAX_LOG_CIPHERTEXT {
+            // A change naming more people than an entry holds goes unlogged.
+            return Ok(None);
+        }
+        let content = songbird_groups::wire::log_signed_content(gid, from_epoch, &ciphertext);
+        let sig = self
+            .mls_signer
+            .sign(&content)
+            .map_err(|_| Error::Malformed)?;
+        let sig: [u8; 64] = sig.as_slice().try_into().map_err(|_| Error::Malformed)?;
+        Ok(Some(songbird_groups::wire::LogEntry::encode(
+            &ciphertext,
+            &sig,
+        )))
+    }
+
+    /// The group's change log ("Member changes", §6.7), oldest first: what this device can open
+    /// with the log key (entries from before it had the key, or written without one, are left
+    /// out).
+    pub async fn change_log(&mut self, gid: &[u8; 16]) -> Result<Vec<LoggedChange>> {
+        use aws_lc_rs::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
+        use prost::Message as _;
+        let Some(key) = self.log_key(gid)? else {
+            return Ok(Vec::new());
+        };
+        let opening = LessSafeKey::new(
+            UnboundKey::new(&CHACHA20_POLY1305, &*key).map_err(|_| Error::Malformed)?,
+        );
+        let mut out = Vec::new();
+        let mut after = u64::MAX;
+        loop {
+            let mut body = vec![1];
+            body.extend_from_slice(gid);
+            body.extend_from_slice(&after.to_be_bytes());
+            let (status, answer) = self.net.api("POST", "/v1/groups/log", body).await?;
+            if status != 200 {
+                return Err(Error::Server(status));
+            }
+            let mut r = crate::crypto::Reader::new(&answer);
+            let n = r.u16()?;
+            let mut last = None;
+            for _ in 0..n {
+                let epoch = r.u64()?;
+                let len = usize::from(r.u16()?);
+                let entry = r.take(len)?;
+                last = Some(epoch);
+                let Ok(e) = songbird_groups::wire::LogEntry::parse(entry) else {
+                    continue;
+                };
+                let Some((nonce, sealed)) = e.ciphertext.split_first_chunk::<12>() else {
+                    continue;
+                };
+                let mut buf = sealed.to_vec();
+                let Ok(plain) = opening.open_in_place(
+                    Nonce::assume_unique_for_key(*nonce),
+                    Aad::from(log_aad(gid, epoch)),
+                    &mut buf,
+                ) else {
+                    continue;
+                };
+                let Some((&1, rest)) = plain.split_first() else {
+                    continue;
+                };
+                let Some((at, proto)) = rest.split_first_chunk::<8>() else {
+                    continue;
+                };
+                let Ok(u) = songbird_content::schema::GroupUpdate::decode(proto) else {
+                    continue;
+                };
+                let (Ok(actor), Ok(kind)) = (
+                    <[u8; 16]>::try_from(u.actor.as_slice()),
+                    group_update::Kind::try_from(u.kind),
+                ) else {
+                    continue;
+                };
+                out.push(LoggedChange {
+                    epoch,
+                    at_ms: u64::from_be_bytes(*at),
+                    kind,
+                    actor,
+                    subjects: u
+                        .subjects
+                        .iter()
+                        .filter_map(|s| <[u8; 16]>::try_from(s.as_slice()).ok())
+                        .collect(),
+                });
+            }
+            r.finish()?;
+            // The server answers at most 200 at a time, oldest first.
+            match last {
+                Some(e) if n == 200 => after = e,
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
     /// Learns (and verifies) the accounts of every member device now; failures leave the cache
     /// as it was.
     async fn warm_accounts(&mut self, gid: &[u8; 16], group: &MlsGroup) {
@@ -936,6 +1158,10 @@ impl<N: Net> Messenger<N> {
                 // member is checked from it).
                 self.warm_accounts(&gid, &group).await;
                 if join {
+                    // Someone joined by a link: they get the change log's key.
+                    let _ = self
+                        .announce_log_key(&gid, group_update::Kind::MemberJoinedByLink, &[])
+                        .await;
                     return Ok(Received::GroupUpdated {
                         group: gid,
                         title: String::new(),
@@ -1029,6 +1255,19 @@ impl<N: Net> Messenger<N> {
                     return Ok(r);
                 }
                 if let Some(data_message::Kind::GroupUpdate(u)) = &data.kind {
+                    // The change log's key, from a member (kept once; never replaced).
+                    if u.log_key.len() == 32 && self.log_key(&gid)?.is_none() {
+                        self.store
+                            .put_secret(&format!("group_log_key.{}", hex(&gid)), &u.log_key)?;
+                    }
+                    if u.kind == i32::from(group_update::Kind::MembersAdded)
+                        || u.kind == i32::from(group_update::Kind::MemberJoinedByLink)
+                    {
+                        return Ok(Received::GroupUpdated {
+                            group: gid,
+                            title: String::new(),
+                        });
+                    }
                     if !u.value.is_empty() {
                         self.store.put_secret(
                             &format!("group_title.{}", hex(&gid)),
@@ -1057,6 +1296,50 @@ fn content_data(c: &Content) -> Result<&DataMessage> {
         Some(Body::Data(d)) => Ok(d),
         _ => Err(Error::Malformed),
     }
+}
+
+/// What a commit changed, for its change-log entry.
+pub(crate) struct LogLine {
+    kind: group_update::Kind,
+    subjects: Vec<[u8; 16]>,
+}
+
+impl LogLine {
+    pub(crate) fn settings() -> Self {
+        Self::new(group_update::Kind::SettingsChanged, &[])
+    }
+
+    fn new(kind: group_update::Kind, subjects: &[[u8; 16]]) -> Self {
+        Self {
+            kind,
+            subjects: subjects.to_vec(),
+        }
+    }
+}
+
+/// One change in a group's change log, opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggedChange {
+    /// The epoch the commit was made from.
+    pub epoch: u64,
+    /// When the committer made it (its clock).
+    pub at_ms: u64,
+    /// What changed.
+    pub kind: group_update::Kind,
+    /// Who changed it.
+    pub actor: [u8; 16],
+    /// Whom it concerned.
+    pub subjects: Vec<[u8; 16]>,
+}
+
+/// The associated data of a change-log entry's sealing.
+fn log_aad(gid: &[u8; 16], from_epoch: u64) -> Vec<u8> {
+    let label = b"songbird.v1/change-log-entry\0";
+    let mut a = Vec::with_capacity(label.len() + 24);
+    a.extend_from_slice(label);
+    a.extend_from_slice(gid);
+    a.extend_from_slice(&from_epoch.to_be_bytes());
+    a
 }
 
 /// The member accounts a `/v1/groups/state` answer ends with (D-0155): after `epoch | info |
