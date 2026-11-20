@@ -481,3 +481,255 @@ pub(crate) fn speaker(on: bool) {
     // SAFETY: the app's shared audio session; overriding the output port has no other effect.
     let _ = unsafe { AVAudioSession::sharedInstance().overrideOutputAudioPort_error(port) };
 }
+
+// ---------------------------------------------------------------- PushKit and CallKit (D-0176)
+
+#[cfg(target_os = "ios")]
+pub(crate) mod callkit {
+    use std::cell::RefCell;
+
+    use block2::DynBlock;
+    use objc2::{
+        AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+        rc::Retained,
+        runtime::{AnyClass, AnyObject, ProtocolObject},
+    };
+    use objc2_avf_audio::AVAudioSession;
+    use objc2_call_kit::{
+        CXAnswerCallAction, CXCallEndedReason, CXCallUpdate, CXEndCallAction, CXHandle,
+        CXHandleType, CXProvider, CXProviderConfiguration, CXProviderDelegate,
+        CXSetMutedCallAction,
+    };
+    use objc2_foundation::{
+        NSError, NSNumber, NSObject, NSObjectProtocol, NSSet, NSString, NSUUID,
+    };
+    use objc2_push_kit::{
+        PKPushCredentials, PKPushPayload, PKPushRegistry, PKPushRegistryDelegate, PKPushType,
+        PKPushTypeVoIP,
+    };
+
+    use crate::callkit::{Ended, Event, OnEvent};
+
+    pub(crate) struct Ivars {
+        on: OnEvent,
+    }
+
+    thread_local! {
+        static PROVIDER: RefCell<Option<Retained<CXProvider>>> = const { RefCell::new(None) };
+        static KEEP: RefCell<Vec<Retained<AnyObject>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// WebRTC's `RTCAudioSession` (in libwebrtc's Objective-C SDK), when linked.
+    fn rtc_session() -> Option<Retained<AnyObject>> {
+        let cls = AnyClass::get(c"RTCAudioSession")?;
+        // SAFETY: a class method returning the shared instance.
+        let s: Option<Retained<AnyObject>> = unsafe { msg_send![cls, sharedInstance] };
+        s
+    }
+
+    /// WebRTC's audio waits for CallKit (`true`), or runs as usual.
+    fn manual_audio(on: bool) {
+        if let Some(s) = rtc_session() {
+            // SAFETY: documented RTCAudioSession properties.
+            unsafe {
+                let _: () = msg_send![&*s, setUseManualAudio: on];
+                let _: () = msg_send![&*s, setIsAudioEnabled: !on];
+            }
+        }
+    }
+
+    define_class!(
+        // SAFETY: plain NSObject subclasses; both delegates are called on the main queue.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "SongbirdCallDelegate"]
+        #[ivars = Ivars]
+        pub(crate) struct Delegate;
+
+        unsafe impl NSObjectProtocol for Delegate {}
+
+        unsafe impl PKPushRegistryDelegate for Delegate {
+            #[unsafe(method(pushRegistry:didUpdatePushCredentials:forType:))]
+            fn credentials(&self, _r: &PKPushRegistry, creds: &PKPushCredentials, _t: &PKPushType) {
+                // SAFETY: reading the token PushKit handed over.
+                let token = unsafe { creds.token() }.to_vec();
+                (self.ivars().on)(Event::Token(token));
+            }
+
+            #[unsafe(method(pushRegistry:didReceiveIncomingPushWithPayload:forType:withCompletionHandler:))]
+            fn incoming(
+                &self,
+                _r: &PKPushRegistry,
+                _payload: &PKPushPayload,
+                _t: &PKPushType,
+                completion: &DynBlock<dyn Fn()>,
+            ) {
+                let mut id = [0u8; 16];
+                let _ = crate::random(&mut id);
+                // The UUID must be a valid v4 for CallKit.
+                id[6] = (id[6] & 0x0f) | 0x40;
+                id[8] = (id[8] & 0x3f) | 0x80;
+                report_incoming(id, "Songbird", false, completion);
+                (self.ivars().on)(Event::Ring(id));
+            }
+        }
+
+        unsafe impl CXProviderDelegate for Delegate {
+            #[unsafe(method(providerDidReset:))]
+            fn reset(&self, _p: &CXProvider) {
+                manual_audio(false);
+            }
+
+            #[unsafe(method(provider:performAnswerCallAction:))]
+            fn answer(&self, _p: &CXProvider, action: &CXAnswerCallAction) {
+                // SAFETY: reading and completing the action CallKit handed over.
+                let id = unsafe { action.callUUID() }.as_bytes();
+                unsafe { action.fulfill() };
+                (self.ivars().on)(Event::Answer(id));
+            }
+
+            #[unsafe(method(provider:performEndCallAction:))]
+            fn end(&self, _p: &CXProvider, action: &CXEndCallAction) {
+                // SAFETY: as above.
+                let id = unsafe { action.callUUID() }.as_bytes();
+                unsafe { action.fulfill() };
+                (self.ivars().on)(Event::End(id));
+            }
+
+            #[unsafe(method(provider:performSetMutedCallAction:))]
+            fn mute(&self, _p: &CXProvider, action: &CXSetMutedCallAction) {
+                // SAFETY: as above.
+                let (id, muted) = unsafe { (action.callUUID().as_bytes(), action.isMuted()) };
+                unsafe { action.fulfill() };
+                (self.ivars().on)(Event::Mute(id, muted));
+            }
+
+            #[unsafe(method(provider:didActivateAudioSession:))]
+            fn activated(&self, _p: &CXProvider, session: &AVAudioSession) {
+                if let Some(s) = rtc_session() {
+                    // SAFETY: documented RTCAudioSession calls, with the session CallKit gave.
+                    unsafe {
+                        let _: () = msg_send![&*s, audioSessionDidActivate: session];
+                        let _: () = msg_send![&*s, setIsAudioEnabled: true];
+                    }
+                }
+            }
+
+            #[unsafe(method(provider:didDeactivateAudioSession:))]
+            fn deactivated(&self, _p: &CXProvider, session: &AVAudioSession) {
+                if let Some(s) = rtc_session() {
+                    // SAFETY: as above.
+                    unsafe {
+                        let _: () = msg_send![&*s, audioSessionDidDeactivate: session];
+                        let _: () = msg_send![&*s, setIsAudioEnabled: false];
+                    }
+                }
+            }
+        }
+    );
+
+    fn call_update(caller: &str, video: bool) -> Retained<CXCallUpdate> {
+        // SAFETY: fresh objects, configured before use.
+        unsafe {
+            let u = CXCallUpdate::new();
+            let handle = CXHandle::initWithType_value(
+                CXHandle::alloc(),
+                CXHandleType::Generic,
+                &NSString::from_str(caller),
+            );
+            u.setRemoteHandle(Some(&handle));
+            u.setLocalizedCallerName(Some(&NSString::from_str(caller)));
+            u.setHasVideo(video);
+            u
+        }
+    }
+
+    fn report_incoming(id: [u8; 16], caller: &str, video: bool, completion: &DynBlock<dyn Fn()>) {
+        manual_audio(true);
+        let update = call_update(caller, video);
+        let done = block2::RcBlock::new(|_err: *mut NSError| {});
+        PROVIDER.with_borrow(|p| {
+            if let Some(p) = p {
+                // SAFETY: our provider, on the main queue; the block lives for the call.
+                unsafe {
+                    p.reportNewIncomingCallWithUUID_update_completion(
+                        &NSUUID::from_bytes(id),
+                        &update,
+                        &done,
+                    );
+                }
+            }
+        });
+        // PushKit's completion: the call is reported.
+        completion.call(());
+    }
+
+    pub(crate) fn install(on: OnEvent) -> bool {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return false;
+        };
+        let delegate: Retained<Delegate> = {
+            let this = Delegate::alloc(mtm).set_ivars(Ivars { on });
+            // SAFETY: NSObject's designated initializer.
+            unsafe { msg_send![super(this), init] }
+        };
+        // SAFETY: CallKit and PushKit set up on the main thread, their delegate kept for the
+        // life of the app (KEEP), the main queue for both.
+        unsafe {
+            let config = CXProviderConfiguration::new();
+            config.setSupportsVideo(true);
+            config.setMaximumCallGroups(1);
+            config.setMaximumCallsPerCallGroup(1);
+            config.setIncludesCallsInRecents(false);
+            config.setSupportedHandleTypes(&NSSet::from_slice(&[&*NSNumber::new_isize(
+                CXHandleType::Generic.0,
+            )]));
+            let provider = CXProvider::initWithConfiguration(CXProvider::alloc(), &config);
+            provider.setDelegate_queue(
+                Some(ProtocolObject::from_ref(&*delegate)),
+                Some(dispatch2::DispatchQueue::main()),
+            );
+            PROVIDER.with_borrow_mut(|p| *p = Some(provider));
+            let registry = PKPushRegistry::initWithQueue(
+                PKPushRegistry::alloc(),
+                Some(dispatch2::DispatchQueue::main()),
+            );
+            registry.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+            registry.setDesiredPushTypes(Some(&NSSet::from_slice(&[PKPushTypeVoIP])));
+            KEEP.with_borrow_mut(|k| {
+                k.push(Retained::into_super(Retained::into_super(registry)));
+                k.push(Retained::into_super(delegate).into());
+            });
+        }
+        true
+    }
+
+    pub(crate) fn update(id: [u8; 16], caller: &str, video: bool) {
+        let u = call_update(caller, video);
+        PROVIDER.with_borrow(|p| {
+            if let Some(p) = p {
+                // SAFETY: our provider on the main thread.
+                unsafe { p.reportCallWithUUID_updated(&NSUUID::from_bytes(id), &u) };
+            }
+        });
+    }
+
+    pub(crate) fn ended(id: [u8; 16], why: Ended) {
+        let reason = match why {
+            Ended::Failed => CXCallEndedReason::Failed,
+            Ended::Remote => CXCallEndedReason::RemoteEnded,
+            Ended::Unanswered => CXCallEndedReason::Unanswered,
+            Ended::AnsweredElsewhere => CXCallEndedReason::AnsweredElsewhere,
+            Ended::DeclinedElsewhere => CXCallEndedReason::DeclinedElsewhere,
+        };
+        PROVIDER.with_borrow(|p| {
+            if let Some(p) = p {
+                // SAFETY: as above.
+                unsafe {
+                    p.reportCallWithUUID_endedAtDate_reason(&NSUUID::from_bytes(id), None, reason);
+                }
+            }
+        });
+        manual_audio(false);
+    }
+}

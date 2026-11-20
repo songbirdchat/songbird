@@ -384,6 +384,42 @@ public final class DeviceBridge {
 
     static native void nativeLocation(long id, int code, double lat, double lon, double accuracy);
 
+    // ------------------------------------------------------------ push (D-0176)
+
+    private static volatile boolean front;
+
+    /** Whether the activity is in front (its connection fetches; a push needs no notification). */
+    public static boolean inFront() {
+        return front;
+    }
+
+    public static void setFront(boolean f) {
+        front = f;
+    }
+
+    /** Asks the user's UnifiedPush distributor for an endpoint (and reports a kept one now). */
+    static void registerPush() {
+        MAIN.post(() -> {
+            Activity a = activity.get();
+            if (a == null) return;
+            Object[] saved = chat.songbird.push.SongbirdPushService.saved(a);
+            if (saved != null) nativePushEndpoint((String) saved[0], (byte[]) saved[1], (byte[]) saved[2]);
+            org.unifiedpush.android.connector.UnifiedPush.tryUseCurrentOrDefaultDistributor(a, ok -> {
+                if (ok) {
+                    org.unifiedpush.android.connector.UnifiedPush.register(a, "default", null, null);
+                }
+                return kotlin.Unit.INSTANCE;
+            });
+        });
+    }
+
+    /** A new endpoint (from the push service, any thread): to Rust when it runs. */
+    public static void pushEndpoint(String url, byte[] p256dh, byte[] auth) {
+        if (activity.get() != null) nativePushEndpoint(url, p256dh, auth);
+    }
+
+    static native void nativePushEndpoint(String url, byte[] p256dh, byte[] auth);
+
     static native void nativeInit();
 
     static native void nativeAuthResult(long id, int code);

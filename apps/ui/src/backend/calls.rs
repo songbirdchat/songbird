@@ -312,7 +312,9 @@ async fn join(
         let _ = tx.send(ok);
     }));
     if !rx.await.unwrap_or(false) {
-        crate::ui::toast("Songbird can't use the microphone, so others won't hear you. Allow it in your device's settings.");
+        crate::ui::toast(
+            "Songbird can't use the microphone, so others won't hear you. Allow it in your device's settings.",
+        );
     }
     songbird_device::audio::call_started();
     let joined =
@@ -419,6 +421,8 @@ pub async fn signal(
             let Some(ui_call) = ui::live::ring(chat, video, group.is_some(), left) else {
                 return;
             };
+            // A ring's push already shows the system's call screen (iOS): it is this call.
+            super::callkit::bind(ui_call);
             LIVE.with_borrow_mut(|l| {
                 *l = Some(Live {
                     ui: ui_call,
@@ -1657,8 +1661,13 @@ pub fn group_left(gid: &[u8; 16]) {
 /// the camera and screen. Idempotent.
 pub fn closed(ui_call: u64, reason: EndReason, by_user: bool) {
     PREPARED.with_borrow_mut(|p| p.remove(&ui_call));
-    // The audio route and mode, as they were before the call (D-0176).
+    // The audio route and mode, as they were before the call (D-0176), and the system's call
+    // screen, if it shows this call.
     songbird_device::audio::call_ended();
+    super::callkit::call_closed(
+        ui_call,
+        matches!(reason, EndReason::Missed | EndReason::Declined),
+    );
     let Some(live) = LIVE.with_borrow_mut(|l| {
         if l.as_ref().is_some_and(|x| x.ui == ui_call) {
             l.take()

@@ -45,7 +45,14 @@ public final class SongbirdActivity extends Activity {
     }
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        DeviceBridge.setFront(true);
+    }
+
+    @Override
     protected void onStop() {
+        DeviceBridge.setFront(false);
         CameraBridge.onActivityStopped(this);
         super.onStop();
     }

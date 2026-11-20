@@ -739,7 +739,9 @@ pub async fn start() -> Result<(), super::Problem> {
     if let Some(s) = crate::store::try_store() {
         // A crash report from last time, sent only if the user allows them (D-0170).
         super::crash::flush(s);
-        // This device's push token, registered (D-0175).
+        // This device's push token, registered (D-0175); calls through the system's call
+        // screen on iOS (D-0176).
+        super::callkit::install();
         super::push::install();
     }
     if let Some(s) = crate::store::try_store() {

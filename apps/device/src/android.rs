@@ -300,7 +300,10 @@ pub(crate) fn microphone(done: crate::audio::Done) {
     match granted {
         // 1: granted already; 0: asked now, the answer comes to `nativeMicrophone`.
         Some(1) => done(true),
-        Some(0) => MIC.lock().unwrap_or_else(PoisonError::into_inner).push(done),
+        Some(0) => MIC
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(done),
         _ => done(false),
     }
 }
@@ -324,4 +327,43 @@ pub(crate) fn audio_mode(call: bool) {
 
 pub(crate) fn speaker(on: bool) {
     call_bool("speaker", on);
+}
+
+// ---------------------------------------------------------------- push (D-0176)
+
+static ON_TOKEN: std::sync::OnceLock<crate::push::OnToken> = std::sync::OnceLock::new();
+
+pub(crate) fn register_push(on_token: crate::push::OnToken) -> bool {
+    let _ = ON_TOKEN.set(on_token);
+    call("registerPush", "()V", |_| Some(Vec::new()), |_, _| Some(())).is_some()
+}
+
+/// `DeviceBridge.nativePushEndpoint(url, p256dh, auth)`: the distributor's endpoint.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_chat_songbird_device_DeviceBridge_nativePushEndpoint(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    url: jni::objects::JString<'_>,
+    p256dh: JByteArray<'_>,
+    auth: JByteArray<'_>,
+) {
+    let Ok(url) = env.get_string(&url).map(String::from) else {
+        return;
+    };
+    let (Ok(p), Ok(a)) = (
+        env.convert_byte_array(&p256dh),
+        env.convert_byte_array(&auth),
+    ) else {
+        return;
+    };
+    let (Ok(p256dh), Ok(auth)) = (<[u8; 65]>::try_from(p), <[u8; 16]>::try_from(a)) else {
+        return;
+    };
+    if let Some(on) = ON_TOKEN.get() {
+        on(crate::push::Token::WebPush {
+            endpoint: url,
+            p256dh,
+            auth,
+        });
+    }
 }

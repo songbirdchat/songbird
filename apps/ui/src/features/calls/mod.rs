@@ -318,6 +318,13 @@ fn hang_up(s: Store) {
 }
 
 fn accept(video: bool) {
+    if let Some(id) = accept_quietly(video) {
+        // Answered in the app: the system's call screen (iOS, D-0176) goes away.
+        crate::backend::callkit::answered_in_app(id);
+    }
+}
+
+fn accept_quietly(video: bool) -> Option<u64> {
     let mut real = None;
     with_call(|c| {
         c.accept(video);
@@ -326,6 +333,7 @@ fn accept(video: bool) {
     if let Some(id) = real {
         crate::backend::calls::answer(id);
     }
+    real
 }
 
 /// The real call's id, if the call going on is real.
@@ -537,6 +545,29 @@ pub mod live {
         crate::sounds::stop();
         if let Some(line) = with(id, super::state::status) {
             announce_for_accessibility(line);
+        }
+    }
+
+    /// The system's call screen (CallKit, D-0176) answered call `id`.
+    pub fn system_answer(id: u64) {
+        if let Some(video) = with(id, |c| c.video) {
+            super::accept_quietly(video);
+        }
+    }
+
+    /// The system's call screen declined or hung up call `id`.
+    pub fn system_end(id: u64) {
+        if exists(id)
+            && let Some(s) = crate::store::try_store()
+        {
+            super::hang_up(s);
+        }
+    }
+
+    /// The system's call screen muted (or unmuted) call `id`.
+    pub fn system_mute(id: u64, muted: bool) {
+        if with(id, |c| c.muted != muted).unwrap_or(false) {
+            super::toggle_mute();
         }
     }
 

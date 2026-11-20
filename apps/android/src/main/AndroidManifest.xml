@@ -45,6 +45,15 @@
             android:exported="false"
             android:grantUriPermissions="true" />
 
+        <!-- UnifiedPush (D-0176): the user's distributor wakes Songbird; no Google services. -->
+        <service
+            android:name="chat.songbird.push.SongbirdPushService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="org.unifiedpush.android.connector.PUSH_EVENT" />
+            </intent-filter>
+        </service>
+
         <activity
             android:name="chat.songbird.app.SongbirdActivity"
             android:exported="true"

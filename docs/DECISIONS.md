@@ -199,6 +199,37 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0176 — Calls and push on phones
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Call audio**: Android asks for the microphone before a call joins (and before a voice
+    note records); without it the call still joins and says why nobody hears you. A call puts
+    Android in its communication mode; "Speaker" routes the sound to the loudspeaker
+    (`setCommunicationDevice` on 12+, `setSpeakerphoneOn` before) or on iOS overrides the audio
+    session's port; the call's end puts both back.
+  - **iOS incoming calls**: PushKit and CallKit in the device crate. A ring's VoIP push carries
+    nothing (§9), and iOS requires every VoIP push to show a call, so each one reports a call
+    from "Songbird" at once; the app connects, and the offer names the caller
+    (`reportCallWithUUID:updated:`), or after 30 s without one the call ends as failed. Answer,
+    end and mute on the system's screen act on the app's call; answering in the app ends the
+    system's call (answered elsewhere). While a CallKit call runs, WebRTC's audio waits for
+    CallKit's audio session (`RTCAudioSession` manual audio), as Apple requires; other calls
+    are unchanged. The PushKit token joins the APNs token in `PUT /v1/push`. Info.plist:
+    `UIBackgroundModes` voip, audio, remote-notification.
+  - **Android push**: UnifiedPush through the user's own distributor (connector 3.3.6,
+    Apache-2.0, with kotlin-stdlib and Tink; pinned by SHA-256 in Gradle's verification
+    metadata), registered as Web Push. A ring and a message are the same wake-up (§9): in front,
+    the connection already has them; otherwise one notification ("You may have new messages or
+    a call") opens the app, which connects and fetches.
+- Consequences: real APNs and PushKit tokens need the push entitlement and a provisioning
+  profile; FCM needs the Firebase app's configuration (`google-services.json`) from the
+  owner's console; a ConnectionService call screen on Android would need a push that tells a
+  ring from a message, which §9 deliberately doesn't. Screen sharing on phones (ReplayKit,
+  MediaProjection) stays undone.
+
 ## D-0175 — Mobile builds; libwebrtc per target; the APNs token
 
 - Date: 2026-11-20

@@ -55,4 +55,7 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
+    // UnifiedPush (Apache-2.0): pushes through the user's own distributor, no Google services
+    // (D-0176). Brings kotlin-stdlib and Tink (its Web Push decryption).
+    implementation("org.unifiedpush.android:connector:3.3.6")
 }

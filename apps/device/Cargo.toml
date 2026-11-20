@@ -18,7 +18,7 @@ getrandom = "0.3"
 security-framework = { version = "3.7.0", default-features = false }
 objc2 = "0.6.5"
 block2 = "0.6.2"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSError", "NSString", "NSObject", "NSArray", "NSData", "NSDate", "NSValue", "NSNotification", "NSThread", "NSURL"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSError", "NSString", "NSObject", "NSArray", "NSData", "NSDate", "NSValue", "NSNotification", "NSThread", "NSURL", "NSUUID", "NSSet"] }
 objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext", "LAError", "LABiometryType"] }
 objc2-core-location = { version = "0.3.2", default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate", "CLError"] }
 
@@ -28,6 +28,8 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std", "UIScreen", "UIApplication", "UIResponder"] }
 objc2-avf-audio = { version = "0.3.2", default-features = false, features = ["std", "AVAudioSession", "AVAudioSessionTypes"] }
+objc2-push-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "dispatch2", "PKPushRegistry", "PKPushCredentials", "PKPushPayload", "PKDefines"] }
+objc2-call-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "dispatch2", "objc2-avf-audio", "CXProvider", "CXProviderConfiguration", "CXCallUpdate", "CXHandle", "CXAction", "CXCallAction", "CXAnswerCallAction", "CXEndCallAction", "CXSetMutedCallAction", "CXError"] }
 objc2-photos = { version = "0.3.2", default-features = false, features = ["std", "block2", "dispatch2", "PHPhotoLibrary", "PHAssetCreationRequest", "PHAssetChangeRequest", "PHChangeRequest", "PhotosTypes"] }
 dispatch2 = "0.3.1"
 
