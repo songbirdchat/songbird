@@ -102,6 +102,8 @@ pub fn App() -> impl IntoElement {
     backend::backup::install(s);
     // A supervised child's rules, kept fresh (D-0166).
     backend::rules::install();
+    // Screenshots, recordings and the app switcher (D-0173).
+    features::cover::install(s);
     // A status whose real expiry passed while the app was closed goes now.
     s.schedule_status_expiry();
     camera::install_for_app();
@@ -141,6 +143,7 @@ pub fn App() -> impl IntoElement {
         )
         .child(features::desktop::jump::layer())
         .child(features::lock::layer())
+        .child(features::cover::layer(s))
         .child(features::calls::call_layer())
         .child(ui::toast_layer())
 }

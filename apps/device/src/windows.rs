@@ -118,3 +118,35 @@ pub(crate) fn authenticate(reason: &str, done: Done) {
         done(r);
     });
 }
+
+/// Every top-level window of this process out of screen capture (Windows 10 2004+), or back.
+pub(crate) fn protect_windows(on: bool) {
+    use windows::Win32::{
+        Foundation::{HWND, LPARAM},
+        System::Threading::GetCurrentProcessId,
+        UI::WindowsAndMessaging::{
+            EnumWindows, GetWindowThreadProcessId, SetWindowDisplayAffinity,
+            WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
+        },
+    };
+    unsafe extern "system" fn each(hwnd: HWND, list: LPARAM) -> windows::core::BOOL {
+        let mut pid = 0u32;
+        // SAFETY: `hwnd` is a live window EnumWindows hands over; `pid` is ours to write.
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
+        // SAFETY: as above.
+        if pid == unsafe { GetCurrentProcessId() } {
+            // SAFETY: `list` is the `Vec` passed below, alive for the whole enumeration.
+            unsafe { &mut *(list.0 as *mut Vec<HWND>) }.push(hwnd);
+        }
+        true.into()
+    }
+    let mut windows: Vec<HWND> = Vec::new();
+    // SAFETY: the callback only reads the window's process and pushes onto `windows`, which
+    // outlives the call.
+    let _ = unsafe { EnumWindows(Some(each), LPARAM(&raw mut windows as isize)) };
+    let affinity = if on { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
+    for w in windows {
+        // SAFETY: our own top-level windows, found above.
+        let _ = unsafe { SetWindowDisplayAffinity(w, affinity) };
+    }
+}

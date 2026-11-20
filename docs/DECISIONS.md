@@ -199,6 +199,21 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0173 — Screen protection and the app switcher cover
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: "Block screenshots" keeps Songbird out of screenshots and recordings where the
+  system allows: Android `FLAG_SECURE`, macOS `NSWindowSharingNone`, Windows
+  `WDA_EXCLUDEFROMCAPTURE`, applied again every second to windows opened since. iOS lets no
+  app block screenshots: there the setting says so, and a cover hides the app while the screen
+  is recorded, mirrored or shared (`UIScreen.isCaptured`). Linux has no such API, so the
+  setting isn't shown there. "Hide content in app switcher" (iOS and Android only, where the
+  switcher shows a snapshot) covers the app whenever it isn't in front, and on Android 13+
+  also blanks the recents thumbnail without blocking screenshots. The cover has no motion: it
+  must be whole in the frame the system snapshots.
+
 ## D-0172 — The device's own services: device secrets in the secure store; biometric unlock
 
 - Date: 2026-11-20

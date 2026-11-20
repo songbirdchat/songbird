@@ -161,6 +161,29 @@ public final class DeviceBridge {
         });
     }
 
+    // ------------------------------------------------------------ screen protection
+
+    /** FLAG_SECURE: no screenshots, black recordings, a blank recents thumbnail. */
+    static void setSecure(boolean on) {
+        MAIN.post(() -> {
+            Activity a = activity.get();
+            if (a == null) return;
+            if (on) {
+                a.getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
+            } else {
+                a.getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
+            }
+        });
+    }
+
+    /** Android 13+: a blank thumbnail in the recent apps, screenshots still allowed. */
+    static void hideInRecents(boolean on) {
+        MAIN.post(() -> {
+            Activity a = activity.get();
+            if (a != null && Build.VERSION.SDK_INT >= 33) a.setRecentsScreenshotEnabled(!on);
+        });
+    }
+
     static native void nativeInit();
 
     static native void nativeAuthResult(long id, int code);

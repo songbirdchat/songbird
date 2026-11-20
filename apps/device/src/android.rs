@@ -178,3 +178,22 @@ pub extern "system" fn Java_chat_songbird_device_DeviceBridge_nativeAuthResult(
         _ => Err(Failure::Unavailable),
     });
 }
+
+fn call_bool(name: &str, on: bool) {
+    let _ = call(
+        name,
+        "(Z)V",
+        |_| Some(vec![JValueOwned::Bool(u8::from(on))]),
+        |_, _| Some(()),
+    );
+}
+
+/// `FLAG_SECURE` on the activity's window.
+pub(crate) fn set_secure(on: bool) {
+    call_bool("setSecure", on);
+}
+
+/// A blank recents thumbnail (Android 13+).
+pub(crate) fn hide_in_recents(on: bool) {
+    call_bool("hideInRecents", on);
+}

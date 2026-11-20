@@ -124,3 +124,34 @@ pub(crate) fn authenticate(reason: &str, done: Done) {
         );
     }
 }
+
+/// macOS: every window of the app out of screen capture, or back in.
+#[cfg(target_os = "macos")]
+pub(crate) fn protect_windows(on: bool) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSWindowSharingType};
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let sharing = if on {
+        NSWindowSharingType::None
+    } else {
+        NSWindowSharingType::ReadOnly
+    };
+    let windows = NSApplication::sharedApplication(mtm).windows();
+    for i in 0..windows.count() {
+        windows.objectAtIndex(i).setSharingType(sharing);
+    }
+}
+
+/// iOS: whether the main screen is recorded, mirrored or shared.
+#[cfg(target_os = "ios")]
+#[allow(
+    deprecated,
+    reason = "UIScreen.mainScreen is still the screen the app shows on"
+)]
+pub(crate) fn captured() -> bool {
+    use objc2::MainThreadMarker;
+    use objc2_ui_kit::UIScreen;
+    MainThreadMarker::new().is_some_and(|mtm| UIScreen::mainScreen(mtm).isCaptured())
+}

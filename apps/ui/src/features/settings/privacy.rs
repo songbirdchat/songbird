@@ -104,35 +104,46 @@ fn content() -> AnyElement {
         ))
         .child(section(
             "On this device",
-            vec![
+            [
                 value_row(
                     "App lock",
                     Some(Icon::Lock),
                     move || if settings.with(|x| x.app_lock) { "On".into() } else { "Off".into() },
                     app_lock,
                 ),
+            ]
+            .into_iter()
+            // Linux can't keep an app out of screenshots: no setting that does nothing.
+            .chain((os() != nsh_core::platform::Os::Linux).then(|| {
                 toggle_row_icon(
                     Icon::EyeOff,
                     "Block screenshots",
-                    Some("Stops screenshots and screen recording of Songbird on this device."),
+                    Some(match os() {
+                        nsh_core::platform::Os::Ios => "iOS doesn't let apps stop screenshots. Songbird hides itself while your screen is recorded or shared.",
+                        _ => "Stops screenshots and screen recording of Songbird on this device.",
+                    }),
                     move || settings.with(|x| x.block_screenshots),
                     move |on| s.settings_update(|x| x.block_screenshots = on),
-                ),
+                )
+            }))
+            // The app switcher's snapshot is a phone's (D-0173).
+            .chain(matches!(os(), nsh_core::platform::Os::Ios | nsh_core::platform::Os::Android).then(|| {
                 toggle_row_icon(
                     Icon::Layers,
                     "Hide content in app switcher",
                     Some("Shows a blank screen when you switch apps."),
                     move || settings.with(|x| x.hide_in_switcher),
                     move |on| s.settings_update(|x| x.hide_in_switcher = on),
-                ),
-                toggle_row_icon(
-                    Icon::Link,
-                    "Link previews",
-                    Some("Previews are made on your device. Nobody else learns which links you share."),
-                    move || settings.with(|x| x.link_previews),
-                    move |on| s.settings_update(|x| x.link_previews = on),
-                ),
-            ],
+                )
+            }))
+            .chain([toggle_row_icon(
+                Icon::Link,
+                "Link previews",
+                Some("Previews are made on your device. Nobody else learns which links you share."),
+                move || settings.with(|x| x.link_previews),
+                move |on| s.settings_update(|x| x.link_previews = on),
+            )])
+            .collect(),
         ))
         .child(section(
             "Advanced",
