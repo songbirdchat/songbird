@@ -199,6 +199,28 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0156 — The group change log on the device
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent, within D-0070 ("ciphertext under a key the members share")
+- Decision: a per-group random **log key**, made by the creator, kept in the encrypted store and
+  handed to members in a group message (`GroupUpdate.log_key`, a new field 5): the "created"
+  update, an update after each add, and one from any member that processes a join by link.
+  Each commit a device makes (adds, removals, committed leaves, link-key settings) carries a
+  version-2 bundle entry sealed under the key, bound to the group and the commit's epoch, and
+  signed by the committer's leaf as §6.7 already required (the server checks the signature, and
+  cannot read or forge an entry). "Member changes" reads the log, opens what it can and names
+  people from the store.
+- Rejected: the epoch's exporter as the key (no device that joins later could read anything
+  before it joined, which is the log's purpose).
+- Also fixed: `songbird-content`'s guard test refused the client-only app-core crate it was
+  written before; client-only crates are now named, and nothing else may depend on them.
+- Evidence: `gate_a2::the_change_log_is_written_encrypted_and_read_by_members` (the creator's
+  key reaches the member; the add is in the log with actor and subject; a removal is logged
+  after it); the whole A2 gate (15) and P05 (14) pass.
+- Consequences: a change naming more people than 2 KiB of ciphertext holds is left unlogged.
+
 ## D-0155 — Devices enforce group roles: verified member accounts
 
 - Date: 2026-11-20

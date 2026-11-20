@@ -1644,7 +1644,9 @@ async fn timers_pins_polls_and_group_events() {
         .unwrap();
     assert!(
         known
-            .chunks_exact(32)
+            .as_chunks::<32>()
+            .0
+            .iter()
             .any(|c| c[..16] == alice.core.local().device && c[16..] == alice.account)
     );
     assert!(matches!(

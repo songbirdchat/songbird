@@ -1493,6 +1493,15 @@ A commit the rule refuses gets 403 `role`, and clients drop it.
     (`u64::MAX` for all) answers `n u16 | n × (epoch u64 | len u16 | entry)`, at most 200, for
     the same devices as the state.
 
+- **The log key and entries on the device** (D-0156): a group's creator draws a random 32-byte
+  **log key**; it reaches members in a group message (`GroupUpdate.log_key`) sent after every
+  add (the "created" update for the first members) and by a member that processes a join by
+  link. An entry's ciphertext is `nonce [12] | ChaCha20-Poly1305(log key, nonce, 1 | at_ms u64 |
+  GroupUpdate{kind, actor, subjects}, aad = "songbird.v1/change-log-entry\0" | group |
+  from_epoch u64)`. Apps write one with each add, removal, committed leave and settings change
+  they commit, and show the entries they can open as "Member changes". Entries that do not
+  open (written before a member had the key, or with another) are left out.
+
 ### 6.8 Invite links and join requests (M3, D-0071)
 
 - **A link** is `handle [16]` (random, chosen by the app) and a 32-byte secret. Both travel
