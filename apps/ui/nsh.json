@@ -8,15 +8,18 @@
   "root": "App",
   "ios": {
     "infoPlist": {
-      "NSCameraUsageDescription": "Songbird uses the camera to scan codes when you link a device or verify a contact, to take photos and videos you choose to send, and for video calls. Nothing it sees leaves your device unless you send it, and what you send is end-to-end encrypted."
+      "NSCameraUsageDescription": "Songbird uses the camera to scan codes when you link a device or verify a contact, to take photos and videos you choose to send, and for video calls. Nothing it sees leaves your device unless you send it, and what you send is end-to-end encrypted.",
+      "NSMicrophoneUsageDescription": "Songbird uses the microphone for calls, and for voice messages you choose to record. Your voice goes only to the people in the call or chat, end-to-end encrypted."
     }
   },
   "macos": {
     "infoPlist": {
-      "NSCameraUsageDescription": "Songbird uses the camera to scan codes when you link a device or verify a contact, to take photos and videos you choose to send, and for video calls. Nothing it sees leaves your device unless you send it, and what you send is end-to-end encrypted."
+      "NSCameraUsageDescription": "Songbird uses the camera to scan codes when you link a device or verify a contact, to take photos and videos you choose to send, and for video calls. Nothing it sees leaves your device unless you send it, and what you send is end-to-end encrypted.",
+      "NSMicrophoneUsageDescription": "Songbird uses the microphone for calls, and for voice messages you choose to record. Your voice goes only to the people in the call or chat, end-to-end encrypted."
     },
     "entitlements": {
-      "com.apple.security.device.camera": true
+      "com.apple.security.device.camera": true,
+      "com.apple.security.device.audio-input": true
     }
   }
 }

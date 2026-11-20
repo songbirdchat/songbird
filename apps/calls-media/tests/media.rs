@@ -175,13 +175,14 @@ async fn camera(call: &Call) -> tokio::task::JoinHandle<()> {
     let sender = call.publish_camera(320, 240).await.unwrap();
     tokio::spawn(async move {
         let y = vec![200u8; 320 * 240];
-        let uv = vec![128u8; 160 * 120];
+        // NV12, as cameras give it: interleaved CbCr at half the rows.
+        let uv = vec![128u8; 320 * 120];
         let mut tick = tokio::time::interval(Duration::from_millis(33));
         let mut ts = 0i64;
         loop {
             tick.tick().await;
             ts += 33_000;
-            let _ = sender.send_i420((320, 240), (&y, &uv, &uv), ts);
+            let _ = sender.send_nv12((320, 240), (&y, 320), (&uv, 320), ts);
         }
     })
 }
@@ -291,6 +292,20 @@ async fn audio_and_video_cross_encrypted() {
         .await;
         assert!(ok, "the right key must decrypt");
     }
+    // The data channel (where hellos travel), encrypted like the media.
+    a.send_data("songbird.test", b"hello".to_vec(), Some(&b_id))
+        .await
+        .unwrap();
+    let got = until(&mut b_rx, 20, |e| match e {
+        Event::Data {
+            identity,
+            topic,
+            payload,
+        } if identity == a_id && topic == "songbird.test" => Some(payload),
+        _ => None,
+    })
+    .await;
+    assert_eq!(got, b"hello");
     t.abort();
     c.abort();
     a.leave().await.unwrap();

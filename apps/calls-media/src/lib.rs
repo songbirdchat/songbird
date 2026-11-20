@@ -28,7 +28,7 @@ use livekit::e2ee::{E2eeOptions, EncryptionType};
 use livekit::options::{TrackPublishOptions, VideoCodec};
 use livekit::prelude::{
     ConnectionState, LocalAudioTrack, LocalTrack, LocalVideoTrack, Participant,
-    ParticipantIdentity, RemoteTrack, Room, RoomEvent, RoomOptions, TrackSource,
+    ParticipantIdentity, RemoteTrack, Room, RoomEvent, RoomOptions, TrackSid, TrackSource,
 };
 use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::webrtc::audio_source::{AudioSourceOptions, RtcAudioSource};
@@ -102,8 +102,15 @@ pub enum Event {
         video: bool,
         muted: bool,
     },
-    /// The participants now speaking, loudest first.
-    Speaking(Vec<String>),
+    /// A participant sent data on the room's encrypted data channel.
+    Data {
+        identity: String,
+        topic: String,
+        payload: Vec<u8>,
+    },
+    /// The participants now speaking (this device included), loudest first, with their audio
+    /// level (0 to 1).
+    Speaking(Vec<(String, f32)>),
     /// The connection is being re-established.
     Reconnecting,
     /// The connection is back.
@@ -248,6 +255,68 @@ impl VideoSender {
             timestamp_us,
             frame_metadata: None,
             buffer: buf,
+        })
+    }
+
+    /// Sends one NV12 frame (what cameras give): a luma plane of `luma_stride` bytes per row and
+    /// an interleaved `CbCr` plane of half the rows. Returns `false` if it was malformed or
+    /// dropped.
+    #[must_use]
+    pub fn send_nv12(
+        &self,
+        (width, height): (u32, u32),
+        (luma, luma_stride): (&[u8], usize),
+        (chroma, chroma_stride): (&[u8], usize),
+        timestamp_us: i64,
+    ) -> bool {
+        let size = |v: u32| usize::try_from(v).unwrap_or(usize::MAX);
+        let (cols, rows) = (size(width), size(height));
+        let (half_cols, half_rows) = (size(width.div_ceil(2)), size(height.div_ceil(2)));
+        if width == 0
+            || height == 0
+            || luma_stride < cols
+            || chroma_stride < half_cols.saturating_mul(2)
+            || luma.len() < luma_stride.saturating_mul(rows)
+            || chroma.len() < chroma_stride.saturating_mul(half_rows)
+        {
+            return false;
+        }
+        let mut packed = Vec::with_capacity(cols * rows);
+        for row in luma.chunks(luma_stride).take(rows) {
+            packed.extend_from_slice(row.get(..cols).unwrap_or_default());
+        }
+        let mut blue = Vec::with_capacity(half_cols * half_rows);
+        let mut red = Vec::with_capacity(half_cols * half_rows);
+        for row in chroma.chunks(chroma_stride).take(half_rows) {
+            for [cb, cr] in row
+                .get(..half_cols * 2)
+                .unwrap_or_default()
+                .as_chunks::<2>()
+                .0
+            {
+                blue.push(*cb);
+                red.push(*cr);
+            }
+        }
+        self.send_i420((width, height), (&packed, &blue, &red), timestamp_us)
+    }
+
+    /// Sends one 32-bit BGRA frame (what some cameras give), `stride` bytes per row. Returns
+    /// `false` if it was malformed or dropped.
+    #[must_use]
+    pub fn send_bgra(
+        &self,
+        (width, height): (u32, u32),
+        (data, stride): (&[u8], u32),
+        timestamp_us: i64,
+    ) -> bool {
+        bgra_to_i420(data, stride, width, height).is_some_and(|buffer| {
+            self.source.capture_frame(&VideoFrame {
+                rotation: VideoRotation::VideoRotation0,
+                timestamp_us,
+                frame_metadata: None,
+                buffer,
+            })
         })
     }
 
@@ -529,7 +598,7 @@ impl Call {
         Ok(VideoSender { source, track })
     }
 
-    async fn publish(&self, track: LocalTrack, source: TrackSource) -> Result<()> {
+    async fn publish(&self, track: LocalTrack, source: TrackSource) -> Result<TrackSid> {
         let options = TrackPublishOptions {
             source,
             // VP8 decodes everywhere LiveKit runs, with E2EE on every platform.
@@ -539,20 +608,86 @@ impl Call {
             simulcast: matches!(source, TrackSource::Camera),
             ..TrackPublishOptions::default()
         };
-        self.room
+        let publication = self
+            .room
             .local_participant()
             .publish_track(track, options)
             .await
             .map_err(|e| Error::Room(e.to_string()))?;
         let i = self.send_index.lock().map_or(0, |g| *g);
         set_sender_index(&self.room, &self.own, i);
-        Ok(())
+        Ok(publication.sid())
+    }
+
+    /// Shares the screen (or one window, with `window`): on macOS the system's picker asks
+    /// which; elsewhere the first screen (or window) the platform lists. Frames go out as a
+    /// screen-share track (encrypted like the camera) until [`ScreenShare::stop`].
+    pub async fn share_screen(&self, window: bool) -> Result<ScreenShare> {
+        let source = NativeVideoSource::new(
+            VideoResolution {
+                width: 1920,
+                height: 1080,
+            },
+            true,
+        );
+        let track =
+            LocalVideoTrack::create_video_track("screen", RtcVideoSource::Native(source.clone()));
+        let sid = self
+            .publish(LocalTrack::Video(track), TrackSource::Screenshare)
+            .await?;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let thread_stop = stop.clone();
+        std::thread::Builder::new()
+            .name("songbird-screen".into())
+            .spawn(move || screen_thread(window, &source, &thread_stop, started_tx))
+            .map_err(|e| Error::Room(e.to_string()))?;
+        let share = ScreenShare {
+            stop,
+            sid,
+            room: self.room.clone(),
+        };
+        if started_rx.await.unwrap_or(false) {
+            Ok(share)
+        } else {
+            share.stop().await;
+            Err(Error::Room("screen capture is not available".into()))
+        }
+    }
+
+    /// Sends `payload` to everyone in the room (or to `to` only) on the data channel, reliably,
+    /// encrypted end to end like the media.
+    pub async fn send_data(&self, topic: &str, payload: Vec<u8>, to: Option<&str>) -> Result<()> {
+        let packet = livekit::DataPacket {
+            payload,
+            topic: Some(topic.to_owned()),
+            reliable: true,
+            destination_identities: to
+                .map(|t| vec![ParticipantIdentity(t.to_owned())])
+                .unwrap_or_default(),
+        };
+        self.room
+            .local_participant()
+            .publish_data(packet)
+            .await
+            .map_err(|e| Error::Room(e.to_string()))
     }
 
     /// Whether the room is connected.
     #[must_use]
     pub fn connected(&self) -> bool {
         self.room.connection_state() == ConnectionState::Connected
+    }
+
+    /// Leaves the call, from any handle to it (the microphone and speaker are released).
+    pub async fn close(&self) -> Result<()> {
+        if let Ok(mut m) = self.microphone.lock() {
+            m.take();
+        }
+        self.room
+            .close()
+            .await
+            .map_err(|e| Error::Room(e.to_string()))
     }
 
     /// Leaves the call.
@@ -647,10 +782,20 @@ impl Pump {
                 video: publication.source() != TrackSource::Microphone,
                 muted: false,
             }),
+            RoomEvent::DataReceived {
+                payload,
+                topic,
+                participant: Some(p),
+                ..
+            } => Some(Event::Data {
+                identity: p.identity().to_string(),
+                topic: topic.unwrap_or_default(),
+                payload: payload.as_ref().clone(),
+            }),
             RoomEvent::ActiveSpeakersChanged { speakers } => Some(Event::Speaking(
                 speakers
                     .iter()
-                    .map(|p: &Participant| p.identity().to_string())
+                    .map(|p: &Participant| (p.identity().to_string(), p.audio_level()))
                     .collect(),
             )),
             RoomEvent::LocalTrackPublished { .. } | RoomEvent::LocalTrackRepublished { .. } => {
@@ -674,6 +819,110 @@ impl Pump {
             _ => None,
         }
     }
+}
+
+/// A screen being shared; [`Self::stop`] ends it.
+pub struct ScreenShare {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    sid: TrackSid,
+    room: Arc<Room>,
+}
+
+impl std::fmt::Debug for ScreenShare {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ScreenShare")
+    }
+}
+
+impl ScreenShare {
+    /// Stops capturing and takes the track out of the call.
+    pub async fn stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self
+            .room
+            .local_participant()
+            .unpublish_track(&self.sid)
+            .await;
+    }
+}
+
+/// Screen frames per second.
+const SCREEN_FPS: u64 = 15;
+
+/// Captures the screen on its own thread (the capturer is not `Send`) until `stop`, converting
+/// each BGRA frame to I420 for the encoder. Says on `started` whether capture began.
+fn screen_thread(
+    window: bool,
+    source: &NativeVideoSource,
+    stop: &std::sync::atomic::AtomicBool,
+    started: tokio::sync::oneshot::Sender<bool>,
+) {
+    use livekit::webrtc::desktop_capturer::{
+        DesktopCaptureSourceType, DesktopCapturer, DesktopCapturerOptions,
+    };
+    let kind = if window {
+        DesktopCaptureSourceType::Window
+    } else {
+        DesktopCaptureSourceType::Screen
+    };
+    let mut options = DesktopCapturerOptions::new(kind);
+    options.set_include_cursor(true);
+    let Some(mut capturer) = DesktopCapturer::new(options) else {
+        let _ = started.send(false);
+        return;
+    };
+    // macOS asks with its own picker (no source); elsewhere the first the platform lists.
+    let chosen = if cfg!(target_os = "macos") {
+        None
+    } else {
+        let first = capturer.get_source_list().into_iter().next();
+        if first.is_none() {
+            let _ = started.send(false);
+            return;
+        }
+        first
+    };
+    let sink = source.clone();
+    let epoch = std::time::Instant::now();
+    capturer.start_capture(chosen, move |frame| {
+        let Ok(frame) = frame else { return };
+        let (Ok(width), Ok(height)) = (u32::try_from(frame.width()), u32::try_from(frame.height()))
+        else {
+            return;
+        };
+        if let Some(buffer) = bgra_to_i420(frame.data(), frame.stride(), width, height) {
+            let _ = sink.capture_frame(&VideoFrame {
+                rotation: VideoRotation::VideoRotation0,
+                timestamp_us: i64::try_from(epoch.elapsed().as_micros()).unwrap_or(i64::MAX),
+                frame_metadata: None,
+                buffer,
+            });
+        }
+    });
+    let _ = started.send(true);
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        capturer.capture_frame();
+        std::thread::sleep(std::time::Duration::from_millis(1000 / SCREEN_FPS));
+    }
+}
+
+/// A BGRA frame (libyuv's "ARGB") as I420; `None` if its sizes do not add up.
+fn bgra_to_i420(data: &[u8], stride: u32, width: u32, height: u32) -> Option<I420Buffer> {
+    let (cols, rows) = (i32::try_from(width).ok()?, i32::try_from(height).ok()?);
+    if width == 0
+        || height == 0
+        || stride < width.checked_mul(4)?
+        || u64::try_from(data.len()).ok()? < u64::from(stride) * u64::from(height)
+    {
+        return None;
+    }
+    let mut buffer = I420Buffer::new(width, height);
+    let (sy, su, sv) = buffer.strides();
+    let (luma, blue, red) = buffer.data_mut();
+    livekit::webrtc::native::yuv_helper::argb_to_i420(
+        data, stride, luma, sy, blue, su, red, sv, cols, rows,
+    );
+    Some(buffer)
 }
 
 /// Puts every frame cryptor of this device's own tracks on key `index`.
@@ -710,5 +959,16 @@ mod tests {
         let _ = rustls::ClientConfig::builder()
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_no_client_auth();
+    }
+}
+
+#[cfg(test)]
+mod send_check {
+    fn send_sync<T: Send + Sync>() {}
+    #[test]
+    fn handles_cross_threads() {
+        send_sync::<super::Call>();
+        send_sync::<super::VideoSender>();
+        send_sync::<super::RemoteVideo>();
     }
 }

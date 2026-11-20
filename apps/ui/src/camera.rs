@@ -358,6 +358,14 @@ impl Session {
         }
     }
 
+    /// Switches to the lens `id` (a call's devices sheet).
+    pub fn select(&self, id: &str) {
+        *self.chosen.borrow_mut() = Some(id.to_owned());
+        if let Some(c) = self.capture.borrow_mut().as_mut() {
+            c.set_lens(id);
+        }
+    }
+
     /// The frames of a [`Purpose::Call`] session, newest wins (taken once).
     pub fn take_frames(&self) -> Option<mailbox::Receiver<Frame>> {
         self.frames.borrow_mut().take()
@@ -479,6 +487,21 @@ pub fn camera_view(session: &Session, size: f32, caption: impl Into<SharedString
             ),
         })
     }))
+}
+
+/// The cameras this device has (desktops show their names in a call's devices sheet).
+pub fn lens_names() -> Vec<String> {
+    current()
+        .and_then(|c| c.backend)
+        .map(|b| b.lenses().into_iter().map(|l| l.name).collect())
+        .unwrap_or_default()
+}
+
+/// The camera at `index` of [`lens_names`]: its id, to switch a session to it.
+pub fn lens_id(index: usize) -> Option<String> {
+    current()
+        .and_then(|c| c.backend)
+        .and_then(|b| b.lenses().into_iter().nth(index).map(|l| l.id))
 }
 
 /// Whether the platform draws a live preview (`songbird/camera`); a demo or test camera does

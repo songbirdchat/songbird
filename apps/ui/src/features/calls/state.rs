@@ -1,14 +1,17 @@
 //! The call state machine, in plain Rust (no NSH), so it is unit tested.
 //!
-//! **Mock.** There is no media yet (LiveKit and the call keys arrive with
-//! app-core). A call walks its phases on a 250ms tick the call layer
-//! drives: Calling → Ringing → Connecting → Connected → Ended for an
-//! outgoing call, Incoming → Connecting → Connected → Ended for one that
-//! rings here. The real app-core reports these phases from signalling.
+//! A **real** call (a chat app-core owns, D-0152) moves through its phases on what signalling
+//! and the media room report (`backend::calls`): Calling → Ringing → Connecting → Connected →
+//! Ended for an outgoing call, Incoming → Connecting → Connected → Ended for one that rings
+//! here. The 250 ms tick only counts: connected time, how long a ring has left, the ended
+//! state's seconds.
+//!
+//! The demo fixtures (screenshots, previews) walk the same phases on timers instead: there is
+//! no one at the other end of a demo chat.
 
 use crate::store::{CallDirection, ChatId};
 
-/// One tick of the mock, in milliseconds.
+/// One tick, in milliseconds.
 pub const TICK_MS: u64 = 250;
 /// Ticks per second.
 pub const PER_SEC: u32 = (1000 / TICK_MS) as u32;
@@ -61,6 +64,14 @@ pub enum EndReason {
     LeftLobby,
     /// The user chose not to allow the microphone.
     NoMicrophone,
+    /// The other person declined.
+    TheyDeclined,
+    /// The other person was in another call.
+    Busy,
+    /// Nobody answered before the ring ran out.
+    NoAnswer,
+    /// The call could not be set up, or the connection was lost.
+    Failed,
 }
 
 /// Grid of equal tiles or one big speaker.
@@ -87,8 +98,14 @@ pub struct Participant {
     pub muted: bool,
     pub hand: bool,
     pub video: bool,
-    /// Connected ticks after which their tile arrives (group calls).
+    /// Connected ticks after which their tile arrives (demo group calls; 0 in real calls).
     pub joins_at: u32,
+    /// Their participant identity in the room (real calls).
+    pub identity: String,
+    /// Whether their frames decrypt (false: shown as "can't decrypt", never played).
+    pub decrypting: bool,
+    /// Speaking now.
+    pub speaking: bool,
 }
 
 /// Someone waiting in a call link's lobby (the admin's side).
@@ -126,12 +143,20 @@ pub struct ActiveCall {
     pub minimised: bool,
     pub participants: Vec<Participant>,
     pub waiting: Vec<Waiting>,
-    /// Indices into the mock device lists (desktop).
+    /// Indices into the device lists (desktop).
     pub mic: usize,
     pub camera: usize,
     pub output: usize,
     /// Demo: another device answers after [`ELSEWHERE_TICKS`].
     pub answered_elsewhere: bool,
+    /// A real call: signalling and media move it, not the demo's timers.
+    pub real: bool,
+    /// Ticks a ring has left (real: Incoming, and Calling/Ringing for an outgoing call).
+    pub ring_left: u32,
+    /// The verification code from the call's key (four indices into [`SYMBOLS`]).
+    pub code: Option<[u8; 4]>,
+    /// The microphone's level now (0 to 1), from the room's speaker reports.
+    pub level: f32,
 }
 
 impl ActiveCall {
@@ -162,6 +187,17 @@ impl ActiveCall {
             camera: 0,
             output: 0,
             answered_elsewhere: false,
+            real: false,
+            ring_left: 0,
+            code: None,
+            level: 0.0,
+        }
+    }
+
+    /// Moves a real call to `phase` (from signalling or the room).
+    pub fn set_phase(&mut self, phase: Phase) {
+        if !self.ended() && self.phase != phase {
+            self.go(phase);
         }
     }
 
@@ -205,6 +241,11 @@ impl ActiveCall {
             EndReason::AnsweredElsewhere | EndReason::NoMicrophone => None,
             EndReason::LeftLobby => None,
             EndReason::Declined => Some((CallDirection::Incoming, 0)),
+            EndReason::TheyDeclined | EndReason::Busy | EndReason::NoAnswer => {
+                Some((CallDirection::Outgoing, 0))
+            }
+            EndReason::Failed if self.incoming => Some((CallDirection::Incoming, self.secs())),
+            EndReason::Failed => Some((CallDirection::Outgoing, self.secs())),
             EndReason::Hangup if self.incoming => Some((CallDirection::Incoming, self.secs())),
             EndReason::Hangup => Some((
                 CallDirection::Outgoing,
@@ -259,15 +300,20 @@ impl ActiveCall {
                     hand: false,
                     video: false,
                     joins_at: self.connected,
+                    identity: String::new(),
+                    decrypting: true,
+                    speaking: false,
                 });
             }
         }
     }
 
-    /// One tick of the mock. Returns what to log, and whether the call is
-    /// over and should be cleared.
+    /// One tick. Returns what to log, and whether the call is over and should be cleared.
     pub fn tick(&mut self) -> Step {
         self.ticks += 1;
+        if self.real {
+            return self.tick_real();
+        }
         let mut step = Step::default();
         match self.phase {
             Phase::Permission => {}
@@ -283,7 +329,7 @@ impl ActiveCall {
             }
             Phase::Connected => {
                 self.connected += 1;
-                // mock: someone in a group raises a hand after a while.
+                // demo: someone in a group raises a hand after a while.
                 if self.group && self.connected == 10 * PER_SEC {
                     if let Some(p) = self.participants.get_mut(1) {
                         p.hand = true;
@@ -297,11 +343,46 @@ impl ActiveCall {
     }
 }
 
+impl ActiveCall {
+    /// A real call's tick: counting only; a ring that runs out ends the call.
+    fn tick_real(&mut self) -> Step {
+        let mut step = Step::default();
+        match self.phase {
+            Phase::Connected => self.connected += 1,
+            Phase::Incoming | Phase::Calling | Phase::Ringing => {
+                self.ring_left = self.ring_left.saturating_sub(1);
+                if self.ring_left == 0 {
+                    let reason = if self.phase == Phase::Incoming {
+                        EndReason::Missed
+                    } else {
+                        EndReason::NoAnswer
+                    };
+                    step.log = self.end(reason);
+                    step.ended = true;
+                }
+            }
+            // Joining the room should take seconds; a minute means it failed.
+            Phase::Connecting if self.ticks >= CONNECT_LIMIT_TICKS => {
+                step.log = self.end(EndReason::Failed);
+                step.ended = true;
+            }
+            Phase::Ended(_) if self.ticks >= ENDED_TICKS => step.clear = true,
+            _ => {}
+        }
+        step
+    }
+}
+
+/// A real call gives up connecting after this long.
+pub const CONNECT_LIMIT_TICKS: u32 = 60 * PER_SEC;
+
 /// What one tick asks the UI to do.
 #[derive(Debug, Default, PartialEq)]
 pub struct Step {
     pub log: Option<(CallDirection, u32)>,
     pub clear: bool,
+    /// A real call ended on this tick (its room and signalling are closed).
+    pub ended: bool,
 }
 
 /// The global the call layer follows.
@@ -373,6 +454,11 @@ pub fn ended_line(reason: EndReason, secs: u32) -> String {
         EndReason::AnsweredElsewhere => "Answered on your phone".into(),
         EndReason::LeftLobby => "You left the call".into(),
         EndReason::NoMicrophone => "Calls need your microphone".into(),
+        EndReason::TheyDeclined => "Call declined".into(),
+        EndReason::Busy => "On another call".into(),
+        EndReason::NoAnswer => "No answer".into(),
+        EndReason::Failed if secs > 0 => format!("Call lost · {}", short(secs)),
+        EndReason::Failed => "Call couldn't connect".into(),
     }
 }
 
@@ -454,11 +540,13 @@ fn fnv(bytes: &[u8]) -> u64 {
     })
 }
 
-/// The four symbols both sides compare: 24 bits of a hash, 6 per symbol.
-///
-/// mock: hashed from the call id. The real code comes from the call's
-/// key agreement (app-core), so both devices derive the same four only
-/// when no one sits in the middle.
+/// The four symbols of a code from the call's key (`songbird_content::call`'s
+/// `verification_code`): both devices show the same four only when they hold the same key.
+pub fn symbols(code: [u8; 4]) -> [(&'static str, &'static str); 4] {
+    code.map(|i| SYMBOLS[usize::from(i & 63)])
+}
+
+/// The demo's code (no key behind a demo call): 24 bits of a hash of its id, 6 per symbol.
 pub fn verification_code(call_id: u64, chat: Option<ChatId>) -> [(&'static str, &'static str); 4] {
     let key = format!("songbird-call:{call_id}:{}", chat.unwrap_or(0));
     let h = fnv(key.as_bytes());
@@ -467,7 +555,7 @@ pub fn verification_code(call_id: u64, chat: Option<ChatId>) -> [(&'static str, 
 
 // ------------------------------------------------------------------ devices
 
-/// mock: the device lists app-core reads from the platform.
+/// The demo's device lists (real calls list the platform's: `backend::calls::devices`).
 pub const MICS: [&str; 3] = [
     "Built-in microphone",
     "Headset microphone",
@@ -602,6 +690,9 @@ mod tests {
                 hand: false,
                 video: false,
                 joins_at: i as u32 * 4,
+                identity: String::new(),
+                decrypting: true,
+                speaking: false,
             })
             .collect();
         c.phase = Phase::Connected;

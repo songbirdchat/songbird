@@ -199,6 +199,60 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0152 — Calls, part 3: the app's call screens on real calls
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision (`apps/ui/src/backend/calls.rs`, `features/calls`):
+  1. **A call in a chat app-core owns is real.** Its phases come from signalling and the room,
+     not timers: Calling until the ticket is in, Ringing (1:1) until the answer, Connecting until
+     the other person is in the room, Connected; a group call is open as soon as the room is.
+     Incoming offers ring for their own deadline, only from chats app-core owns (never a
+     non-contact); an offer during a call answers "busy" (new `Messenger::busy_call`). Another
+     of the account's devices answering stops the ring here. Whoever ends a 1:1 call tells the
+     other side (hang-up, or decline while ringing); a ring that runs out ends as "No answer" or
+     "Missed". New end lines: declined, on another call, no answer, couldn't connect / lost.
+  2. **Keys without the core lock.** `Messenger::group_call_secret` gives the epoch secret and
+     epoch; the media layer derives every sender key from it as newcomers arrive. Every commit
+     in the call's group (received, or this device's own) installs the new epoch at once and
+     sends with it a second later (§8.2).
+  3. **Names are signed** (PROTOCOL §8.2 "Hellos"): a participant identity is unlinkable, so a
+     group call's tiles would otherwise name nobody; any member could claim to be another if
+     the hello were not signed by the device key and checked against the signed device list. A
+     1:1 call's other participant can only be the person called (the only other key holder),
+     and a hello naming anyone else is ignored.
+  4. **Verification code from the key** (PROTOCOL §8.2): `songbird_content::call`'s
+     `verification_code`, the same on both sides only with the same epoch secret.
+  5. **Media in the UI:** the microphone through the platform's audio device module (macOS asks
+     on first use; `NSMicrophoneUsageDescription` and the audio-input entitlement added); the
+     self-view's camera session feeds the call's encoder (NV12 or BGRA); remote video shows as
+     RGBA frames (`ImageSrc::rgba`, no encoding) at up to 15 a second, turned upright; a tile
+     whose frames do not decrypt shows "Can't decrypt" and nothing of theirs; a ring around who
+     speaks; the mic meter follows the level the room measures. Screen sharing uses macOS's
+     system picker (elsewhere the first screen or window listed). The devices sheet lists the
+     computer's microphones, cameras and speakers and switches to the one picked. Raised hands
+     travel on the encrypted data channel.
+  6. **Demo-only until real:** the demo's timed calls stay for demo chats; the Calls tab's "make
+     it ring" rows and call links show only in demo builds until call links are real on the
+     device (a link nobody can join must never be offered).
+  7. **Build:** `apps/ui` links libwebrtc (`-ObjC` on Apple targets in `apps/ui/.cargo/config.toml`)
+     and `apps/calls-media` refuses to build without `LK_CUSTOM_WEBRTC` (so `webrtc-sys` never
+     downloads one unchecked).
+- Evidence:
+  - `gate_a2::calls_ring_answer_and_agree_on_keys` against the real stack, extended: equal
+    verification codes; a hello verifies to its account, and fails for another identity or with
+    a forged account; `group_call_secret` gives the same keys and code on both members; a busy
+    reply reaches the caller.
+  - `apps/calls-media`: the data channel carries a payload end to end; NV12 frames arrive as
+    the right picture (three LiveKit tests pass).
+  - `songbird-content`: codes agree only on the same secret; `apps/ui`: 213 tests, including
+    frame rotation and participant IDs; the app starts with libwebrtc linked.
+  - Not yet exercised: two app instances calling each other through the UI (the pieces each
+    have their test; the end-to-end run needs two registered devices on screen).
+- Consequences: call links on the device are next; the phone speaker route and the mobile
+  builds of call media wait for the native hosts (P08).
+
 ## D-0151 — Calls, part 2: call media on LiveKit's Rust SDK, end-to-end encrypted
 
 - Date: 2026-11-20

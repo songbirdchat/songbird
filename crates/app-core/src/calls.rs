@@ -13,8 +13,8 @@
 use openmls::prelude::*;
 use songbird_content::call::EpochSecret;
 use songbird_content::schema::{
-    CallAnswer, CallDecline, CallHangup, CallMessage, CallOffer, Content, call_event, call_hangup,
-    call_message, content::Body,
+    CallAnswer, CallBusy, CallDecline, CallHangup, CallMessage, CallOffer, Content, call_event,
+    call_hangup, call_message, content::Body,
 };
 use songbird_proto::frame::{SendHints, SendStatus};
 use zeroize::Zeroizing;
@@ -189,12 +189,45 @@ impl<N: Net> Messenger<N> {
             .await
     }
 
+    /// Tells a caller this device is in another call.
+    pub async fn busy_call(&mut self, caller: &[u8; 16], call: &[u8; 16]) -> Result<()> {
+        self.signal(caller, call, call_message::Kind::Busy(CallBusy {}))
+            .await
+    }
+
     /// Hangs up a 1:1 call.
     pub async fn hang_up(&mut self, peer: &[u8; 16], call: &[u8; 16]) -> Result<()> {
         let h = CallHangup {
             reason: call_hangup::Reason::Normal.into(),
         };
         self.signal(peer, call, call_message::Kind::Hangup(h)).await
+    }
+
+    /// A group call's epoch secret at the group's current epoch, and the epoch: the media layer
+    /// derives every participant's sender key from it ([`EpochSecret::group`]) without coming
+    /// back here for each newcomer. Asked again after every commit (a new epoch).
+    pub fn group_call_secret(
+        &self,
+        gid: &[u8; 16],
+        call: &[u8; 16],
+    ) -> Result<(Zeroizing<[u8; 32]>, u64)> {
+        let group = self.load_group(gid)?;
+        let exported = Zeroizing::new(
+            group
+                .export_secret(
+                    self.mls.crypto(),
+                    songbird_content::call::GROUP_EXPORTER_LABEL,
+                    call,
+                    songbird_content::call::GROUP_EXPORTER_LEN,
+                )
+                .map_err(|_| Error::Malformed)?,
+        );
+        let mut secret = Zeroizing::new([0u8; 32]);
+        if exported.len() != secret.len() {
+            return Err(Error::Malformed);
+        }
+        secret.copy_from_slice(&exported);
+        Ok((secret, group.epoch().as_u64()))
     }
 
     /// The sender key of `identity` in a group's call at the group's current epoch.
@@ -204,25 +237,72 @@ impl<N: Net> Messenger<N> {
         call: &[u8; 16],
         identity: &str,
     ) -> Result<(u32, Zeroizing<[u8; 32]>)> {
-        let group = self.load_group(gid)?;
-        let exported = group
-            .export_secret(
-                self.mls.crypto(),
-                songbird_content::call::GROUP_EXPORTER_LABEL,
-                call,
-                songbird_content::call::GROUP_EXPORTER_LEN,
-            )
-            .map_err(|_| Error::Malformed)?;
-        let exported: [u8; 32] = exported
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::Malformed)?;
-        let e = EpochSecret::group(exported, group.epoch().as_u64());
+        let (secret, epoch) = self.group_call_secret(gid, call)?;
+        let e = EpochSecret::group(*secret, epoch);
         Ok((
             e.key_index(),
             e.sender_key(identity.as_bytes())
                 .map_err(|_| Error::Malformed)?,
         ))
+    }
+
+    /// This device's hello in a call (sent on the room's encrypted data channel, topic
+    /// [`HELLO_TOPIC`]): who stands behind its participant identity, signed with the device's
+    /// identity key so no other participant can claim to be someone else.
+    pub fn call_hello(&self, call: &[u8; 16], identity: &str) -> Result<Vec<u8>> {
+        let (account, device) = (self.local.account, self.local.device);
+        let msg = hello_message(call, identity, &account, &device)?;
+        let sig = self.local.identity.sign(&msg)?;
+        let mut out = Vec::with_capacity(HELLO_LEN);
+        out.extend_from_slice(&account);
+        out.extend_from_slice(&device);
+        out.extend_from_slice(&sig);
+        Ok(out)
+    }
+
+    /// Checks a participant's hello: the device is in the account's signed device list and
+    /// signed this call and identity. Answers the account.
+    pub async fn verify_hello(
+        &mut self,
+        call: &[u8; 16],
+        identity: &str,
+        hello: &[u8],
+    ) -> Result<[u8; 16]> {
+        if hello.len() != HELLO_LEN {
+            return Err(Error::Malformed);
+        }
+        let account: [u8; 16] = hello
+            .get(..16)
+            .and_then(|b| b.try_into().ok())
+            .ok_or(Error::Malformed)?;
+        let device: [u8; 16] = hello
+            .get(16..32)
+            .and_then(|b| b.try_into().ok())
+            .ok_or(Error::Malformed)?;
+        let sig: [u8; 64] = hello
+            .get(32..)
+            .and_then(|b| b.try_into().ok())
+            .ok_or(Error::Malformed)?;
+        let msg = hello_message(call, identity, &account, &device)?;
+        let mut key = self
+            .devices_of(&account, false)
+            .await?
+            .into_iter()
+            .find(|(d, _)| *d == device);
+        if key.is_none() {
+            // A device linked since the list was last fetched.
+            key = self
+                .devices_of(&account, true)
+                .await?
+                .into_iter()
+                .find(|(d, _)| *d == device);
+        }
+        let (_, ik) = key.ok_or(Error::Verify)?;
+        if songbird_keys::xeddsa::verify(&ik, &msg, &sig) {
+            Ok(account)
+        } else {
+            Err(Error::Verify)
+        }
     }
 
     /// Sends a call signal to every device of `to` (sealed, kept at most 60 s if undelivered).
@@ -264,6 +344,44 @@ impl<N: Net> Messenger<N> {
             _ => Err(Error::Server(0)),
         }
     }
+}
+
+/// The data-channel topic of a participant's hello ([`Messenger::call_hello`]).
+pub const HELLO_TOPIC: &str = "songbird.v1/call-hello";
+/// What a hello signs over: this context, the call, the identity, account and device.
+const HELLO_CONTEXT: &[u8] = b"songbird.v1/call-hello\0";
+/// A hello: account (16), device (16), XEdDSA signature (64).
+const HELLO_LEN: usize = 96;
+
+fn hello_message(
+    call: &[u8; 16],
+    identity: &str,
+    account: &[u8; 16],
+    device: &[u8; 16],
+) -> Result<Vec<u8>> {
+    let n = u8::try_from(identity.len()).map_err(|_| Error::Malformed)?;
+    let mut m = Vec::with_capacity(HELLO_CONTEXT.len() + 16 + 1 + identity.len() + 32);
+    m.extend_from_slice(HELLO_CONTEXT);
+    m.extend_from_slice(call);
+    m.push(n);
+    m.extend_from_slice(identity.as_bytes());
+    m.extend_from_slice(account);
+    m.extend_from_slice(device);
+    Ok(m)
+}
+
+/// A call's verification code (four symbols of 6 bits) in a 1:1 call, from the offer's secret.
+pub fn one_to_one_code(call: &[u8; 16], secret: &[u8]) -> Result<[u8; 4]> {
+    let secret: [u8; 32] = secret.try_into().map_err(|_| Error::Malformed)?;
+    Ok(EpochSecret::one_to_one(call, &secret)
+        .map_err(|_| Error::Malformed)?
+        .verification_code())
+}
+
+/// A group call's verification code at `epoch`, from [`Messenger::group_call_secret`].
+#[must_use]
+pub fn group_code(secret: &[u8; 32], epoch: u64) -> [u8; 4] {
+    EpochSecret::group(*secret, epoch).verification_code()
 }
 
 /// The sender key of `identity` in a 1:1 call (epoch 0), from the offer's secret:

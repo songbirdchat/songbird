@@ -64,7 +64,11 @@ Status: ☐ open · ☑ done (with the commit).
 **M6 attachments, the rest (a, b, c):** voice notes (microphone, e), video playback, view-once, the user's own GPS position (e; picking on the map is done), view-once,
 download, save, HD, auto-download.
 
-**Calls (b, c, e):** LiveKit client media, devices, screen share, call links, verification symbols.
+**Calls (b, c, e):** done for 1:1 and group calls (D-0151, D-0152): LiveKit media end-to-end
+encrypted, devices, screen share, verification symbols from the call's key, signed hellos, raised
+hands. Left: call links on the device (cards, sender keys, lobby; the server's endpoints exist),
+shown only in demo builds until then; the phone speaker route and the iOS and Android builds of
+call media (libwebrtc's mobile archives are pinned, the native hosts are not wired).
 
 **e (native modules):**
 - Face ID and fingerprint

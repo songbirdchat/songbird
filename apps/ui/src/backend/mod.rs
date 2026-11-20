@@ -25,6 +25,7 @@
 pub mod account;
 pub mod avatar;
 pub mod backup;
+pub mod calls;
 pub mod chat;
 pub mod link;
 pub mod lock;

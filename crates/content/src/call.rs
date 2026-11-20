@@ -51,6 +51,8 @@ pub const MAX_RING_MS: u64 = 120_000;
 pub const ONE_TO_ONE_CONTEXT: &[u8] = b"songbird.v1/call-1to1\0";
 /// Domain separation of a sender key.
 pub const SENDER_CONTEXT: &[u8] = b"songbird.v1/call-sender\0";
+/// HKDF info of the verification code ([`EpochSecret::verification_code`]).
+pub const CODE_CONTEXT: &[u8] = b"songbird.v1/call-code\0";
 /// Domain separation of a link's ID.
 pub const LINK_ID_CONTEXT: &[u8] = b"songbird.v1/call-link-id\0";
 /// Domain separation of a link's card key.
@@ -141,6 +143,22 @@ impl EpochSecret {
             .ok_or(Error::Invalid("call.identity"))?;
         let prk = hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, self.secret.as_slice());
         expand(&prk, &[SENDER_CONTEXT, &[n], identity])
+    }
+
+    /// The call's verification code in this epoch: four symbols of 6 bits (indices into the
+    /// apps' list of 64), from `HKDF-Expand(PRK = epoch secret, "songbird.v1/call-code\0", 32)`'s
+    /// first 24 bits. Both sides show the same four only if they hold the same epoch secret,
+    /// that is, if nobody stood between them when the secret was shared.
+    #[must_use]
+    pub fn verification_code(&self) -> [u8; 4] {
+        let prk = hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, self.secret.as_slice());
+        let okm = expand(&prk, &[CODE_CONTEXT]).unwrap_or_default();
+        let bits = okm
+            .iter()
+            .take(3)
+            .fold(0u32, |acc, b| (acc << 8) | u32::from(*b));
+        // Each symbol is 6 bits, so every value fits in a byte.
+        std::array::from_fn(|i| u8::try_from((bits >> (18 - 6 * i)) & 63).unwrap_or(0))
     }
 }
 

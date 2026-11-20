@@ -43,7 +43,7 @@ const K_DB_KEY: &str = "sb.core.db_key";
 const K_DEVICE_IDENTITY: &str = "sb.core.device_identity";
 const DB_FILE: &str = "songbird-core.db";
 
-type Core = Messenger<AppNet>;
+pub(super) type Core = Messenger<AppNet>;
 
 thread_local! {
     /// The core, behind an async lock: one operation at a time, held across
@@ -108,7 +108,7 @@ pub async fn refresh_profile(account: [u8; 16], key: [u8; 32]) {
     }
 }
 
-fn core() -> Rc<tokio::sync::Mutex<Option<Core>>> {
+pub(super) fn core() -> Rc<tokio::sync::Mutex<Option<Core>>> {
     CORE.with(Rc::clone)
 }
 
@@ -129,7 +129,7 @@ pub fn owns(chat: ChatId) -> bool {
     ACCOUNTS.with_borrow(|a| a.contains_key(&chat)) || GROUPS.with_borrow(|g| g.contains_key(&chat))
 }
 
-fn group_of(chat: ChatId) -> Option<[u8; 16]> {
+pub(super) fn group_of(chat: ChatId) -> Option<[u8; 16]> {
     GROUPS.with_borrow(|g| g.get(&chat).copied())
 }
 
@@ -177,7 +177,10 @@ where
         let m = guard
             .as_mut()
             .ok_or_else(|| super::problem("Not connected yet."))?;
-        op(m, gid).await.map_err(|_| super::problem(failed))
+        op(m, gid).await.map_err(|_| super::problem(failed))?;
+        // This device's own commit: a call in the group moves to the new epoch's keys too.
+        super::calls::group_changed(m, &gid);
+        Ok(())
     });
 }
 
@@ -472,7 +475,7 @@ pub fn create_group(s: Store, title: String, members: Vec<ContactId>) -> ChatId 
     chat
 }
 
-fn account_of(chat: ChatId) -> Option<[u8; 16]> {
+pub(super) fn account_of(chat: ChatId) -> Option<[u8; 16]> {
     ACCOUNTS.with_borrow(|a| a.get(&chat).copied())
 }
 
@@ -681,6 +684,7 @@ pub async fn start() -> Result<(), super::Problem> {
 
 /// Closes app-core (disconnect, forget).
 pub fn stop() {
+    super::calls::stop();
     let lock = core();
     if let Ok(mut g) = lock.try_lock() {
         *g = None;
@@ -1132,6 +1136,8 @@ pub async fn receive(envelope: &[u8]) -> bool {
             true
         }
         Ok(Received::GroupUpdated { group, title }) => {
+            // A commit: a call in the group moves to the new epoch's keys.
+            super::calls::group_changed(m, &group);
             let devices = m.group_devices(&group).map(|d| d.len()).unwrap_or(0);
             if let Some(s) = crate::store::try_store() {
                 let chat = ensure_group(s, group, &title);
@@ -1143,11 +1149,21 @@ pub async fn receive(envelope: &[u8]) -> bool {
             true
         }
         Ok(Received::RemovedFromGroup { group }) => {
+            super::calls::group_left(&group);
             if let Some(s) = crate::store::try_store() {
                 let chat = ui_id(&group);
                 s.push_message(chat, None, Body::System("You were removed".into()));
                 s.edit_chat(chat, |c| c.members.retain(|x| x.contact.is_some()));
             }
+            true
+        }
+        Ok(Received::Call {
+            account,
+            group,
+            call,
+            signal,
+        }) => {
+            super::calls::signal(m, account, group, call, signal).await;
             true
         }
         Ok(_) => true,
@@ -1294,7 +1310,7 @@ pub fn send(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
     });
 }
 
-fn me_account() -> [u8; 16] {
+pub(super) fn me_account() -> [u8; 16] {
     live()
         .with_untracked(|l| l.account.as_deref().and_then(hex16))
         .unwrap_or([0; 16])

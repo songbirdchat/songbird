@@ -1884,6 +1884,16 @@ timestamp, counter) cannot collide across senders.
   ring for late frames. The server also disconnects removed devices from the SFU (§8.6).
 - **Call links** are §8.4.
 
+- **The verification code** (D-0152) both people compare: the first 24 bits of
+  `HKDF-Expand(PRK = epoch secret, "songbird.v1/call-code\0", 32)`, four symbols of 6 bits
+  (indices into the apps' list of 64). It changes with every group epoch.
+- **Hellos** (D-0152): on joining, and to each newcomer, a device sends on the room's encrypted
+  data channel (topic `songbird.v1/call-hello`) `account (16) ‖ device (16) ‖ XEdDSA signature
+  (64)` by its device identity key over `"songbird.v1/call-hello\0" ‖ call ID ‖ u8(len) ‖
+  identity ‖ account ‖ device`. Receivers check the device in the account's signed device list
+  before showing a name; until then the tile names nobody. A raised hand is one byte (1 or 0)
+  on topic `songbird.v1/call-hand`.
+
 ### 8.3 Rules for apps
 
 - Never reuse a `call_secret` or a call ID; never send a sender key or secret outside a Signal

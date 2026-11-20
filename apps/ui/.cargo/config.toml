@@ -1,0 +1,5 @@
+# libwebrtc (call media, D-0151) keeps its Objective-C code in categories inside a static
+# library; Apple's linker drops them unless told to load every Objective-C member, and the app
+# then aborts at start.
+[target.'cfg(target_vendor = "apple")']
+rustflags = ["-C", "link-arg=-ObjC"]

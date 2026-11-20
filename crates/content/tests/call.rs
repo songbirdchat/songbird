@@ -324,3 +324,19 @@ proptest! {
         let _ = open_card(&[1; 32], &b);
     }
 }
+
+#[test]
+fn verification_codes_agree_only_on_the_same_secret() {
+    let call = [7u8; 16];
+    let a = EpochSecret::one_to_one(&call, &[1; 32]).unwrap();
+    let b = EpochSecret::one_to_one(&call, &[1; 32]).unwrap();
+    let other = EpochSecret::one_to_one(&call, &[2; 32]).unwrap();
+    assert_eq!(a.verification_code(), b.verification_code());
+    assert_ne!(a.verification_code(), other.verification_code());
+    assert!(a.verification_code().iter().all(|s| *s < 64));
+    // A new group epoch shows a new code.
+    assert_ne!(
+        EpochSecret::group([9; 32], 3).verification_code(),
+        EpochSecret::group([8; 32], 4).verification_code()
+    );
+}

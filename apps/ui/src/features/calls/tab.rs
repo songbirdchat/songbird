@@ -72,7 +72,9 @@ pub fn calls_tab() -> AnyElement {
             move || filter.get(),
             move |f| filter.set(f),
         )))
-        .child(
+        // Call links run on the demo's sample links only until links are real on the device
+        // (D-0152): a link must never be offered that nobody can join.
+        .child(crate::store::demo().then(|| {
             view().pt_3().child(group([Row::new("Create call link")
                 .leading(
                     view()
@@ -86,10 +88,10 @@ pub fn calls_tab() -> AnyElement {
                 )
                 .subtitle("Anyone with the link can join")
                 .on_press(move || link_open.set(true))
-                .build()])),
-        )
+                .build()]))
+        }))
         .child(when(
-            move || s.call_links.with(|l| !l.is_empty()),
+            move || crate::store::demo() && s.call_links.with(|l| !l.is_empty()),
             move || {
                 view()
                     .child(section_title("Call links"))
@@ -135,8 +137,8 @@ pub fn calls_tab() -> AnyElement {
             "Your call history is end-to-end encrypted and synced across your devices.",
         ));
     // Developer and preview builds only (never a release): rows that make
-    // the mock ring, to test calls and their notifications on a device.
-    let footer = if crate::PREVIEW_BUILD {
+    // the demo ring, to test calls and their notifications on a device.
+    let footer = if crate::store::demo() {
         footer.child(demo(s))
     } else {
         footer
@@ -563,7 +565,7 @@ fn link_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
         } else {
             n
         };
-        // mock: app-core creates the link's room and its key; the key
+        // demo: app-core will create the link's room and its key; the key
         // travels in the link's fragment, never to the server.
         // One link per name and lobby setting: creating it again (a
         // double press, the same form twice) shows the link you have.
@@ -634,7 +636,7 @@ fn link_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
     )
 }
 
-/// Developer and preview builds only: make the mock ring here (no calls
+/// Developer and preview builds only: make the demo ring here (no calls
 /// arrive yet). Set apart and marked, never in a release build.
 fn demo(s: Store) -> View {
     let ana = 1;

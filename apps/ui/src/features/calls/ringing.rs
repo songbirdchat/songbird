@@ -231,18 +231,23 @@ fn card(s: Store) -> AnyElement {
 }
 
 /// Desktops, before the first call: why Songbird needs the microphone.
-/// Continue hands over to the system's own prompt (mock: allowed at
+/// Continue hands over to the system's own prompt (demo: allowed at
 /// once); after a "Not now", the next call explains how to turn it on.
 pub fn permission() -> AnyElement {
     let mic = global::<MicAccess>();
     let denied = mic.get_untracked() == MicAccess::Denied;
     let allow = move || {
-        // mock: app-core asks the OS (AVCaptureDevice / PipeWire portal /
-        // Windows privacy settings) and reports the answer.
+        // The system's own prompt follows when the call opens the microphone (macOS asks the
+        // first time an app records; Windows and Linux follow their privacy settings).
         mic.set(MicAccess::Allowed);
+        let mut started = None;
         with_call(|c| {
             c.permission(true);
+            started = Some(c.clone());
         });
+        if let Some(call) = started {
+            super::start_real(&call);
+        }
     };
     let not_now = move || {
         mic.set(MicAccess::Denied);

@@ -1194,7 +1194,7 @@ async fn channels_and_communities() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn calls_ring_answer_and_agree_on_keys() {
-    use songbird_app_core::calls::{Signal, one_to_one_key};
+    use songbird_app_core::calls::{Signal, one_to_one_code, one_to_one_key};
     let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
         return;
     };
@@ -1255,6 +1255,35 @@ async fn calls_ring_answer_and_agree_on_keys() {
         &*a_on_a.1,
         &*one_to_one_key(&call, &got, &bt.identity).unwrap().1
     );
+    // The verification code agrees only on the same secret.
+    assert_eq!(
+        one_to_one_code(&call, &secret[..]).unwrap(),
+        one_to_one_code(&call, &got).unwrap()
+    );
+    // Hellos: each device says who it is in the room, signed with its device key; the other
+    // checks it against the signed device list. A hello for another identity, or tampered, fails.
+    let hello = alice.core.call_hello(&call, &ticket.identity).unwrap();
+    assert_eq!(
+        bob.core
+            .verify_hello(&call, &ticket.identity, &hello)
+            .await
+            .unwrap(),
+        alice.account
+    );
+    assert!(
+        bob.core
+            .verify_hello(&call, &bt.identity, &hello)
+            .await
+            .is_err()
+    );
+    let mut forged = hello.clone();
+    forged[..16].copy_from_slice(&bob.account);
+    assert!(
+        bob.core
+            .verify_hello(&call, &ticket.identity, &forged)
+            .await
+            .is_err()
+    );
     // Hanging up reaches Bob.
     alice.core.hang_up(&bob.account, &call).await.unwrap();
     assert!(matches!(
@@ -1299,4 +1328,34 @@ async fn calls_ring_answer_and_agree_on_keys() {
         .unwrap();
     let b = bob.core.group_call_key(&gid, &call, &gt.identity).unwrap();
     assert_eq!((a.0, &*a.1), (b.0, &*b.1));
+    // The secret the media layer derives from gives the same keys and code on both members.
+    let (sa, ea) = alice.core.group_call_secret(&gid, &call).unwrap();
+    let (sb, eb) = bob.core.group_call_secret(&gid, &call).unwrap();
+    assert_eq!((&*sa, ea), (&*sb, eb));
+    let e = songbird_content::call::EpochSecret::group(*sa, ea);
+    assert_eq!(&*e.sender_key(gt.identity.as_bytes()).unwrap(), &*a.1);
+    assert_eq!(
+        songbird_app_core::calls::group_code(&sa, ea),
+        songbird_app_core::calls::group_code(&sb, eb)
+    );
+
+    // Busy: Bob, in a call, answers a new 1:1 offer with "busy".
+    let (t2, _) = alice.core.start_call(&bob.account, false).await.unwrap();
+    let Received::Call {
+        call: c2,
+        signal: Signal::Offer { .. },
+        ..
+    } = pump_app(&mut bob).await
+    else {
+        panic!("a second offer")
+    };
+    assert_eq!(c2, t2.call);
+    bob.core.busy_call(&alice.account, &c2).await.unwrap();
+    assert!(matches!(
+        pump_app(&mut alice).await,
+        Received::Call {
+            signal: Signal::Busy,
+            ..
+        }
+    ));
 }
