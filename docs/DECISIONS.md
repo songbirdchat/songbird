@@ -199,6 +199,30 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0177 — Passkeys on the device; the IP setting that wasn't one
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Passkeys** are made and used by the system's own sheet: AuthenticationServices on macOS
+    and iOS, the platform CredentialManager on Android 14+ (no Play Services library; older
+    Android has no passkeys here). Adding one (Account → Passkeys) asks the server for a
+    challenge, makes the passkey, registers it (`PUT /v1/account/passkeys`) and lists the
+    account's from the server; removing one deletes it there. A device being linked can answer
+    the factor with a passkey instead of the PIN: an assertion over
+    `link_challenge(transcript)`, as the server checks. The relying party a new device uses is
+    the server's web domain (the api host without its first label). Before this, "Add a
+    passkey" waited a moment and added a made-up entry.
+  - **"Protect IP address in calls"** did nothing, and needn't: every call's media goes
+    through Songbird's call server, so the people you call never see your IP address. The
+    toggle became a plain statement of that.
+- Consequences: the system binds passkeys to the domain: the iOS app needs the
+  `webcredentials:songbird.chat` entitlement and `apple-app-site-association` (team ID), the
+  Android app `assetlinks.json` (signing key), and `[api.keys.devices]` the apps' origins.
+  Until then the system refuses, and the app says so. Windows Hello passkeys (webauthn.dll) and
+  Linux have none yet.
+
 ## D-0176 — Calls and push on phones
 
 - Date: 2026-11-20

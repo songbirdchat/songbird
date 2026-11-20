@@ -6,6 +6,7 @@
 //! - [`audio`]: a call's audio on a phone: the microphone's permission, the speaker.
 //! - [`callkit`]: incoming calls on iOS: PushKit wakes the app, CallKit rings.
 //! - [`biometrics`]: Face ID, Touch ID, fingerprints, Windows Hello.
+//! - [`passkeys`]: the platform's passkeys (WebAuthn), for the account's second factor.
 //! - [`photos`]: saving a photo or video the person chose (or received, with "Save to photos").
 //! - [`push`]: the device's push token (APNs, FCM).
 //! - [`location`]: one position, when the person asks to share where they are.
@@ -23,6 +24,7 @@ pub mod callkit;
 #[cfg(target_os = "linux")]
 mod linux;
 pub mod location;
+pub mod passkeys;
 pub mod photos;
 pub mod push;
 pub mod screen;

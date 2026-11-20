@@ -149,6 +149,31 @@ pub async fn complete(w: Waiting) -> Result<Step, Problem> {
     .await
 }
 
+/// Links with one of the account's passkeys (D-0177): an assertion over this link's
+/// transcript, so it approves exactly this token, device and pair of keys.
+pub async fn with_passkey(mut pending: Pending) -> Result<Step, Problem> {
+    let ep = endpoint();
+    let r = &pending.request;
+    let t = link_transcript(
+        LINK_IDENTITY_CONTEXT,
+        &ep.api_name,
+        &r.token,
+        &r.device,
+        &r.auth_key,
+        &r.identity_key,
+    )
+    .map_err(|_| problem("The server's name is too long."))?;
+    let challenge = songbird_keys::webauthn::link_challenge(&t);
+    let a = super::passkeys::assert(&super::passkeys::rp_for(&ep.api_name), &challenge).await?;
+    pending.request.factor = Factor::Passkey {
+        credential_id: a.credential_id,
+        authenticator_data: a.authenticator_data,
+        client_data_json: a.client_data_json,
+        signature: a.signature,
+    };
+    submit(pending).await
+}
+
 /// Links with the account's two-step PIN (6 to 12 digits).
 pub async fn with_pin(mut pending: Pending, pin: String) -> Result<Step, Problem> {
     pending.request.factor = Factor::Pin(pin);

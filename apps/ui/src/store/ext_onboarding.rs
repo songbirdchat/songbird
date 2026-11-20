@@ -538,29 +538,53 @@ impl Store {
     }
 
     /// Mock: a passkey made by the platform (app-core `add_passkey`).
-    pub fn add_passkey(&self) {
-        let name = if is_desktop() {
-            "Passkey on this computer"
-        } else {
-            "Passkey on this phone"
-        };
-        self.account_extra()
-            .update(|a| a.passkeys.push(name.into()));
-        self.settings_update(|s| s.passkey = true);
+    /// Makes a passkey with the system's sheet and registers it (D-0177).
+    ///
+    /// # Errors
+    /// A [`crate::backend::Problem`].
+    pub async fn add_passkey(&self) -> Result<(), crate::backend::Problem> {
+        let account = crate::backend::live()
+            .with_untracked(|l| l.account.as_deref().and_then(crate::backend::wire::unhex))
+            .and_then(|b| <[u8; 16]>::try_from(b).ok())
+            .ok_or_else(|| crate::backend::problem("Create your account on the server first."))?;
+        let name = self.profile_name_for_passkey();
+        crate::backend::passkeys::add(account, name).await?;
+        self.refresh_passkeys().await
+    }
+
+    fn profile_name_for_passkey(&self) -> String {
+        crate::backend::live()
+            .with_untracked(|l| l.username.clone())
+            .map_or_else(|| "Songbird".into(), |u| format!("@{u}"))
+    }
+
+    /// The account's passkeys, as the server lists them.
+    ///
+    /// # Errors
+    /// A [`crate::backend::Problem`].
+    pub async fn refresh_passkeys(&self) -> Result<(), crate::backend::Problem> {
+        let ids = crate::backend::passkeys::list().await?;
+        let names: Vec<String> = ids
+            .iter()
+            .map(|id| format!("Passkey {}", &id[..id.len().min(8)]))
+            .collect();
+        let any = !names.is_empty();
+        self.account_extra().update(|a| a.passkeys = names);
+        self.settings_update(|s| s.passkey = any);
+        Ok(())
     }
 
     pub fn remove_passkey(&self, index: usize) {
-        self.account_extra().update(|a| {
-            if index < a.passkeys.len() {
-                a.passkeys.remove(index);
-            }
+        let s = *self;
+        crate::backend::run(async move {
+            let ids = crate::backend::passkeys::list().await?;
+            let id = ids
+                .get(index)
+                .cloned()
+                .ok_or_else(|| crate::backend::problem("That passkey is already gone."))?;
+            crate::backend::passkeys::remove(id).await?;
+            s.refresh_passkeys().await
         });
-        let none = self
-            .account_extra()
-            .with_untracked(|a| a.passkeys.is_empty());
-        if none {
-            self.settings_update(|s| s.passkey = false);
-        }
     }
 
     /// Mock: the account report (app-core `export_account`), ready after a

@@ -103,6 +103,18 @@ pub(super) fn link_device(s: Store, f: Flow) -> View {
             spawn(async move { on_step(crate::backend::link::with_pin(p, code).await) });
         }
     };
+    // Or one of the account's passkeys, kept by this device's system (D-0177).
+    let send_passkey = {
+        let (pending, on_step) = (pending.clone(), on_step.clone());
+        move || {
+            let Some(p) = pending.borrow_mut().take() else {
+                return;
+            };
+            wrong_pin.set(false);
+            let on_step = on_step.clone();
+            spawn(async move { on_step(crate::backend::link::with_passkey(p).await) });
+        }
+    };
     // The real backend: a provisioning channel and a fresh X25519 key; the phone
     // scans the code and sends the account sealed to that key.
     let attempt = {
@@ -197,8 +209,10 @@ pub(super) fn link_device(s: Store, f: Flow) -> View {
                     move || need_pin.get(),
                     {
                         let send_pin = send_pin.clone();
+                        let send_passkey = send_passkey.clone();
                         move || {
                             let send_pin = send_pin.clone();
+                            let send_passkey = send_passkey.clone();
                             view()
                                 .gap_3()
                                 .child(passcode_field_pin(pin, send_pin.clone()))
@@ -210,6 +224,9 @@ pub(super) fn link_device(s: Store, f: Flow) -> View {
                                     )
                                 }))
                                 .child(btn("Link this device", Variant::Primary, BtnSize::Lg, send_pin).w_full())
+                                .child(crate::backend::passkeys::available().then(|| {
+                                    btn("Use a passkey instead", Variant::Ghost, BtnSize::Md, send_passkey).w_full()
+                                }))
                         }
                     },
                 ).otherwise({

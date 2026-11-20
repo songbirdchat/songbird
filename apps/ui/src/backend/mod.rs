@@ -36,6 +36,7 @@ pub mod link;
 pub mod lock;
 pub mod nudge;
 pub mod packs;
+pub mod passkeys;
 pub mod plans;
 pub mod presence;
 pub mod profile;

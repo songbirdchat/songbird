@@ -4534,6 +4534,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6d6f7dab884a28adaec1012eb3889257a49cc145724e35f93ece2d209f8b25"
 dependencies = [
+ "bitflags 2.13.2",
  "block2",
  "objc2",
  "objc2-app-kit",
@@ -7028,6 +7029,7 @@ dependencies = [
  "jni 0.21.1",
  "objc2",
  "objc2-app-kit",
+ "objc2-authentication-services",
  "objc2-avf-audio",
  "objc2-call-kit",
  "objc2-core-location",
@@ -7038,6 +7040,7 @@ dependencies = [
  "objc2-ui-kit",
  "secret-service",
  "security-framework",
+ "serde_json",
  "windows 0.62.2",
  "zbus",
  "zeroize",

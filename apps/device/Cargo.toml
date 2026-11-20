@@ -21,6 +21,7 @@ block2 = "0.6.2"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSError", "NSString", "NSObject", "NSArray", "NSData", "NSDate", "NSValue", "NSNotification", "NSThread", "NSURL", "NSUUID", "NSSet"] }
 objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext", "LAError", "LABiometryType"] }
 objc2-core-location = { version = "0.3.2", default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate", "CLError"] }
+objc2-authentication-services = { version = "0.3.2", default-features = false, features = ["std", "block2", "ASAuthorizationPlatformPublicKeyCredentialProvider", "ASAuthorizationPlatformPublicKeyCredentialRegistrationRequest", "ASAuthorizationPlatformPublicKeyCredentialAssertionRequest", "ASAuthorizationPlatformPublicKeyCredentialDescriptor", "ASAuthorizationPublicKeyCredentialAssertionRequest", "ASAuthorizationPublicKeyCredentialRegistrationRequest", "ASAuthorizationPublicKeyCredentialDescriptor", "ASAuthorizationController", "ASAuthorizationRequest", "ASAuthorization", "ASAuthorizationError"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSWindow"] }
@@ -36,6 +37,8 @@ dispatch2 = "0.3.1"
 # Android: the Keystore and BiometricPrompt in Songbird's Gradle host, over JNI.
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
+# Passkeys (D-0177): the WebAuthn JSON Android's CredentialManager speaks.
+serde_json = "1"
 
 # Windows: DPAPI and Windows Hello; the version NSH links.
 [target.'cfg(target_os = "windows")'.dependencies]

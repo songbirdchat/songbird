@@ -733,3 +733,200 @@ pub(crate) mod callkit {
         manual_audio(false);
     }
 }
+
+// ---------------------------------------------------------------- passkeys (D-0177)
+
+pub(crate) mod passkeys {
+    use std::cell::RefCell;
+
+    use objc2::{
+        AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send,
+        rc::Retained, runtime::AnyObject,
+    };
+    use objc2_authentication_services::{
+        ASAuthorizationController, ASAuthorizationPlatformPublicKeyCredentialDescriptor,
+        ASAuthorizationPlatformPublicKeyCredentialProvider, ASAuthorizationRequest,
+    };
+    use objc2_foundation::{NSArray, NSData, NSError, NSObject, NSString};
+
+    use crate::passkeys::{AssertDone, Assertion, CreateDone, Created, Failure};
+
+    enum Done {
+        Create(CreateDone),
+        Assert(AssertDone),
+    }
+
+    pub(crate) struct Ivars {
+        done: RefCell<Option<Done>>,
+    }
+
+    thread_local! {
+        static LIVE: RefCell<Vec<(Retained<Delegate>, Retained<ASAuthorizationController>)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    fn data(obj: &AnyObject, sel: objc2::runtime::Sel) -> Vec<u8> {
+        // SAFETY: the credential's documented `NSData` properties, looked up by selector.
+        let d: Option<Retained<NSData>> = unsafe { msg_send![obj, performSelector: sel] };
+        d.map(|d| d.to_vec()).unwrap_or_default()
+    }
+
+    define_class!(
+        // SAFETY: a plain NSObject; the controller calls it on the main thread.
+        #[unsafe(super(NSObject))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "SongbirdPasskeyDelegate"]
+        #[ivars = Ivars]
+        pub(crate) struct Delegate;
+
+        impl Delegate {
+            #[unsafe(method(authorizationController:didCompleteWithAuthorization:))]
+            fn done_ok(&self, _c: &ASAuthorizationController, auth: &AnyObject) {
+                // SAFETY: `credential` of the ASAuthorization handed over.
+                let cred: Retained<AnyObject> = unsafe { msg_send![auth, credential] };
+                let id = data(&cred, objc2::sel!(credentialID));
+                let client = data(&cred, objc2::sel!(rawClientDataJSON));
+                match self.ivars().done.borrow_mut().take() {
+                    Some(Done::Create(d)) => d(Ok(Created {
+                        credential_id: id,
+                        client_data_json: client,
+                        attestation_object: data(&cred, objc2::sel!(rawAttestationObject)),
+                    })),
+                    Some(Done::Assert(d)) => d(Ok(Assertion {
+                        credential_id: id,
+                        authenticator_data: data(&cred, objc2::sel!(rawAuthenticatorData)),
+                        client_data_json: client,
+                        signature: data(&cred, objc2::sel!(signature)),
+                    })),
+                    None => {}
+                }
+            }
+
+            #[unsafe(method(authorizationController:didCompleteWithError:))]
+            fn done_err(&self, _c: &ASAuthorizationController, err: &NSError) {
+                // ASAuthorizationErrorCanceled is 1001.
+                let f = if err.code() == 1001 {
+                    Failure::Cancelled
+                } else {
+                    Failure::NotAllowed
+                };
+                match self.ivars().done.borrow_mut().take() {
+                    Some(Done::Create(d)) => d(Err(f)),
+                    Some(Done::Assert(d)) => d(Err(f)),
+                    None => {}
+                }
+            }
+
+            #[unsafe(method_id(presentationAnchorForAuthorizationController:))]
+            fn anchor(&self, _c: &ASAuthorizationController) -> Retained<AnyObject> {
+                window()
+            }
+        }
+    );
+
+    /// The window the system's sheet shows over.
+    fn window() -> Retained<AnyObject> {
+        #[cfg(target_os = "ios")]
+        {
+            let mtm = MainThreadMarker::new().expect("main thread");
+            let app = objc2_ui_kit::UIApplication::sharedApplication(mtm);
+            // SAFETY: the app's windows; the first is the one NSH shows.
+            let windows: Retained<NSArray<AnyObject>> = unsafe { msg_send![&*app, windows] };
+            windows.firstObject().expect("a window")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mtm = MainThreadMarker::new().expect("main thread");
+            let app = objc2_app_kit::NSApplication::sharedApplication(mtm);
+            let w = app.keyWindow().or_else(|| app.mainWindow()).or_else(|| {
+                let ws = app.windows();
+                (ws.count() > 0).then(|| ws.objectAtIndex(0))
+            });
+            Retained::into_super(Retained::into_super(Retained::into_super(
+                w.expect("a window"),
+            )))
+        }
+    }
+
+    fn run(request: Retained<ASAuthorizationRequest>, done: Done) {
+        let Some(mtm) = MainThreadMarker::new() else {
+            match done {
+                Done::Create(d) => d(Err(Failure::Unavailable)),
+                Done::Assert(d) => d(Err(Failure::Unavailable)),
+            }
+            return;
+        };
+        let delegate: Retained<Delegate> = {
+            let this = Delegate::alloc(mtm).set_ivars(Ivars {
+                done: RefCell::new(Some(done)),
+            });
+            // SAFETY: NSObject's designated initializer.
+            unsafe { msg_send![super(this), init] }
+        };
+        // SAFETY: a controller for one request, its delegate and presentation provider ours,
+        // both kept alive (LIVE) until the next request.
+        unsafe {
+            let controller = ASAuthorizationController::initWithAuthorizationRequests(
+                ASAuthorizationController::alloc(),
+                &NSArray::from_retained_slice(&[request]),
+            );
+            let _: () = msg_send![&*controller, setDelegate: &*delegate];
+            let _: () = msg_send![&*controller, setPresentationContextProvider: &*delegate];
+            controller.performRequests();
+            LIVE.with_borrow_mut(|l| {
+                l.retain(|(d, _)| d.ivars().done.borrow().is_some());
+                l.push((delegate, controller));
+            });
+        }
+    }
+
+    fn provider(rp_id: &str) -> Retained<ASAuthorizationPlatformPublicKeyCredentialProvider> {
+        // SAFETY: a provider for the relying party.
+        unsafe {
+            ASAuthorizationPlatformPublicKeyCredentialProvider::initWithRelyingPartyIdentifier(
+                ASAuthorizationPlatformPublicKeyCredentialProvider::alloc(),
+                &NSString::from_str(rp_id),
+            )
+        }
+    }
+
+    pub(crate) fn create(
+        rp_id: &str,
+        user_id: &[u8],
+        name: &str,
+        challenge: &[u8],
+        done: CreateDone,
+    ) {
+        // SAFETY: a registration request from our provider.
+        let req = unsafe {
+            provider(rp_id).createCredentialRegistrationRequestWithChallenge_name_userID(
+                &NSData::with_bytes(challenge),
+                &NSString::from_str(name),
+                &NSData::with_bytes(user_id),
+            )
+        };
+        run(Retained::into_super(req), Done::Create(done));
+    }
+
+    pub(crate) fn assert(rp_id: &str, challenge: &[u8], allow: &[Vec<u8>], done: AssertDone) {
+        // SAFETY: an assertion request from our provider, its allowed credentials set before use.
+        let req = unsafe {
+            let r = provider(rp_id)
+                .createCredentialAssertionRequestWithChallenge(&NSData::with_bytes(challenge));
+            if !allow.is_empty() {
+                let list: Vec<_> = allow
+                    .iter()
+                    .map(|id| {
+                        ASAuthorizationPlatformPublicKeyCredentialDescriptor::initWithCredentialID(
+                            ASAuthorizationPlatformPublicKeyCredentialDescriptor::alloc(),
+                            &NSData::with_bytes(id),
+                        )
+                    })
+                    .collect();
+                r.setAllowedCredentials(&NSArray::from_retained_slice(&list));
+            }
+            r
+        };
+        run(Retained::into_super(req), Done::Assert(done));
+    }
+}

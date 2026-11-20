@@ -24,7 +24,6 @@ pub fn privacy() {
 fn content() -> AnyElement {
     let s = store();
     let settings = s.settings;
-    let ext = s.ext();
     let count_blocked = move || {
         s.contacts
             .with(|cs| cs.iter().filter(|c| c.blocked).count())
@@ -148,13 +147,12 @@ fn content() -> AnyElement {
         .child(section(
             "Advanced",
             vec![
-                toggle_row_icon(
-                    Icon::Shield,
-                    "Protect IP address in calls",
-                    Some("Calls go through Songbird's relay, so the other person can't see your IP address. Call quality may drop a little."),
-                    move || ext.with(|x| x.protect_ip_in_calls),
-                    move |on| s.ext_update(|x| x.protect_ip_in_calls = on),
-                ),
+                // Every call's media goes through Songbird's call server (D-0177): the other
+                // person never sees your IP address, so there is nothing to turn on.
+                Row::new("IP address in calls")
+                    .icon(Icon::Shield)
+                    .subtitle("Calls always go through Songbird's servers, so the people you call never see your IP address.")
+                    .build(),
                 toggle_row_icon(
                     Icon::Alert,
                     "Send crash reports",

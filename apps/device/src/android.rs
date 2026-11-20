@@ -367,3 +367,215 @@ pub extern "system" fn Java_chat_songbird_device_DeviceBridge_nativePushEndpoint
         });
     }
 }
+
+// ---------------------------------------------------------------- passkeys (D-0177)
+
+fn b64url(b: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut s = String::with_capacity(b.len() * 4 / 3 + 2);
+    for chunk in b.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |acc, (i, &x)| acc | (u32::from(x) << (16 - 8 * i)));
+        for i in 0..=chunk.len() {
+            let idx = usize::try_from((n >> (18 - 6 * i)) & 63).unwrap_or(0);
+            s.push(char::from(A.get(idx).copied().unwrap_or(b'A')));
+        }
+    }
+    s
+}
+
+fn unb64url(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.trim_end_matches('=').bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(u8::try_from((acc >> bits) & 0xff).ok()?);
+        }
+    }
+    Some(out)
+}
+
+pub(crate) fn passkeys_available() -> bool {
+    call(
+        "passkeysAvailable",
+        "()Z",
+        |_| Some(Vec::new()),
+        |_, v| v.z().ok(),
+    ) == Some(true)
+}
+
+enum PasskeyDone {
+    Create(crate::passkeys::CreateDone),
+    Assert(crate::passkeys::AssertDone),
+}
+
+static PASSKEYS: Mutex<Vec<(u64, PasskeyDone)>> = Mutex::new(Vec::new());
+
+fn passkey_call(method: &str, json: &str, done: PasskeyDone) {
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    PASSKEYS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((id, done));
+    let started = call(
+        method,
+        "(Ljava/lang/String;J)V",
+        |env| {
+            Some(vec![
+                JValueOwned::Object(env.new_string(json).ok()?.into()),
+                JValueOwned::Long(i64::try_from(id).unwrap_or(i64::MAX)),
+            ])
+        },
+        |_, _| Some(()),
+    );
+    if started.is_none() {
+        finish_passkey(id, 3, "");
+    }
+}
+
+pub(crate) fn passkey_create(
+    rp_id: &str,
+    user_id: &[u8],
+    name: &str,
+    challenge: &[u8],
+    done: crate::passkeys::CreateDone,
+) {
+    let json = serde_json::json!({
+        "rp": { "id": rp_id, "name": "Songbird" },
+        "user": { "id": b64url(user_id), "name": name, "displayName": name },
+        "challenge": b64url(challenge),
+        "pubKeyCredParams": [
+            { "type": "public-key", "alg": -7 },
+            { "type": "public-key", "alg": -8 }
+        ],
+        "timeout": 120_000,
+        "attestation": "none",
+        "authenticatorSelection": { "residentKey": "required", "userVerification": "required" }
+    });
+    passkey_call(
+        "createPasskey",
+        &json.to_string(),
+        PasskeyDone::Create(done),
+    );
+}
+
+pub(crate) fn passkey_assert(
+    rp_id: &str,
+    challenge: &[u8],
+    allow: &[Vec<u8>],
+    done: crate::passkeys::AssertDone,
+) {
+    let json = serde_json::json!({
+        "rpId": rp_id,
+        "challenge": b64url(challenge),
+        "allowCredentials": allow
+            .iter()
+            .map(|id| serde_json::json!({ "type": "public-key", "id": b64url(id) }))
+            .collect::<Vec<_>>(),
+        "userVerification": "required",
+        "timeout": 120_000
+    });
+    passkey_call("getPasskey", &json.to_string(), PasskeyDone::Assert(done));
+}
+
+/// code 0 a response (WebAuthn JSON), 1 cancelled, 2 not allowed, else unavailable.
+fn finish_passkey(id: u64, code: i32, json: &str) {
+    use crate::passkeys::{Assertion, Created, Failure};
+    let done = {
+        let mut l = PASSKEYS.lock().unwrap_or_else(PoisonError::into_inner);
+        l.iter().position(|(i, _)| *i == id).map(|i| l.remove(i).1)
+    };
+    let Some(done) = done else { return };
+    let fail = match code {
+        0 => None,
+        1 => Some(Failure::Cancelled),
+        2 => Some(Failure::NotAllowed),
+        _ => Some(Failure::Unavailable),
+    };
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
+    let field = |path: &str| {
+        v.pointer(path)
+            .and_then(serde_json::Value::as_str)
+            .and_then(unb64url)
+    };
+    match done {
+        PasskeyDone::Create(d) => d(match fail {
+            Some(f) => Err(f),
+            None => match (
+                field("/rawId"),
+                field("/response/clientDataJSON"),
+                field("/response/attestationObject"),
+            ) {
+                (Some(credential_id), Some(client_data_json), Some(attestation_object)) => {
+                    Ok(Created {
+                        credential_id,
+                        client_data_json,
+                        attestation_object,
+                    })
+                }
+                _ => Err(Failure::Unavailable),
+            },
+        }),
+        PasskeyDone::Assert(d) => d(match fail {
+            Some(f) => Err(f),
+            None => match (
+                field("/rawId"),
+                field("/response/authenticatorData"),
+                field("/response/clientDataJSON"),
+                field("/response/signature"),
+            ) {
+                (
+                    Some(credential_id),
+                    Some(authenticator_data),
+                    Some(client_data_json),
+                    Some(signature),
+                ) => Ok(Assertion {
+                    credential_id,
+                    authenticator_data,
+                    client_data_json,
+                    signature,
+                }),
+                _ => Err(Failure::Unavailable),
+            },
+        }),
+    }
+}
+
+/// `DeviceBridge.nativePasskey(id, code, json)`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_chat_songbird_device_DeviceBridge_nativePasskey(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    id: jlong,
+    code: jint,
+    json: jni::objects::JString<'_>,
+) {
+    let json = env.get_string(&json).map(String::from).unwrap_or_default();
+    if let Ok(id) = u64::try_from(id) {
+        finish_passkey(id, code, &json);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn base64url_round_trips() {
+        for n in 0..40u8 {
+            let b: Vec<u8> = (0..n).map(|i| i.wrapping_mul(37)).collect();
+            assert_eq!(super::unb64url(&super::b64url(&b)).unwrap(), b);
+        }
+    }
+}

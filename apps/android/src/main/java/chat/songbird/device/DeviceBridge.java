@@ -420,6 +420,90 @@ public final class DeviceBridge {
 
     static native void nativePushEndpoint(String url, byte[] p256dh, byte[] auth);
 
+    // ------------------------------------------------------------ passkeys (D-0177)
+
+    private static final String PK_TYPE = "androidx.credentials.TYPE_PUBLIC_KEY_CREDENTIAL";
+    private static final String PK_REQUEST = "androidx.credentials.BUNDLE_KEY_REQUEST_JSON";
+    private static final String PK_REGISTERED = "androidx.credentials.BUNDLE_KEY_REGISTRATION_RESPONSE_JSON";
+    private static final String PK_ASSERTED = "androidx.credentials.BUNDLE_KEY_AUTHENTICATION_RESPONSE_JSON";
+
+    /** Android 14+: the platform's CredentialManager, no Play Services library. */
+    static boolean passkeysAvailable() {
+        return Build.VERSION.SDK_INT >= 34 && activity.get() != null;
+    }
+
+    private static int code(Throwable e) {
+        String t = e.getClass().getSimpleName() + " " + e;
+        if (t.contains("Cancel")) return 1;
+        if (t.contains("NoCredential") || t.contains("NotAllowed") || t.contains("Domain") || t.contains("Security")) return 2;
+        return 3;
+    }
+
+    /** Makes a passkey from WebAuthn creation options (JSON); the answer to nativePasskey. */
+    static void createPasskey(String json, long id) {
+        MAIN.post(() -> {
+            Activity a = activity.get();
+            if (a == null || Build.VERSION.SDK_INT < 34) {
+                nativePasskey(id, 3, "");
+                return;
+            }
+            android.os.Bundle data = new android.os.Bundle();
+            data.putString(PK_REQUEST, json);
+            android.credentials.CreateCredentialRequest req =
+                    new android.credentials.CreateCredentialRequest.Builder(PK_TYPE, data, data)
+                            .setAlwaysSendAppInfoToProvider(true).build();
+            a.getSystemService(android.credentials.CredentialManager.class).createCredential(
+                    a, req, new CancellationSignal(), a.getMainExecutor(),
+                    new android.os.OutcomeReceiver<android.credentials.CreateCredentialResponse,
+                            android.credentials.CreateCredentialException>() {
+                        @Override
+                        public void onResult(android.credentials.CreateCredentialResponse r) {
+                            String out = r.getData().getString(PK_REGISTERED);
+                            nativePasskey(id, out == null ? 3 : 0, out == null ? "" : out);
+                        }
+
+                        @Override
+                        public void onError(android.credentials.CreateCredentialException e) {
+                            nativePasskey(id, code(e), "");
+                        }
+                    });
+        });
+    }
+
+    /** An assertion from WebAuthn request options (JSON); the answer to nativePasskey. */
+    static void getPasskey(String json, long id) {
+        MAIN.post(() -> {
+            Activity a = activity.get();
+            if (a == null || Build.VERSION.SDK_INT < 34) {
+                nativePasskey(id, 3, "");
+                return;
+            }
+            android.os.Bundle data = new android.os.Bundle();
+            data.putString(PK_REQUEST, json);
+            android.credentials.GetCredentialRequest req = new android.credentials.GetCredentialRequest.Builder(
+                    new android.os.Bundle())
+                    .addCredentialOption(new android.credentials.CredentialOption.Builder(PK_TYPE, data, data).build())
+                    .build();
+            a.getSystemService(android.credentials.CredentialManager.class).getCredential(
+                    a, req, new CancellationSignal(), a.getMainExecutor(),
+                    new android.os.OutcomeReceiver<android.credentials.GetCredentialResponse,
+                            android.credentials.GetCredentialException>() {
+                        @Override
+                        public void onResult(android.credentials.GetCredentialResponse r) {
+                            String out = r.getCredential().getData().getString(PK_ASSERTED);
+                            nativePasskey(id, out == null ? 3 : 0, out == null ? "" : out);
+                        }
+
+                        @Override
+                        public void onError(android.credentials.GetCredentialException e) {
+                            nativePasskey(id, code(e), "");
+                        }
+                    });
+        });
+    }
+
+    static native void nativePasskey(long id, int code, String json);
+
     static native void nativeInit();
 
     static native void nativeAuthResult(long id, int code);

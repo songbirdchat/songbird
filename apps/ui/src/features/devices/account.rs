@@ -2,8 +2,6 @@
 //! two-step PIN, passkeys, accounts on this device, the account report
 //! and deleting the account.
 
-use std::time::Duration;
-
 use nsh_core::prelude::*;
 
 use crate::{
@@ -24,6 +22,10 @@ fn body() -> AnyElement {
     let pin_open = signal(false);
     let delete_open = signal(false);
     let adding_passkey = signal(false);
+    // The account's passkeys, as the server lists them (D-0177).
+    if crate::backend::is_live() && crate::backend::registered() {
+        crate::backend::run(async move { s.refresh_passkeys().await });
+    }
     let username = move || s.me.with(|m| m.username.clone());
 
     let username_rows = group([
@@ -158,13 +160,20 @@ fn body() -> AnyElement {
                     if adding_passkey.get_untracked() {
                         return;
                     }
+                    if !crate::backend::passkeys::available() {
+                        toast(
+                            "This device can't make passkeys. Add one from your phone or computer.",
+                        );
+                        return;
+                    }
                     adding_passkey.set(true);
-                    // mock: the platform's passkey sheet (app-core `add_passkey`).
-                    set_timeout(Duration::from_millis(1400), move || {
-                        if adding_passkey.try_set(false) {
-                            s.add_passkey();
-                            toast("Passkey added");
-                        }
+                    // The system's passkey sheet, then the server (D-0177).
+                    crate::backend::run(async move {
+                        let r = s.add_passkey().await;
+                        let _ = adding_passkey.try_set(false);
+                        r?;
+                        toast("Passkey added");
+                        Ok(())
                     });
                 })
                 .build(),
