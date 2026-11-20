@@ -3081,7 +3081,9 @@ it never overrides or shortens a moderator's row.
 
 A ticket is opened by the app, signed or not, and read with a bearer secret. Messages are sealed
 on the device and opened only by staff with the support key, or by the app with the ticket's
-reply key: the server stores ciphertext.
+reply key: the server stores ciphertext. `kind` is `help`, `appeal` (signed only), `billing` or
+`crash` (unsigned only: a crash report, scrubbed on the device and sent only when the user turned
+them on; D-0170).
 
 | Request | Auth | Body | Answer |
 | --- | --- | --- | --- |
