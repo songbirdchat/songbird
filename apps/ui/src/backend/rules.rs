@@ -240,9 +240,11 @@ mod tests {
 
     fn scenario() -> Result<(), String> {
         forget();
-        let mut r = ParentalRules::default();
-        r.block_unknown_calls = true;
-        r.nudges = false;
+        let r = ParentalRules {
+            block_unknown_calls: true,
+            nudges: false,
+            ..Default::default()
+        };
         let l = linked(&r, 1);
         check!(unknown_calls_blocked() && nudges_off());
         let contact = [9u8; 16];
@@ -258,8 +260,10 @@ mod tests {
         check!(may_start(&contact, "ana") && pending().is_none());
 
         // A forged policy (another key) is ignored; an older one never replaces a newer one.
-        let mut loose = ParentalRules::default();
-        loose.block_unknown_calls = false;
+        let loose = ParentalRules {
+            block_unknown_calls: false,
+            ..Default::default()
+        };
         let forged = sup::ParentLink {
             seed: [7; 32],
             ..l.clone()
