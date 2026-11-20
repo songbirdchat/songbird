@@ -725,6 +725,9 @@ pub async fn start() -> Result<(), super::Problem> {
     }
     super::calls::show_links(&m);
     if let Some(s) = crate::store::try_store() {
+        super::chat_state::reload(s);
+    }
+    if let Some(s) = crate::store::try_store() {
         super::presence::refresh(s);
         // New contacts (a profile key shared since) start getting presence within minutes.
         if !PRESENCE_TIMER.replace(true) {
@@ -1951,7 +1954,7 @@ fn chat_ui(id: &[u8; 16]) -> ChatId {
 }
 
 /// The app-core chat ID of a real UI chat: its group, else its account.
-fn core_chat(chat: ChatId) -> Option<[u8; 16]> {
+pub fn core_chat(chat: ChatId) -> Option<[u8; 16]> {
     group_of(chat).or_else(|| account_of(chat))
 }
 

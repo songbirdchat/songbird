@@ -152,6 +152,8 @@ impl Store {
             .collect();
         self.book().set(ContactBook(sorted_az(book)));
         self.scenes().set(ChatScenes(scenes));
+        // Real chats' list state another device wrote (D-0163).
+        crate::backend::chat_state::reload(*self);
     }
 
     /// Saves a contact (a new one when its id is empty) and returns its id.

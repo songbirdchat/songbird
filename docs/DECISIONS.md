@@ -199,6 +199,20 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0163 — Chat-list state follows the account across devices
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: each real chat's archived, pinned, muted-until, marked-unread and favourite state
+  and the custom lists it is in are one encrypted record `c/<account or group ID, hex>/state`
+  (PROTOCOL §10.2), last writer wins. Changes are written when the chat list changes; a sync
+  from another device applies them. A chat this device has not written yet takes the synced
+  state instead of overwriting it with its own defaults. Locked chats stay device-only: a lock
+  protects whoever holds this device, and the passcode never leaves it.
+- Consequences: the records server sees one more opaque record per chat that has state; it
+  learns nothing of which chat (keys are encrypted with the records key, D-0047).
+
 ## D-0162 — Locked chats open with the app passcode; real storage and network usage
 
 - Date: 2026-11-20
