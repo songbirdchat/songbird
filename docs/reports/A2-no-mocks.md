@@ -62,8 +62,6 @@ Status: ☐ open · ☑ done (with the commit).
 **a (app only, or an existing endpoint):**
 - Google Drive, OneDrive and Dropbox stores (the crate has them; OAuth needs the owner's apps)
 
-**b (app-core):**
-
 **Groups:** roles on received commits (D-0155), the change log (D-0156), new devices joining by external commit (D-0167).
 
 **M6 attachments, the rest (a, b, c):** the user's own GPS position (e; picking on the map is done). (View-once and video playback: D-0158; voice notes: D-0161.)
