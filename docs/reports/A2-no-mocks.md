@@ -76,16 +76,16 @@ hands. Call links are real too (D-0153): create, join, lobby, admit, revoke, per
 phone speaker route and the iOS and Android builds of
 call media (libwebrtc's mobile archives are pinned, the native hosts are not wired).
 
-**e (native modules):**
-- Face ID and fingerprint
-- block screenshots and hide content in the app switcher
-- alternate app icons
-- notification actions
-- passkeys
-- StoreKit and Play billing
-- push hosts (deferred by the owner)
-- photo-library save
-- background backup scheduling
+**e (native modules):** in `apps/device` (D-0172 to D-0174): device secrets under the Keychain,
+Android Keystore, DPAPI and the Secret Service; Face ID, Touch ID, fingerprint and Windows Hello
+unlock; screen protection and the app switcher cover; saving photos and videos; "Use my
+location". Left:
+- passkeys (the server's are real; the platform sheets need the domain association, apple-app-site-association and assetlinks.json on songbird.chat, and the Apple team ID)
+- StoreKit and Play billing (products in App Store Connect and Play Console)
+- push hosts: APNs (token callbacks added to NSH's app delegate at run time), PushKit and CallKit, FCM or UnifiedPush (Apple and Firebase registrations)
+- mobile call media and the speaker route (libwebrtc's mobile archives are pinned; mobile builds need CMake, and Android its SDK and NDK)
+- notification actions and background backups: NSH has no notification actions or categories and owns the delegate; iOS background tasks must be registered before launch finishes (NSH's runner). Requests for NSH.
+- alternate app icons: no icon artwork yet, and NSH packages one icon set
 
 **d (backend gaps):**
 - a public channel directory (public channels await the owner's legal review, D-0065 §4)
