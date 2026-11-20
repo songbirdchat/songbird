@@ -1237,7 +1237,8 @@ pub fn proxy() {
                     .gap_2()
                     .child(muted("A proxy helps where Songbird is blocked. Your messages stay end\u{2011}to\u{2011}end encrypted through it."))
                     .child(muted("The proxy's operator sees your IP address and when you connect, never your messages or who you talk to."))
-                    .child(muted("Songbird's servers see the proxy's address instead of yours.")),
+                    .child(muted("Songbird's servers see the proxy's address instead of yours."))
+                    .child(muted("Calls connect directly: they need a kind of connection a proxy doesn't carry.")),
             )
             .into_element()
     });
