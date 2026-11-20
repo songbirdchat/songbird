@@ -927,12 +927,12 @@ fn notices(people: Signal<bool>) -> View {
                                     .child(call_pill(
                                         Icon::Ban,
                                         format!("Deny {name}"),
-                                        move || with_call(|c| c.admit(id, false)),
+                                        move || super::decide(id, false),
                                     ))
                                     .child(call_pill(
                                         Icon::Check,
                                         format!("Admit {name}"),
-                                        move || with_call(|c| c.admit(id, true)),
+                                        move || super::decide(id, true),
                                     ))
                             })
                         })
@@ -1585,14 +1585,16 @@ fn verify_sheet(open: Signal<bool>) -> nsh_base::SheetElement {
         },
         None,
     );
-    let (who, group) = calls().with_untracked(|x| {
+    let (who, group, link) = calls().with_untracked(|x| {
         x.call
             .as_ref()
-            .map(|c| (c.title.clone(), c.group))
+            .map(|c| (c.title.clone(), c.group, c.real && c.link))
             .unwrap_or_default()
     });
     let first = who.split_whitespace().next().unwrap_or("them").to_string();
-    let compare = if group {
+    let compare = if link {
+        "A link call has no shared code: each person sends their own key to each other device in a secure session. People who aren't your contacts show as unverified; compare safety numbers with them in a chat to be sure who they are.".to_string()
+    } else if group {
         "Compare these with the others in the call. If they match, your call is end-to-end encrypted.".to_string()
     } else {
         format!("Compare these with {first}. If they match, your call is end-to-end encrypted.")
@@ -1630,6 +1632,7 @@ fn verify_sheet(open: Signal<bool>) -> nsh_base::SheetElement {
                                 .child(text(name).text_size(px(font::CAPTION)).text_color(move || c::on_call().opacity(0.7)))
                         }))
                         .into_element(),
+                    None if link => view().into_element(),
                     None => view()
                         .flex_row()
                         .items_center()
@@ -1764,10 +1767,10 @@ fn people_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
                                                     .flex_row()
                                                     .gap_2()
                                                     .child(sheet_btn("Deny", false, move || {
-                                                        with_call(|c| c.admit(id, false))
+                                                        super::decide(id, false)
                                                     }))
                                                     .child(sheet_btn("Admit", true, move || {
-                                                        with_call(|c| c.admit(id, true))
+                                                        super::decide(id, true)
                                                     }))
                                                     .into_element(),
                                             ),

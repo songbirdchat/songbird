@@ -27,6 +27,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod call_link;
 pub mod close;
 pub mod control;
 pub mod devices;

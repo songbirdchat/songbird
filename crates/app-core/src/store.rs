@@ -24,8 +24,35 @@ use crate::crypto::X25519Pair;
 use crate::session::{Local, Prekeys, Session, Sessions};
 use crate::{Error, Result};
 
+/// A call link this device made (PROTOCOL §8.4): the link is its root; the admin token lets
+/// this device skip the lobby, see who waits, and revoke it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StoredCallLink {
+    /// The link's root (in the link's fragment).
+    pub root: Zeroizing<[u8; 32]>,
+    /// The admin token.
+    pub admin: Zeroizing<[u8; 32]>,
+    /// Its name, shown to people who join.
+    pub name: String,
+    /// A video call (else audio).
+    pub video: bool,
+    /// Whether new people wait in a lobby.
+    pub lobby: bool,
+    /// When the server forgets it.
+    pub expires_ms: u64,
+}
+
+impl std::fmt::Debug for StoredCallLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredCallLink")
+            .field("name", &self.name)
+            .field("lobby", &self.lobby)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The schema version this code writes.
-pub const SCHEMA: i64 = 4;
+pub const SCHEMA: i64 = 5;
 
 /// Outgoing message status, as the UI shows it (`crates/content`'s levels, plus the local ones).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -248,7 +275,82 @@ impl Store {
             ))?;
             db(tx.commit())?;
         }
+        if v < 5 {
+            // Call links this device made (PROTOCOL §8.4, §8.7): the root (the link itself) and
+            // the admin token, which only this store holds.
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "CREATE TABLE call_links (root BLOB PRIMARY KEY, admin BLOB NOT NULL,
+                     name TEXT NOT NULL, video INTEGER NOT NULL, lobby INTEGER NOT NULL,
+                     expires_ms INTEGER NOT NULL);
+                 PRAGMA user_version = 5;",
+            ))?;
+            db(tx.commit())?;
+        }
         Ok(())
+    }
+
+    /// Keeps a call link this device made.
+    pub fn put_call_link(&self, link: &StoredCallLink) -> Result<()> {
+        db(self.db.execute(
+            "INSERT OR REPLACE INTO call_links (root, admin, name, video, lobby, expires_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &link.root[..],
+                &link.admin[..],
+                link.name,
+                i64::from(link.video),
+                i64::from(link.lobby),
+                sql_ms(link.expires_ms)
+            ],
+        ))
+        .map(|_| ())
+    }
+
+    /// The call links this device made, newest last; expired ones are forgotten.
+    pub fn call_links(&self, now_ms: u64) -> Result<Vec<StoredCallLink>> {
+        db(self.db.execute(
+            "DELETE FROM call_links WHERE expires_ms <= ?1",
+            params![sql_ms(now_ms)],
+        ))?;
+        let mut st = db(self.db.prepare(
+            "SELECT root, admin, name, video, lobby, expires_ms FROM call_links ORDER BY rowid",
+        ))?;
+        let rows = db(st.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        }))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (root, admin, name, video, lobby, expires) = db(row)?;
+            let (Ok(root), Ok(admin)) = (<[u8; 32]>::try_from(root), <[u8; 32]>::try_from(admin))
+            else {
+                continue;
+            };
+            out.push(StoredCallLink {
+                root: Zeroizing::new(root),
+                admin: Zeroizing::new(admin),
+                name,
+                video: video != 0,
+                lobby: lobby != 0,
+                expires_ms: u64::try_from(expires).unwrap_or(0),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Forgets a call link (revoked).
+    pub fn delete_call_link(&self, root: &[u8; 32]) -> Result<()> {
+        db(self
+            .db
+            .execute("DELETE FROM call_links WHERE root = ?1", params![&root[..]]))
+        .map(|_| ())
     }
 
     /// Blocks or unblocks an account here (the server is told by the messenger).

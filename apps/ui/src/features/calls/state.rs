@@ -72,6 +72,8 @@ pub enum EndReason {
     NoAnswer,
     /// The call could not be set up, or the connection was lost.
     Failed,
+    /// A call link's admin turned the user away from the lobby (or the link is gone).
+    NotAdmitted,
 }
 
 /// Grid of equal tiles or one big speaker.
@@ -157,6 +159,10 @@ pub struct ActiveCall {
     pub code: Option<[u8; 4]>,
     /// The microphone's level now (0 to 1), from the room's speaker reports.
     pub level: f32,
+    /// A call link's call (real): keys per participant, cards, maybe a lobby.
+    pub link: bool,
+    /// This device administers the link (sees and admits who waits).
+    pub admin: bool,
 }
 
 impl ActiveCall {
@@ -191,6 +197,8 @@ impl ActiveCall {
             ring_left: 0,
             code: None,
             level: 0.0,
+            link: false,
+            admin: false,
         }
     }
 
@@ -239,7 +247,7 @@ impl ActiveCall {
             EndReason::Missed => Some((CallDirection::Missed, 0)),
             // The device that answered logs it; history syncs.
             EndReason::AnsweredElsewhere | EndReason::NoMicrophone => None,
-            EndReason::LeftLobby => None,
+            EndReason::LeftLobby | EndReason::NotAdmitted => None,
             EndReason::Declined => Some((CallDirection::Incoming, 0)),
             EndReason::TheyDeclined | EndReason::Busy | EndReason::NoAnswer => {
                 Some((CallDirection::Outgoing, 0))
@@ -459,6 +467,7 @@ pub fn ended_line(reason: EndReason, secs: u32) -> String {
         EndReason::NoAnswer => "No answer".into(),
         EndReason::Failed if secs > 0 => format!("Call lost · {}", short(secs)),
         EndReason::Failed => "Call couldn't connect".into(),
+        EndReason::NotAdmitted => "You weren't let in".into(),
     }
 }
 

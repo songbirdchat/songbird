@@ -27,8 +27,8 @@ use crate::{
     ui::*,
 };
 
-use state::{ActiveCall, Waiting};
-pub use state::{CallState, EndReason, Layout, MicAccess, Participant, Phase, Share};
+use state::ActiveCall;
+pub use state::{CallState, EndReason, Layout, MicAccess, Participant, Phase, Share, Waiting};
 pub use tab::calls_tab;
 
 /// The call global.
@@ -169,7 +169,9 @@ fn ring_ticks(ms: u64) -> u32 {
 /// Asks the backend to set up a real call that just left its first phase (or the permission
 /// explainer).
 fn start_real(call: &ActiveCall) {
-    if call.real
+    if call.real && call.link && call.phase == Phase::Connecting {
+        crate::backend::calls::join_link(call.id);
+    } else if call.real
         && !call.incoming
         && call.phase == Phase::Calling
         && let Some(chat) = call.chat
@@ -201,6 +203,35 @@ fn simulate_in(s: &Store, chat: ChatId, video: bool, elsewhere: bool) {
         s.arrive(crate::store::Arrival::Call { chat, video });
     }
     announce_for_accessibility(format!("{name} is calling"));
+}
+
+/// Opens a call link (pasted or tapped): the user's own links by their name, anyone else's as
+/// "Call link"; in through the lobby where it has one. `false` if `url` is not a call link.
+pub fn open_link(url: &str) -> bool {
+    let Some((root, own)) = crate::backend::calls::describe_link(url) else {
+        return false;
+    };
+    let (title, admin) = match own {
+        Some((name, _)) => (name, true),
+        None => ("Call link".to_string(), false),
+    };
+    let seed = u64::from_be_bytes(root[..8].try_into().unwrap_or_default()) >> 3;
+    let mut call = ActiveCall::new(next_id(), title, seed, Phase::Connecting);
+    call.group = true;
+    call.real = true;
+    call.link = true;
+    call.admin = admin;
+    crate::backend::calls::prepare_link(call.id, root);
+    begin(call);
+    true
+}
+
+/// Lets someone in from a link's lobby, or turns them away (the admin's side).
+fn decide(id: u64, let_in: bool) {
+    match real_id() {
+        Some(call) => crate::backend::calls::admit(call, id, let_in),
+        None => with_call(|c| c.admit(id, let_in)),
+    }
 }
 
 /// Joins a call link: the user's own links open with the lobby on the

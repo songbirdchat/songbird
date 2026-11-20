@@ -3,7 +3,7 @@
 
 use nsh_core::prelude::*;
 
-use super::{join_link, simulate_in, start_call_in, state};
+use super::{join_link, open_link, simulate_in, start_call_in, state};
 use crate::{
     nav,
     store::{
@@ -72,9 +72,8 @@ pub fn calls_tab() -> AnyElement {
             move || filter.get(),
             move |f| filter.set(f),
         )))
-        // Call links run on the demo's sample links only until links are real on the device
-        // (D-0152): a link must never be offered that nobody can join.
-        .child(crate::store::demo().then(|| {
+        // Links are made on the server (real) or are the demo's samples.
+        .child((crate::store::demo() || real_links()).then(|| {
             view().pt_3().child(group([Row::new("Create call link")
                 .leading(
                     view()
@@ -91,7 +90,7 @@ pub fn calls_tab() -> AnyElement {
                 .build()]))
         }))
         .child(when(
-            move || crate::store::demo() && s.call_links.with(|l| !l.is_empty()),
+            move || (crate::store::demo() || real_links()) && s.call_links.with(|l| !l.is_empty()),
             move || {
                 view()
                     .child(section_title("Call links"))
@@ -172,7 +171,12 @@ pub fn calls_tab() -> AnyElement {
         .into_element()
 }
 
-/// The user's call links: tap to join (as its admin), copy its link.
+/// Whether call links are real here: a registered account on the real backend.
+fn real_links() -> bool {
+    !crate::store::demo() && crate::backend::is_live() && crate::backend::registered()
+}
+
+/// The user's call links: tap to join (as its admin), copy its link, revoke it.
 fn group_links(s: Store) -> View {
     view()
         .mx_4()
@@ -218,8 +222,13 @@ fn group_links(s: Store) -> View {
                                         } else {
                                             "Anyone with the link joins"
                                         })
-                                        .on_press(move || {
-                                            join_link(name.clone(), seed, lobby, false)
+                                        .on_press({
+                                            let url = url.clone();
+                                            move || {
+                                                if !open_link(&url) {
+                                                    join_link(name.clone(), seed, lobby, false);
+                                                }
+                                            }
                                         })
                                         .build(),
                                 ),
@@ -227,11 +236,26 @@ fn group_links(s: Store) -> View {
                             .child(icon_btn(
                                 Icon::Copy,
                                 format!("Copy link to {}", l.name),
-                                move || {
-                                    set_clipboard(url.clone());
-                                    toast("Link copied");
+                                {
+                                    let url = url.clone();
+                                    move || {
+                                        set_clipboard(url.clone());
+                                        toast("Link copied");
+                                    }
                                 },
-                            )),
+                            ))
+                            .child(real_links().then(|| {
+                                let (url, name) = (url.clone(), l.name.clone());
+                                icon_btn(Icon::Trash, format!("Revoke {name}"), move || {
+                                    let url = url.clone();
+                                    confirm(
+                                        format!("Revoke “{name}”?"),
+                                        "Nobody can join with this link any more, and its call ends for everyone in it.",
+                                        "Revoke",
+                                        move || crate::backend::calls::revoke_link(&url),
+                                    );
+                                })
+                            })),
                     )
             },
         ))
@@ -516,12 +540,28 @@ fn new_call(s: Store) {
                                     .pt_3()
                                     .child(search_field("Search name or username", query)),
                             )
-                            .child(
+                            .child(when(
+                                move || {
+                                    query
+                                        .with(|q| crate::backend::calls::describe_link(q).is_some())
+                                },
+                                move || {
+                                    view().pt_3().child(group([Row::new("Join this call link")
+                                        .icon(Icon::Video)
+                                        .on_press(move || {
+                                            let url = query.get_untracked();
+                                            nav::pop();
+                                            open_link(&url);
+                                        })
+                                        .build()]))
+                                },
+                            ))
+                            .child((crate::store::demo() || real_links()).then(|| {
                                 view().pt_3().child(group([Row::new("New call link")
                                     .icon(Icon::Link)
                                     .on_press(move || link_open.set(true))
-                                    .build()])),
-                            )
+                                    .build()]))
+                            }))
                             .child(section_title("Contacts")),
                     )
                     .footer(view().child(when(
@@ -565,14 +605,21 @@ fn link_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
         } else {
             n
         };
-        // demo: app-core will create the link's room and its key; the key
-        // travels in the link's fragment, never to the server.
+        // The link's root (its key) travels only in the link's fragment, never to the server.
         // One link per name and lobby setting: creating it again (a
         // double press, the same form twice) shows the link you have.
         let lob = lobby.get_untracked();
         let existing = s
             .call_links
             .with_untracked(|ls| ls.iter().find(|l| l.name == n && l.lobby == lob).cloned());
+        if real_links() {
+            // The server registers the link; its root (the link itself) stays on this device.
+            crate::backend::calls::create_link(n, true, lob, move |link| {
+                announce_for_accessibility("Call link created");
+                created.set(Some(link));
+            });
+            return;
+        }
         let link = existing.unwrap_or_else(|| s.create_call_link(n, lob));
         announce_for_accessibility("Call link created");
         created.set(Some(link));
@@ -624,9 +671,14 @@ fn link_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
                                     set_clipboard(url.clone());
                                     toast("Link copied");
                                 })))
-                                .child(view().flex_1().child(btn_with_icon("Join call", Some(Icon::Video), Variant::Primary, BtnSize::Lg, move || {
-                                    open.set(false);
-                                    join_link(lname.clone(), seed, lob, false);
+                                .child(view().flex_1().child(btn_with_icon("Join call", Some(Icon::Video), Variant::Primary, BtnSize::Lg, {
+                                    let url = link.url.clone();
+                                    move || {
+                                        open.set(false);
+                                        if !open_link(&url) {
+                                            join_link(lname.clone(), seed, lob, false);
+                                        }
+                                    }
                                 }))),
                         )
                         .into_element()

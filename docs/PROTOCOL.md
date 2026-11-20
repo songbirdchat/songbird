@@ -1929,6 +1929,20 @@ stored    = SHA-256("songbird.v1/call-link-hash\0" ‖ link ID)                 
   each participant draws a new key at the next index and sends it to those still present, so a
   newcomer cannot decrypt what came before and a leaver cannot decrypt what follows. Joining
   needs a Songbird account (sessions need one).
+- **On the device** (D-0153). The Signal session's envelope carrying a `sender_key` travels on
+  the room's data channel (topic `songbird.v1/call-key`, addressed to that participant), not
+  through the message lanes: those would refuse a stranger whose account is closed, and a link
+  call is mostly strangers. A key counts only if it came, over the session, from the account and
+  device the sender's card names, for the identity the card names. A link call's data channel is
+  **not** encrypted by LiveKit (its packets would be under sender keys a newcomer does not hold
+  yet); everything sent there is sealed by the app: cards (topic `songbird.v1/call-card`, the
+  card's identity must be its sender's), key envelopes, and other data such as a raised hand
+  (topic `songbird.v1/call-hand`) as `nonce [12] | ChaCha20-Poly1305(link key, nonce, data,
+  aad = "songbird.v1/call-link-data\0")`. Media stays encrypted by LiveKit under the sender keys.
+  No hello (§8.2) is sent in a link call.
+- A card sent to a lobby is made before the device has a participant identity; it carries the
+  identity `lobby`.
+- The link's URL is `https://songbird.chat/call#<base64url, no padding, of the root>`.
 
 ### 8.5 Signalling
 

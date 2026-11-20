@@ -66,8 +66,8 @@ download, save, HD, auto-download.
 
 **Calls (b, c, e):** done for 1:1 and group calls (D-0151, D-0152): LiveKit media end-to-end
 encrypted, devices, screen share, verification symbols from the call's key, signed hellos, raised
-hands. Left: call links on the device (cards, sender keys, lobby; the server's endpoints exist),
-shown only in demo builds until then; the phone speaker route and the iOS and Android builds of
+hands. Call links are real too (D-0153): create, join, lobby, admit, revoke, per-device keys. Left: the
+phone speaker route and the iOS and Android builds of
 call media (libwebrtc's mobile archives are pinned, the native hosts are not wired).
 
 **e (native modules):**

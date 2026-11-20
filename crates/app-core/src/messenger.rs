@@ -32,7 +32,7 @@ use aws_lc_rs::signature::{ED25519, Ed25519KeyPair, KeyPair as _, UnparsedPublic
 use prost::Message as _;
 use songbird_content::schema::{
     self, ChatRef, Content, DataMessage, ReceiptMessage, SentTranscript, SyncMessage, Text,
-    content::Body, data_message, receipt_message, sync_message,
+    call_message, content::Body, data_message, receipt_message, sync_message,
 };
 use songbird_proto::control::DeviceMismatch;
 use songbird_proto::envelope::Stamp;
@@ -200,6 +200,21 @@ pub(crate) fn hex(b: &[u8]) -> String {
             let _ = write!(s, "{x:02x}");
             s
         })
+}
+
+/// Lowercase hex of any length, strictly.
+pub(crate) fn unhex_vec(s: &str) -> Result<Vec<u8>> {
+    if !s.len().is_multiple_of(2) || s.len() > 4096 {
+        return Err(Error::Malformed);
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            s.get(i..i + 2)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+                .ok_or(Error::Malformed)
+        })
+        .collect()
 }
 
 pub(crate) fn unhex<const N: usize>(s: &str) -> Result<[u8; N]> {
@@ -1285,6 +1300,25 @@ impl<N: Net> Messenger<N> {
             Some(Body::Call(c))
                 if account != self.local.account || dec.device != self.local.device =>
             {
+                // A link call's sender key names the device it came from (PROTOCOL §8.4).
+                if let (Some(call_message::Kind::SenderKey(k)), Ok(call)) =
+                    (c.kind.as_ref(), <[u8; 16]>::try_from(c.call_id.as_slice()))
+                {
+                    let Ok(key) = <[u8; 32]>::try_from(k.key.as_slice()) else {
+                        return Ok(Received::Nothing);
+                    };
+                    return Ok(Received::Call {
+                        account,
+                        group: None,
+                        call,
+                        signal: crate::calls::Signal::SenderKey {
+                            device: dec.device,
+                            identity: k.identity.clone(),
+                            index: k.key_index,
+                            key: Zeroizing::new(key),
+                        },
+                    });
+                }
                 Ok(
                     crate::calls::signal_of(c, content.sent_at_ms, now_ms()).map_or(
                         Received::Nothing,

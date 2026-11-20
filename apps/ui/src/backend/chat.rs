@@ -667,6 +667,7 @@ pub async fn start() -> Result<(), super::Problem> {
     if let Some(s) = crate::store::try_store() {
         show_all(s, &m);
     }
+    super::calls::show_links(&m);
     let keyed: Vec<([u8; 16], [u8; 32])> = m
         .store
         .chats()

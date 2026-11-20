@@ -32,6 +32,9 @@ fn now_ms() -> u64 {
     // The clock is past 1970 and within u64 milliseconds.
     unix_ms().max(0.0) as u64
 }
+use songbird_app_core::call_links::{
+    CARD_TOPIC, Card, KEY_TOPIC, LinkJoin, open_link_card, open_link_data, seal_link_data,
+};
 use songbird_app_core::calls::{self as core_calls, Signal, Ticket};
 use songbird_calls_media::{Call, Event, KeySource, ScreenShare, VideoSender};
 use songbird_content::call::EpochSecret;
@@ -61,29 +64,65 @@ enum Keys {
         secret: Zeroizing<[u8; 32]>,
         epoch: u64,
     },
+    /// A call link's: each participant's own random key, as it arrived (this device's too).
+    Link {
+        keys: HashMap<String, (u32, Zeroizing<[u8; 32]>)>,
+    },
 }
 
 impl Keys {
-    fn epoch(&self) -> EpochSecret {
+    fn epoch(&self) -> Option<EpochSecret> {
         match self {
-            Self::OneToOne { call, secret } => EpochSecret::one_to_one(call, secret)
-                .unwrap_or_else(|_| EpochSecret::group([0; 32], 0)),
-            Self::Group { secret, epoch } => EpochSecret::group(**secret, *epoch),
+            Self::OneToOne { call, secret } => EpochSecret::one_to_one(call, secret).ok(),
+            Self::Group { secret, epoch } => Some(EpochSecret::group(**secret, *epoch)),
+            Self::Link { .. } => None,
         }
     }
 
-    fn code(&self) -> [u8; 4] {
-        self.epoch().verification_code()
+    fn code(&self) -> Option<[u8; 4]> {
+        self.epoch().map(|e| e.verification_code())
+    }
+
+    fn key_of(&self, identity: &str) -> Option<(u32, Zeroizing<[u8; 32]>)> {
+        match self {
+            Self::Link { keys } => keys.get(identity).map(|(i, k)| (*i, k.clone())),
+            _ => {
+                let e = self.epoch()?;
+                Some((e.key_index(), e.sender_key(identity.as_bytes()).ok()?))
+            }
+        }
     }
 }
 
-/// Every participant's key from the call's current epoch.
+/// Every participant's key: from the call's current epoch, or (a link call) as it arrived.
 fn key_source(keys: &Arc<Mutex<Keys>>) -> KeySource {
     let keys = keys.clone();
-    Arc::new(move |identity: &str| {
-        let e = keys.lock().ok()?.epoch();
-        Some((e.key_index(), e.sender_key(identity.as_bytes()).ok()?))
-    })
+    Arc::new(move |identity: &str| keys.lock().ok()?.key_of(identity))
+}
+
+/// A key that came before its sender's card: (account, device, index, key).
+type EarlyKey = ([u8; 16], [u8; 16], u32, Zeroizing<[u8; 32]>);
+
+/// A link as the UI first sees it: its root, and (this device's own) its name and lobby.
+pub type LinkInfo = ([u8; 32], Option<(String, bool)>);
+
+/// What a link call adds (D-0153).
+struct LinkState {
+    root: Zeroizing<[u8; 32]>,
+    /// This device administers the link.
+    admin: bool,
+    /// The link has a lobby.
+    lobby: bool,
+    /// This device's sender key and its index.
+    own: (u32, Zeroizing<[u8; 32]>),
+    /// Participants' opened cards, by participant identity (each checked against its sender).
+    cards: HashMap<String, Card>,
+    /// Keys that arrived before their sender's card: (account, device, index, key).
+    pending: HashMap<String, EarlyKey>,
+    /// Identities whose key came from the device their card names (over a Signal session).
+    keyed: std::collections::HashSet<String>,
+    /// Lobby places by the UI's waiting id.
+    waiting: HashMap<u64, [u8; 16]>,
 }
 
 /// The call going on (or ringing) on this device.
@@ -106,6 +145,8 @@ struct Live {
     screen: Option<Arc<ScreenShare>>,
     /// Participant identities whose hello checked out, and the account behind each.
     known: HashMap<String, [u8; 16]>,
+    /// A call link's state.
+    link: Option<LinkState>,
 }
 
 thread_local! {
@@ -219,10 +260,11 @@ pub fn start(ui_call: u64, chat: ChatId, video: bool) {
                 frames: None,
                 screen: None,
                 known: HashMap::new(),
+                link: None,
             });
         });
         ui::live::update(ui_call, |c| {
-            c.code = Some(code);
+            c.code = code;
             // A 1:1 call rings the callee; a group call is open as soon as the room is.
             if peer.is_some() {
                 c.set_phase(Phase::Ringing);
@@ -260,7 +302,13 @@ async fn join(
         identity,
         ..
     } = ticket;
-    let joined = background(async move { Call::join(&url, &token, &identity, source).await }).await;
+    // A link call's data channel carries only what the app sealed itself (D-0153).
+    let encrypt_data = !LIVE.with_borrow(|l| l.as_ref().is_some_and(|l| l.link.is_some()));
+    let joined =
+        background(
+            async move { Call::join_with(&url, &token, &identity, source, encrypt_data).await },
+        )
+        .await;
     let (call, events) = match joined {
         Ok(Ok(x)) => x,
         _ => {
@@ -303,6 +351,9 @@ async fn join(
     }
     ui::live::devices_changed();
     spawn(follow(ui_call, events));
+    if !encrypt_data {
+        link_in_room(ui_call, &call);
+    }
 }
 
 // ------------------------------------------------------------------ ringing here
@@ -363,6 +414,7 @@ pub async fn signal(
                     frames: None,
                     screen: None,
                     known: HashMap::new(),
+                    link: None,
                 });
             });
         }
@@ -382,6 +434,9 @@ pub async fn signal(
                 ui::live::update(ui_call, |c| c.set_phase(Phase::Connecting));
             }
         }
+        // A link call's keys travel on the room's data channel (`link_data`); one that came
+        // through the server is not for any call here.
+        Signal::SenderKey { .. } => {}
         Signal::Decline | Signal::Busy | Signal::Hangup => {
             let Some((ui_call, live_call, peer, _)) = current else {
                 return;
@@ -458,7 +513,7 @@ pub fn answer(ui_call: u64) {
         let code = keys.code();
         let keys = Arc::new(Mutex::new(keys));
         with_live(|l| l.keys = Some(keys.clone()));
-        ui::live::update(ui_call, |c| c.code = Some(code));
+        ui::live::update(ui_call, |c| c.code = code);
         join(ui_call, ticket, &keys, hello, group.is_some()).await;
         Ok(())
     });
@@ -478,12 +533,20 @@ async fn follow(ui_call: u64, mut events: tokio::sync::mpsc::UnboundedReceiver<E
 
 fn on_event(ui_call: u64, ev: Event) {
     match ev {
-        Event::Joined(identity) => joined(ui_call, identity),
+        Event::Joined(identity) => {
+            joined(ui_call, identity.clone());
+            if in_link() {
+                link_joined(ui_call, &identity);
+            }
+        }
         Event::Left(identity) => {
             ui::live::update(ui_call, |c| {
                 c.participants.retain(|p| p.identity != identity);
             });
             ui::live::frame(&identity, None);
+            if in_link() {
+                link_left(ui_call, &identity);
+            }
             let direct = LIVE.with_borrow(|l| l.as_ref().is_some_and(|l| l.peer.is_some()));
             if direct {
                 // The other person left a 1:1 call.
@@ -538,7 +601,9 @@ fn on_event(ui_call: u64, ev: Event) {
             topic,
             payload,
         } => {
-            if topic == HELLO_TOPIC {
+            if in_link() {
+                link_data(ui_call, identity, &topic, payload);
+            } else if topic == HELLO_TOPIC {
                 check_hello(ui_call, identity, payload);
             } else if topic == HAND_TOPIC {
                 let raised = payload.first() == Some(&1);
@@ -595,7 +660,11 @@ fn joined(ui_call: u64, identity: String) {
         }
         c.set_phase(Phase::Connected);
     });
-    // Tell the newcomer who this device is.
+    // Tell the newcomer who this device is. Not in a link call: its data channel is not
+    // LiveKit-encrypted, and its sealed card says it there instead.
+    if in_link() {
+        return;
+    }
     let Some((call, media)) = with_live(|l| (l.call, l.media.clone())) else {
         return;
     };
@@ -816,11 +885,21 @@ fn send_frame(cam: &VideoSender, frame: &songbird_camera::Frame) {
 
 /// Raises or lowers the hand, for everyone in the call.
 pub fn set_hand(ui_call: u64, raised: bool) {
-    if let Some(m) = media_of(ui_call) {
-        drop(background(async move {
-            let _ = m.send_data(HAND_TOPIC, vec![u8::from(raised)], None).await;
-        }));
-    }
+    let Some(m) = media_of(ui_call) else { return };
+    // In a link call, sealed under the link key (its data channel is not LiveKit-encrypted).
+    let payload = match LIVE.with_borrow(|l| {
+        l.as_ref()
+            .and_then(|l| l.link.as_ref().map(|k| k.root.clone()))
+    }) {
+        Some(root) => match seal_link_data(&root, &[u8::from(raised)]) {
+            Ok(p) => p,
+            Err(_) => return,
+        },
+        None => vec![u8::from(raised)],
+    };
+    drop(background(async move {
+        let _ = m.send_data(HAND_TOPIC, payload, None).await;
+    }));
 }
 
 /// Starts sharing the screen (or a window); `false` with a toast when it can't.
@@ -882,6 +961,628 @@ pub fn select_audio(ui_call: u64, output: bool, index: usize) -> bool {
         .unwrap_or(false)
 }
 
+// ------------------------------------------------------------------ call links
+
+/// How often a lobby place, or an admin's view of the lobby, is asked again.
+const LOBBY_POLL: Duration = Duration::from_secs(3);
+
+thread_local! {
+    /// Links a call is about to join, by the UI's call.
+    static PREPARED: RefCell<HashMap<u64, Zeroizing<[u8; 32]>>> = RefCell::new(HashMap::new());
+}
+
+fn in_link() -> bool {
+    LIVE.with_borrow(|l| l.as_ref().is_some_and(|l| l.link.is_some()))
+}
+
+fn fresh_key() -> Option<Zeroizing<[u8; 32]>> {
+    let mut k = Zeroizing::new([0u8; 32]);
+    aws_lc_rs::rand::fill(&mut *k).ok()?;
+    Some(k)
+}
+
+fn my_name() -> String {
+    crate::store::try_store()
+        .map(|s| s.me.with_untracked(|m| m.name.clone()))
+        .unwrap_or_default()
+}
+
+/// A link's UI ID (its list row): from its root, never meeting a chat's.
+fn link_id(root: &[u8; 32]) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&root[..8]);
+    // Top bits `001`: neither a contact's (`1…`) nor a call participant's (`01…`).
+    (u64::from_be_bytes(b) >> 3) | (1 << 61)
+}
+
+fn to_ui(l: &songbird_app_core::store::StoredCallLink) -> crate::store::CallLink {
+    crate::store::CallLink {
+        id: link_id(&l.root),
+        name: l.name.clone(),
+        url: songbird_proto::call_link::CallLink { root: *l.root }.to_link(),
+        lobby: l.lobby,
+    }
+}
+
+/// Shows the links this device made (called at start, with the core held).
+pub fn show_links(m: &super::chat::Core) {
+    if let (Ok(links), Some(s)) = (m.call_links(), crate::store::try_store()) {
+        s.call_links.set(links.iter().rev().map(to_ui).collect());
+    }
+}
+
+/// Makes a call link (named `name`), then `done` with it as the Calls tab lists it.
+pub fn create_link(
+    name: String,
+    video: bool,
+    lobby: bool,
+    done: impl FnOnce(crate::store::CallLink) + 'static,
+) {
+    super::run(async move {
+        let made = {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let m = guard
+                .as_mut()
+                .ok_or_else(|| super::problem("Not connected yet."))?;
+            m.create_call_link(&name, video, lobby).await
+        };
+        let link = made.map_err(|_| super::problem("The link couldn't be made. Try again."))?;
+        let ui_link = to_ui(&link);
+        if let Some(s) = crate::store::try_store() {
+            s.call_links.update(|l| {
+                l.retain(|x| x.id != ui_link.id);
+                l.insert(0, ui_link.clone());
+            });
+        }
+        done(ui_link);
+        Ok(())
+    });
+}
+
+/// Revokes a link this device made: nobody can join it again, and its call ends for everyone.
+pub fn revoke_link(url: &str) {
+    let Some(root) = songbird_proto::call_link::CallLink::parse(url).map(|l| l.root) else {
+        return;
+    };
+    super::run(async move {
+        let done = {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let m = guard
+                .as_mut()
+                .ok_or_else(|| super::problem("Not connected yet."))?;
+            m.revoke_call_link(&root).await
+        };
+        done.map_err(|_| super::problem("The link couldn't be revoked. Try again."))?;
+        if let Some(s) = crate::store::try_store() {
+            let id = link_id(&root);
+            s.call_links.update(|l| l.retain(|x| x.id != id));
+        }
+        toast("Link revoked");
+        Ok(())
+    });
+}
+
+/// What the UI needs to show a link before joining: its name (this device's own links) and
+/// whether this device administers it. `None` for something that is not a call link.
+pub fn describe_link(url: &str) -> Option<LinkInfo> {
+    let root = songbird_proto::call_link::CallLink::parse(url.trim())?.root;
+    let id = link_id(&root);
+    let own = crate::store::try_store().and_then(|s| {
+        s.call_links.with_untracked(|l| {
+            l.iter()
+                .find(|x| x.id == id)
+                .map(|x| (x.name.clone(), x.lobby))
+        })
+    });
+    Some((root, own))
+}
+
+/// Remembers the link the UI's call `ui_call` is about to join (see [`join_link`]).
+pub fn prepare_link(ui_call: u64, root: [u8; 32]) {
+    PREPARED.with_borrow_mut(|p| p.insert(ui_call, Zeroizing::new(root)));
+}
+
+/// Joins the prepared link of `ui_call`: straight in (its admin, or no lobby), or into the
+/// lobby to wait.
+pub fn join_link(ui_call: u64) {
+    let Some(root) = PREPARED.with_borrow_mut(|p| p.remove(&ui_call)) else {
+        return;
+    };
+    let name = my_name();
+    super::run(async move {
+        let asked = {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let Some(m) = guard.as_mut() else {
+                drop(guard);
+                failed(ui_call, "Not connected yet. Try again in a moment.");
+                return Ok(());
+            };
+            m.join_call_link(&root, &name)
+                .await
+                .map(|j| (j, m.is_link_admin(&root), m.call_links().ok()))
+        };
+        match asked {
+            Ok((LinkJoin::Ticket(t), admin, links)) => {
+                let lobby = links
+                    .into_iter()
+                    .flatten()
+                    .any(|l| *l.root == *root && l.lobby);
+                enter_link(ui_call, root, t, admin, lobby).await;
+            }
+            Ok((LinkJoin::Waiting(place), ..)) => {
+                ui::live::update(ui_call, |c| c.set_phase(Phase::Lobby));
+                poll_place(ui_call, root, place);
+            }
+            Err(songbird_app_core::Error::Server(404)) => {
+                failed(ui_call, "This link doesn't work any more.");
+            }
+            Err(songbird_app_core::Error::Server(409)) => {
+                failed(ui_call, "The lobby is full. Try again later.");
+            }
+            Err(_) => failed(ui_call, "The call couldn't be joined. Try again."),
+        }
+        Ok(())
+    });
+}
+
+/// Asks again, every few seconds, whether an admin let this device in.
+fn poll_place(ui_call: u64, root: Zeroizing<[u8; 32]>, place: [u8; 16]) {
+    set_timeout(LOBBY_POLL, move || {
+        if !ui::live::exists(ui_call) {
+            return;
+        }
+        super::run(async move {
+            let polled = {
+                let lock = core();
+                let mut guard = lock.lock().await;
+                let Some(m) = guard.as_mut() else {
+                    return Ok(());
+                };
+                m.poll_lobby(&root, &place).await
+            };
+            match polled {
+                Ok(Some(t)) => {
+                    ui::live::update(ui_call, |c| c.set_phase(Phase::Connecting));
+                    enter_link(ui_call, root, t, false, true).await;
+                }
+                Ok(None) => poll_place(ui_call, root, place),
+                Err(songbird_app_core::Error::Server(404)) => {
+                    ended_remotely(ui_call, EndReason::NotAdmitted);
+                }
+                // A passing failure: ask again.
+                Err(_) => poll_place(ui_call, root, place),
+            }
+            Ok(())
+        });
+    });
+}
+
+/// In with a ticket: this device's own sender key, then the room.
+async fn enter_link(
+    ui_call: u64,
+    root: Zeroizing<[u8; 32]>,
+    ticket: Ticket,
+    admin: bool,
+    lobby: bool,
+) {
+    if !ui::live::exists(ui_call) {
+        return;
+    }
+    let Some(own) = fresh_key() else {
+        failed(ui_call, "The call couldn't be joined.");
+        return;
+    };
+    let mut keys = HashMap::new();
+    keys.insert(ticket.identity.clone(), (0, own.clone()));
+    let keys = Arc::new(Mutex::new(Keys::Link { keys }));
+    let chat = 0;
+    LIVE.with_borrow_mut(|l| {
+        *l = Some(Live {
+            ui: ui_call,
+            chat,
+            call: ticket.call,
+            peer: None,
+            group: None,
+            offered: None,
+            keys: Some(keys.clone()),
+            media: None,
+            camera: None,
+            frames: None,
+            screen: None,
+            known: HashMap::new(),
+            link: Some(LinkState {
+                root,
+                admin,
+                lobby,
+                own: (0, own),
+                cards: HashMap::new(),
+                pending: HashMap::new(),
+                keyed: std::collections::HashSet::new(),
+                waiting: HashMap::new(),
+            }),
+        });
+    });
+    ui::live::update(ui_call, |c| {
+        c.admin = admin;
+        c.code = None;
+    });
+    join(ui_call, ticket, &keys, None, true).await;
+}
+
+/// In the room: this device's card to everyone, and (an admin of a link with a lobby) the
+/// lobby watched.
+fn link_in_room(ui_call: u64, call: &Arc<Call>) {
+    send_card(ui_call, call, None);
+    let watch = LIVE.with_borrow(|l| {
+        l.as_ref()
+            .and_then(|l| l.link.as_ref())
+            .is_some_and(|k| k.admin && k.lobby)
+    });
+    if watch {
+        watch_lobby(ui_call);
+    }
+}
+
+/// Sends this device's sealed card (to `to`, or everyone).
+fn send_card(ui_call: u64, call: &Arc<Call>, to: Option<String>) {
+    let Some(root) = LIVE.with_borrow(|l| {
+        l.as_ref()
+            .filter(|l| l.ui == ui_call)
+            .and_then(|l| l.link.as_ref().map(|k| k.root.clone()))
+    }) else {
+        return;
+    };
+    let call = call.clone();
+    let own = call.identity().to_owned();
+    let name = my_name();
+    super::run(async move {
+        let card = {
+            let lock = core();
+            let guard = lock.lock().await;
+            guard
+                .as_ref()
+                .and_then(|m| m.link_card(&root, &own, &name).ok())
+        };
+        if let Some(card) = card {
+            drop(background(async move {
+                let _ = call.send_data(CARD_TOPIC, card, to.as_deref()).await;
+            }));
+        }
+        Ok(())
+    });
+}
+
+/// Someone entered: they get this device's card, and everyone present a new key from this
+/// device (so the newcomer cannot decrypt what came before).
+fn link_joined(ui_call: u64, identity: &str) {
+    if let Some(media) = media_of(ui_call) {
+        send_card(ui_call, &media, Some(identity.to_owned()));
+    }
+    rotate(ui_call);
+}
+
+/// Someone left: those still present get a new key from this device (so the leaver cannot
+/// decrypt what follows).
+fn link_left(ui_call: u64, identity: &str) {
+    with_live(|l| {
+        if let Some(k) = l.link.as_mut() {
+            k.cards.remove(identity);
+            k.pending.remove(identity);
+            k.keyed.remove(identity);
+        }
+    });
+    rotate(ui_call);
+}
+
+/// A new sender key for this device at the next index: installed at once, sent to every
+/// participant whose card arrived, sent with a second later (§8.4, as §8.2 for epochs).
+fn rotate(ui_call: u64) {
+    let Some(media) = media_of(ui_call) else {
+        return;
+    };
+    let Some(key) = fresh_key() else { return };
+    let own = media.identity().to_owned();
+    let Some((index, targets)) = with_live(|l| {
+        let k = l.link.as_mut()?;
+        let index = (k.own.0 + 1) % songbird_calls_media::KEY_RING;
+        k.own = (index, key.clone());
+        if let Some(keys) = &l.keys
+            && let Ok(mut keys) = keys.lock()
+            && let Keys::Link { keys } = &mut *keys
+        {
+            keys.insert(own.clone(), (index, key.clone()));
+        }
+        Some((index, k.cards.clone()))
+    })
+    .flatten() else {
+        return;
+    };
+    if media.set_key(&own, index, &key).is_err() {
+        return;
+    }
+    for (identity, card) in targets {
+        send_key(ui_call, identity, card);
+    }
+    set_timeout(Duration::from_secs(1), move || {
+        let _ = media.send_with(index);
+    });
+}
+
+/// Sends this device's current key to one participant's device, sealed in a Signal session,
+/// on the room's data channel.
+fn send_key(ui_call: u64, identity: String, card: Card) {
+    let Some((call, media, own)) =
+        with_live(|l| Some((l.call, l.media.clone()?, l.link.as_ref()?.own.clone()))).flatten()
+    else {
+        return;
+    };
+    if !is_live(ui_call) {
+        return;
+    }
+    let me = media.identity().to_owned();
+    super::run(async move {
+        let envelope = {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let Some(m) = guard.as_mut() else {
+                return Ok(());
+            };
+            m.link_key_envelope(&card.account, &card.device, &call, &me, own.0, &own.1)
+                .await
+        };
+        match envelope {
+            Ok(env) => drop(background(async move {
+                let _ = media.send_data(KEY_TOPIC, env, Some(&identity)).await;
+            })),
+            Err(_) => toast("Someone in the call couldn't be sent your key."),
+        }
+        Ok(())
+    });
+}
+
+/// Data on a link call's channel: a card, a key (a Signal envelope), a raised hand.
+fn link_data(ui_call: u64, identity: String, topic: &str, payload: Vec<u8>) {
+    let Some(root) = LIVE.with_borrow(|l| {
+        l.as_ref()
+            .and_then(|l| l.link.as_ref().map(|k| k.root.clone()))
+    }) else {
+        return;
+    };
+    match topic {
+        t if t == CARD_TOPIC => {
+            // A card counts only for the identity that sent it.
+            let Ok(card) = open_link_card(&root, &payload) else {
+                return;
+            };
+            if card.identity != identity {
+                return;
+            }
+            let fresh = with_live(|l| {
+                l.link
+                    .as_mut()
+                    .map(|k| k.cards.insert(identity.clone(), card.clone()).is_none())
+            })
+            .flatten()
+            .unwrap_or(false);
+            name_participant(ui_call, &identity);
+            if fresh {
+                send_key(ui_call, identity.clone(), card);
+            }
+            // A key that came before the card.
+            let early =
+                with_live(|l| l.link.as_mut().and_then(|k| k.pending.remove(&identity))).flatten();
+            if let Some((account, device, index, key)) = early {
+                use_key(ui_call, &identity, account, device, index, &key);
+            }
+        }
+        t if t == KEY_TOPIC => {
+            let call = LIVE
+                .with_borrow(|l| l.as_ref().map(|l| l.call))
+                .unwrap_or_default();
+            super::run(async move {
+                let opened = {
+                    let lock = core();
+                    let mut guard = lock.lock().await;
+                    let Some(m) = guard.as_mut() else {
+                        return Ok(());
+                    };
+                    m.receive(&payload).await
+                };
+                if let Ok(songbird_app_core::messenger::Received::Call {
+                    account,
+                    call: c,
+                    signal:
+                        Signal::SenderKey {
+                            device,
+                            identity: kid,
+                            index,
+                            key,
+                        },
+                    ..
+                }) = opened
+                    && c == call
+                    && kid == identity
+                {
+                    use_key(ui_call, &identity, account, device, index, &key);
+                }
+                Ok(())
+            });
+        }
+        t if t == HAND_TOPIC => {
+            if let Ok(b) = open_link_data(&root, &payload) {
+                let raised = b.first() == Some(&1);
+                ui::live::update(ui_call, |c| {
+                    if let Some(p) = c.participants.iter_mut().find(|p| p.identity == identity) {
+                        p.hand = raised;
+                    }
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Installs a participant's key if it came from the device their card names; one that came
+/// before the card waits for it.
+fn use_key(
+    ui_call: u64,
+    identity: &str,
+    account: [u8; 16],
+    device: [u8; 16],
+    index: u32,
+    key: &Zeroizing<[u8; 32]>,
+) {
+    let matches = with_live(|l| {
+        let k = l.link.as_mut()?;
+        match k.cards.get(identity) {
+            Some(card) => Some(card.account == account && card.device == device),
+            None => {
+                k.pending
+                    .insert(identity.to_owned(), (account, device, index, key.clone()));
+                None
+            }
+        }
+    })
+    .flatten();
+    if matches != Some(true) {
+        return;
+    }
+    let Some(media) = media_of(ui_call) else {
+        return;
+    };
+    if media.set_key(identity, index, key).is_err() {
+        return;
+    }
+    with_live(|l| {
+        if let Some(keys) = &l.keys
+            && let Ok(mut keys) = keys.lock()
+            && let Keys::Link { keys } = &mut *keys
+        {
+            keys.insert(identity.to_owned(), (index, key.clone()));
+        }
+        if let Some(k) = l.link.as_mut() {
+            k.keyed.insert(identity.to_owned());
+        }
+    });
+    name_participant(ui_call, identity);
+}
+
+/// A link participant's tile name: a contact's name once their key came from the device their
+/// card names; anyone else's card name, marked unverified (anyone holding the link can write
+/// any name in a card, §8.7).
+fn name_participant(ui_call: u64, identity: &str) {
+    let Some((card, keyed)) = LIVE.with_borrow(|l| {
+        let k = l.as_ref()?.link.as_ref()?;
+        Some((k.cards.get(identity)?.clone(), k.keyed.contains(identity)))
+    }) else {
+        return;
+    };
+    let id = ui_id(&card.account);
+    let me = super::chat::me_account() == card.account;
+    let contact = crate::store::try_store()
+        .filter(|s| super::chat::owns(id) && s.contact(id).is_some())
+        .map(|s| s.contact_name(Some(id)));
+    let shown = if card.name.trim().is_empty() {
+        "Guest".to_string()
+    } else {
+        card.name.trim().to_string()
+    };
+    let name = match (contact, keyed, me) {
+        (_, true, true) => format!("{} (another device)", my_name()),
+        (Some(n), true, false) => n,
+        _ => format!("{shown} (unverified)"),
+    };
+    ui::live::update(ui_call, |c| {
+        if let Some(p) = c.participants.iter_mut().find(|p| p.identity == identity) {
+            p.name = name;
+            if keyed && !me {
+                p.id = id;
+                p.seed = id;
+            }
+        }
+    });
+}
+
+/// An admin's view of the lobby, asked again every few seconds while the call lasts.
+fn watch_lobby(ui_call: u64) {
+    let Some(root) = LIVE.with_borrow(|l| {
+        l.as_ref()
+            .and_then(|l| l.link.as_ref().map(|k| k.root.clone()))
+    }) else {
+        return;
+    };
+    super::run(async move {
+        let waiting = {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let Some(m) = guard.as_mut() else {
+                return Ok(());
+            };
+            m.lobby_waiting(&root).await
+        };
+        if let Ok(waiting) = waiting {
+            let mut places = HashMap::new();
+            let shown: Vec<ui::Waiting> = waiting
+                .into_iter()
+                .map(|w| {
+                    let id = stranger_id(&super::wire::hex(&w.handle));
+                    places.insert(id, w.handle);
+                    let contact = ui_id(&w.account);
+                    let name = crate::store::try_store()
+                        .filter(|s| super::chat::owns(contact) && s.contact(contact).is_some())
+                        .map_or_else(
+                            || {
+                                let n = w.name.trim();
+                                format!("{} (unverified)", if n.is_empty() { "Guest" } else { n })
+                            },
+                            |s| s.contact_name(Some(contact)),
+                        );
+                    ui::Waiting { id, name, seed: id }
+                })
+                .collect();
+            with_live(|l| {
+                if let Some(k) = l.link.as_mut() {
+                    k.waiting = places;
+                }
+            });
+            ui::live::update(ui_call, |c| c.waiting = shown);
+        }
+        if is_live(ui_call) {
+            set_timeout(LOBBY_POLL, move || watch_lobby(ui_call));
+        }
+        Ok(())
+    });
+}
+
+/// Lets someone waiting in the lobby in, or turns them away (the admin's choice).
+pub fn admit(ui_call: u64, waiting: u64, let_in: bool) {
+    let Some((root, place)) = with_live(|l| {
+        let k = l.link.as_ref()?;
+        Some((k.root.clone(), *k.waiting.get(&waiting)?))
+    })
+    .flatten() else {
+        return;
+    };
+    ui::live::update(ui_call, |c| c.waiting.retain(|w| w.id != waiting));
+    super::run(async move {
+        let done = {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let Some(m) = guard.as_mut() else {
+                return Ok(());
+            };
+            m.admit(&root, &place, let_in).await
+        };
+        if done.is_err() {
+            toast("That didn't go through. They may have left the lobby.");
+        }
+        Ok(())
+    });
+}
+
 // ------------------------------------------------------------------ groups changing
 
 /// A group changed (a commit): a call in it moves to the new epoch's keys, sending with them a
@@ -911,7 +1612,7 @@ pub fn group_changed(m: &super::chat::Core, gid: &[u8; 16]) {
     if !changed {
         return;
     }
-    let code = keys.lock().map(|k| k.code()).ok();
+    let code = keys.lock().ok().and_then(|k| k.code());
     ui::live::update(ui_call, |c| c.code = code);
     let source = key_source(&keys);
     if let Ok(index) = media.install_epoch(&source) {
@@ -936,6 +1637,7 @@ pub fn group_left(gid: &[u8; 16]) {
 /// other side is told (a hang-up, or a decline while ringing here). Leaves the room and stops
 /// the camera and screen. Idempotent.
 pub fn closed(ui_call: u64, reason: EndReason, by_user: bool) {
+    PREPARED.with_borrow_mut(|p| p.remove(&ui_call));
     let Some(live) = LIVE.with_borrow_mut(|l| {
         if l.as_ref().is_some_and(|x| x.ui == ui_call) {
             l.take()

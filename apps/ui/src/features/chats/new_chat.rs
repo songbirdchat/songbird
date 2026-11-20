@@ -136,6 +136,11 @@ fn body() -> impl IntoElement {
                                 "Message this username on Songbird",
                                 move || {
                                     let name = query.get_untracked();
+                                    // A call link pasted here joins its call.
+                                    if crate::features::calls::open_link(&name) {
+                                        nav::pop_to_root();
+                                        return;
+                                    }
                                     crate::backend::run(async move {
                                         let chat = crate::backend::chat::start_with_username(&name)
                                             .await?;

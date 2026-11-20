@@ -199,6 +199,55 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0153 — Call links on the device
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent, within the owner's design (D-0085 §2: Signal's link calls)
+- Decision (`songbird_app_core::call_links`, `apps/ui/src/backend/calls.rs`):
+  1. **Making a link**: a random root (the link, `https://songbird.chat/call#…`, new
+     `songbird_proto::call_link`) and admin token; the server gets the link ID and admin token
+     to hash (§8.7); the device keeps both in the SQLCipher store (schema 5, `call_links`). The
+     Calls tab lists them; each can be copied, joined (as admin, skipping the lobby) or revoked
+     (after a confirmation; the server ends its call for everyone).
+  2. **Joining**: a link pasted into New call or New chat, or tapped in the list. With a lobby,
+     the device's card waits (identity `lobby`, the device has none yet) and its place is asked
+     again every 3 s until admitted (then the ticket) or turned away ("You weren't let in").
+     Admins in the call see who waits (cards opened with the link key, unverified names unless a
+     contact) and admit or turn them away.
+  3. **Keys on the data channel, sealed in Signal sessions.** The message lanes refuse a
+     stranger whose account is closed (reason 10), and a link call is mostly strangers, so the
+     `sender_key` envelope (built by `link_key_envelope`, opened by the receiver's ordinary
+     `receive`) travels on the room's data channel to that participant only. A key is used only
+     if it came, over the session, from the account and device the sender's card names, for the
+     card's identity; one that arrives before the card waits for it. Each participant draws a
+     new key at the next index on every join and leave, installs it, sends it to everyone whose
+     card arrived, and sends with it a second later.
+  4. **The data channel is not LiveKit-encrypted in a link call** (`Call::join_with(…, false)`):
+     LiveKit encrypts data packets under the sender's key, which a newcomer does not hold before
+     the exchange that needs the channel. Everything sent there is sealed by the app instead
+     (cards and other data under the link key, keys in Signal sessions); media stays encrypted
+     under the sender keys. No hello is sent (it would name the device to the server in the
+     clear; the sealed card does that job).
+  5. **Names**: a contact's name once their key came from the device their card names; anyone
+     else's card name marked "(unverified)", as §8.7 requires (anyone with the link can write
+     any name). Link calls have no shared verification code; the sheet says why and points to
+     safety numbers.
+- Evidence:
+  - `gate_a2::call_links_lobby_keys_and_revoke` against the real stack: a link with a lobby, a
+    stranger waits, the admin sees his card's name and admits him, both get tickets to the same
+    room with different identities; cards open only with the link key; a sender key reaches the
+    other device in a Signal session naming the sender's device, though they are strangers; a
+    turned-away joiner gets 404; a revoked link cannot be joined and the other link stays.
+  - `apps/calls-media::a_link_calls_keys_arrive_by_data_and_unlock_media`: on the compose
+    LiveKit, with the data channel not LiveKit-encrypted, a participant without the sender's key
+    hears nothing, receives the key on the data channel, installs it and hears the sender.
+  - App-core unit tests (cards, sealed link data, join answers); `apps/ui` 213 tests; the app
+    starts.
+  - Not yet exercised: two app instances in one link call through the UI.
+- Consequences: the server learns, from the room's data channel, that participants exchange
+  sealed blobs (as it would see message traffic); it reads none of them.
+
 ## D-0152 — Calls, part 3: the app's call screens on real calls
 
 - Date: 2026-11-20

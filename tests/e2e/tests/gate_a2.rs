@@ -1359,3 +1359,127 @@ async fn calls_ring_answer_and_agree_on_keys() {
         }
     ));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn call_links_lobby_keys_and_revoke() {
+    use songbird_app_core::call_links::{LinkJoin, open_link_card};
+    use songbird_app_core::calls::Signal;
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    // Alice makes a link with a lobby; the link is its root, which never reaches the server.
+    let link = alice
+        .core
+        .create_call_link("Book club", true, true)
+        .await
+        .unwrap();
+    assert_eq!(alice.core.call_links().unwrap().len(), 1);
+    assert!(alice.core.is_link_admin(&link.root));
+    let url = songbird_proto::call_link::CallLink { root: *link.root }.to_link();
+    let root = songbird_proto::call_link::CallLink::parse(&url)
+        .unwrap()
+        .root;
+
+    // Bob (no contact of hers) asks to join: he waits in the lobby with his card.
+    let LinkJoin::Waiting(place) = bob.core.join_call_link(&root, "Bob").await.unwrap() else {
+        panic!("a lobby place")
+    };
+    assert_eq!(bob.core.poll_lobby(&root, &place).await.unwrap(), None);
+    // Alice sees his card, opened with the link key, and lets him in.
+    let waiting = alice.core.lobby_waiting(&root).await.unwrap();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(
+        (waiting[0].account, waiting[0].name.as_str()),
+        (bob.account, "Bob")
+    );
+    alice
+        .core
+        .admit(&root, &waiting[0].handle, true)
+        .await
+        .unwrap();
+    let bt = bob.core.poll_lobby(&root, &place).await.unwrap().unwrap();
+    // Alice, the admin, skips the lobby into the same room.
+    let LinkJoin::Ticket(at) = alice.core.join_call_link(&root, "Alice").await.unwrap() else {
+        panic!("the admin's ticket")
+    };
+    assert_eq!(at.call, bt.call);
+    assert_ne!(at.identity, bt.identity);
+
+    // Cards in the room carry the real identity; only the link's key opens them.
+    let card = alice.core.link_card(&root, &at.identity, "Alice").unwrap();
+    let opened = open_link_card(&root, &card).unwrap();
+    assert_eq!(
+        (opened.account, opened.identity.as_str()),
+        (alice.account, at.identity.as_str())
+    );
+    assert!(open_link_card(&[0; 32], &card).is_err());
+
+    // Alice's sender key reaches Bob's device in a Signal session (carried on the room's data
+    // channel, never the server's lanes: they are strangers), naming her device.
+    let key = [9u8; 32];
+    let (alice_device, bob_device) = (alice.core.local().device, bob.core.local().device);
+    let envelope = alice
+        .core
+        .link_key_envelope(&bob.account, &bob_device, &at.call, &at.identity, 3, &key)
+        .await
+        .unwrap();
+    let Received::Call {
+        account,
+        call,
+        signal:
+            Signal::SenderKey {
+                device,
+                identity,
+                index,
+                key: got,
+            },
+        ..
+    } = bob.core.receive(&envelope).await.unwrap()
+    else {
+        panic!("a sender key")
+    };
+    assert_eq!(
+        (account, call, device, identity.as_str(), index, *got),
+        (
+            alice.account,
+            at.call,
+            alice_device,
+            at.identity.as_str(),
+            3,
+            key
+        )
+    );
+
+    // Someone turned away gets 404 on their next poll.
+    let carol_root = alice
+        .core
+        .create_call_link("Closed", false, true)
+        .await
+        .unwrap()
+        .root;
+    let LinkJoin::Waiting(p2) = bob.core.join_call_link(&carol_root, "Bob").await.unwrap() else {
+        panic!("a lobby place")
+    };
+    let w = alice.core.lobby_waiting(&carol_root).await.unwrap();
+    alice
+        .core
+        .admit(&carol_root, &w[0].handle, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        bob.core.poll_lobby(&carol_root, &p2).await.unwrap_err(),
+        songbird_app_core::Error::Server(404)
+    );
+
+    // Revoking deletes the link: nobody joins it any more, and Alice forgets it.
+    alice.core.revoke_call_link(&root).await.unwrap();
+    assert_eq!(
+        bob.core.join_call_link(&root, "Bob").await.unwrap_err(),
+        songbird_app_core::Error::Server(404)
+    );
+    assert_eq!(
+        alice.core.call_links().unwrap().len(),
+        1,
+        "the other link stays"
+    );
+}

@@ -18,6 +18,7 @@
 
 pub mod attachments;
 pub mod blob;
+pub mod call_links;
 pub mod calls;
 pub mod crypto;
 pub mod maps;

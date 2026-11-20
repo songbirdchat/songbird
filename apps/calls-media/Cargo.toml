@@ -27,6 +27,7 @@ zeroize = "1"
 songbird-content = { path = "../../crates/content" }
 livekit-api = { version = "=0.10.2", default-features = false, features = ["access-token"] }
 aws-lc-rs = "1"
+zeroize = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 
 # The workspace's lints (this crate is its own workspace so libwebrtc stays out of the server's).

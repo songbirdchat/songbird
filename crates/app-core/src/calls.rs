@@ -69,9 +69,20 @@ pub enum Signal {
     Busy,
     /// Hung up.
     Hangup,
+    /// A link call participant's sender key, from one of its devices over a Signal session.
+    SenderKey {
+        /// The device it came from.
+        device: [u8; 16],
+        /// The participant identity it is for.
+        identity: String,
+        /// Its key index.
+        index: u32,
+        /// The key.
+        key: Zeroizing<[u8; 32]>,
+    },
 }
 
-fn ticket(v: &serde_json::Value) -> Result<Ticket> {
+pub(crate) fn ticket(v: &serde_json::Value) -> Result<Ticket> {
     let s = |k: &str| {
         v.get(k)
             .and_then(serde_json::Value::as_str)
@@ -400,7 +411,7 @@ pub fn one_to_one_key(
     ))
 }
 
-fn call_content(call: &[u8; 16], kind: call_message::Kind) -> Result<Content> {
+pub(crate) fn call_content(call: &[u8; 16], kind: call_message::Kind) -> Result<Content> {
     let msg = CallMessage {
         call_id: call.to_vec(),
         kind: Some(kind),

@@ -130,6 +130,16 @@ async fn join(
     identity: &str,
     keys: KeySource,
 ) -> (Call, UnboundedReceiver<Event>) {
+    join_with(s, room, identity, keys, true).await
+}
+
+async fn join_with(
+    s: &Stack,
+    room: &str,
+    identity: &str,
+    keys: KeySource,
+    encrypt_data: bool,
+) -> (Call, UnboundedReceiver<Event>) {
     let grants = VideoGrants {
         room_join: true,
         room: room.to_owned(),
@@ -145,7 +155,9 @@ async fn join(
         .with_grants(grants)
         .to_jwt()
         .unwrap();
-    Call::join(&s.url, &token, identity, keys).await.unwrap()
+    Call::join_with(&s.url, &token, identity, keys, encrypt_data)
+        .await
+        .unwrap()
 }
 
 /// Sends a 440 Hz tone, 10 ms at a time, until dropped.
@@ -400,4 +412,47 @@ async fn a_new_epoch_locks_out_old_keys() {
     for c in [a, b, d] {
         c.leave().await.unwrap();
     }
+}
+
+/// Only `own`'s key: everyone else's arrives later (a call link).
+fn only(own: String, key: [u8; 32]) -> KeySource {
+    Arc::new(move |identity: &str| (identity == own).then(|| (0, zeroize::Zeroizing::new(key))))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_calls_keys_arrive_by_data_and_unlock_media() {
+    let Some(s) = stack() else { return };
+    let (_, name) = room();
+    create_room(&s, &name).await;
+    let (a_id, b_id) = (identity(), identity());
+    let (ka, kb) = (random::<32>(), random::<32>());
+    let (a, mut a_rx) = join_with(&s, &name, &a_id, only(a_id.clone(), ka), false).await;
+    let (b, mut b_rx) = join_with(&s, &name, &b_id, only(b_id.clone(), kb), false).await;
+    until(&mut a_rx, 20, |e| {
+        matches!(e, Event::Joined(ref i) if *i == b_id).then_some(())
+    })
+    .await;
+    let t = tone(&a).await;
+    let audio = until(&mut b_rx, 30, |e| match e {
+        Event::Audio { identity, audio } if identity == a_id => Some(audio),
+        _ => None,
+    })
+    .await;
+    assert!(!hears(&audio, 4).await, "no key yet: nothing is heard");
+    // The data channel is readable without the sender's key (its payloads are sealed by the app).
+    a.send_data("songbird.test.key", ka.to_vec(), Some(&b_id))
+        .await
+        .unwrap();
+    let got = until(&mut b_rx, 20, |e| match e {
+        Event::Data {
+            identity, payload, ..
+        } if identity == a_id => Some(payload),
+        _ => None,
+    })
+    .await;
+    b.set_key(&a_id, 0, &got.try_into().unwrap()).unwrap();
+    assert!(hears(&audio, 15).await, "with the key, B hears A");
+    t.abort();
+    a.leave().await.unwrap();
+    b.leave().await.unwrap();
 }

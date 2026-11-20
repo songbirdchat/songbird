@@ -437,6 +437,19 @@ impl Call {
         identity: &str,
         source: KeySource,
     ) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
+        Self::join_with(url, token, identity, source, true).await
+    }
+
+    /// [`Self::join`], choosing whether LiveKit also encrypts the data channel. A call link's
+    /// room turns it off (D-0153): its packets would be under sender keys a newcomer does not
+    /// hold yet, so everything the app sends there is sealed by the app instead.
+    pub async fn join_with(
+        url: &str,
+        token: &str,
+        identity: &str,
+        source: KeySource,
+        encrypt_data: bool,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         tls();
         let keys = key_provider();
         let own = ParticipantIdentity(identity.to_owned());
@@ -449,10 +462,22 @@ impl Call {
 
         let mut options = RoomOptions::default();
         options.auto_subscribe = true;
-        options.encryption = Some(E2eeOptions {
+        let e2ee = E2eeOptions {
             encryption_type: EncryptionType::Gcm,
             key_provider: keys.clone(),
-        });
+        };
+        if encrypt_data {
+            options.encryption = Some(e2ee);
+        } else {
+            // Media only: LiveKit encrypts data packets only when given `encryption`.
+            #[allow(
+                deprecated,
+                reason = "the field that keeps the data channel unencrypted"
+            )]
+            {
+                options.e2ee = Some(e2ee);
+            }
+        }
         let (room, mut room_events) = Room::connect(url, token, options)
             .await
             .map_err(|e| Error::Room(e.to_string()))?;
@@ -527,6 +552,16 @@ impl Call {
             }
         }
         Ok(index)
+    }
+
+    /// Installs one participant's key (a link call's sender key, as it arrives).
+    pub fn set_key(&self, identity: &str, index: u32, key: &[u8; 32]) -> Result<()> {
+        install(
+            &self.keys,
+            &ParticipantIdentity(identity.to_owned()),
+            index,
+            key,
+        )
     }
 
     /// Sends with key `index` from now on (§8.2: one second after installing an epoch).
