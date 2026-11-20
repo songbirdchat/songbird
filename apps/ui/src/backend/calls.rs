@@ -1666,14 +1666,27 @@ pub fn closed(ui_call: u64, reason: EndReason, by_user: bool) {
         }
     }
     let (media, screen) = (live.media, live.screen);
-    drop(background(async move {
+    let leaving = background(async move {
         if let Some(share) = screen {
             share.stop().await;
         }
+        let mut traffic = (0, 0);
         if let Some(media) = media {
+            // What WebRTC counted for this call, for Network usage.
+            traffic = media.traffic().await;
             let _ = media.close().await;
         }
-    }));
+        traffic
+    });
+    spawn(async move {
+        if let Ok((sent, received)) = leaving.await {
+            super::usage::count(
+                super::usage::Lane::Calls,
+                usize::try_from(sent).unwrap_or(usize::MAX),
+                usize::try_from(received).unwrap_or(usize::MAX),
+            );
+        }
+    });
 }
 
 fn hang_up_signal(peer: [u8; 16], call: [u8; 16]) {

@@ -43,6 +43,8 @@ Status: ☐ open · ☑ done (with the commit).
 
 - ☑ Broadcast lists send; presence and nudges to real contacts (D-0160)
 
+- ☑ Locked chats open with the app passcode; real storage and network usage (D-0162)
+
 ## Open, by what they need
 
 **a (app only, or an existing endpoint):**
@@ -50,13 +52,10 @@ Status: ☐ open · ☑ done (with the commit).
 - backup frequency, include media and second destination
 - Google Drive, OneDrive and Dropbox stores (the crate has them; OAuth needs the owner's apps)
 - parental rules enforced on the child's app
-- lock chat unlocked with the app passcode
 
 **b (app-core):**
 - security notifications (KT)
 - chat list state synced (records)
-- network usage counted
-- storage per chat
 
 **Groups, the rest (b, c):** new devices joining by external commit. (Roles on received commits: D-0155; the change log: D-0156.)
 

@@ -199,6 +199,29 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0162 — Locked chats open with the app passcode; real storage and network usage
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Locked chats** open with the app passcode (the six digits kept only on this device as a
+    slow hash, D-0101), with the lock screen's growing wait after wrong tries, served on the
+    Locked chats page too. Locking a chat needs a passcode to exist; without one the user is
+    sent to Privacy → App lock. Before this, "Unlock" opened them with a press. Face ID and
+    fingerprints join with the native host projects.
+  - **Manage storage** lists what app-core keeps on this device (every decrypted file in the
+    SQLCipher store, by chat, with its real size, type and name) and deletes files from it (the
+    messages stay). A real account no longer sees the made-up files.
+  - **Network usage** counts what crosses the network on this device, by lane (messages,
+    media, calls), kept on the device until reset: every HTTP request and answer (by its path:
+    attachments, packs, GIFs, map tiles and storage URLs are media), every delivery-connection
+    frame sent and received, and each call's bytes as WebRTC counted them on its transports
+    (`Call::traffic`), added when the call ends. Header sizes are estimated (a flat 200 bytes an
+    HTTP request and answer); bodies are exact.
+- Evidence: `apps/ui` 214 tests (the lanes of URLs, the date); the app builds with every
+  counter wired. Not exercised against a live session.
+
 ## D-0161 — Voice notes: a recorder on every platform, WAV, played receipts
 
 - Date: 2026-11-20

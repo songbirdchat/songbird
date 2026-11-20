@@ -155,6 +155,19 @@ type Grouped = Option<(([u8; 16], [u8; 16]), Vec<Session>)>;
 pub type Frank = (Vec<u8>, Vec<u8>, Vec<u8>);
 /// An installed pack as kept: (id, pack key, the manifest's encoding).
 pub type StoredPack = ([u8; 16], Zeroizing<[u8; 32]>, Vec<u8>);
+/// A file kept on this device (decrypted, in this store).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptFile {
+    pub chat: [u8; 16],
+    pub author: [u8; 16],
+    pub id: [u8; 16],
+    pub idx: u32,
+    pub bytes: u64,
+    pub stored_ms: u64,
+    /// The message's encoded `Content` (its attachment pointers name and type the file).
+    pub content: Vec<u8>,
+}
+
 /// A message in a chat: (chat, author, id).
 pub type ChatMessage = ([u8; 16], [u8; 16], [u8; 16]);
 /// A pinned message: (author, id, pinned until, ms).
@@ -824,6 +837,45 @@ impl Store {
             params![&author[..], &id[..]],
         ))
         .map(|_| ())
+    }
+
+    /// Every file kept here: (chat, author, id, index, bytes, stored at, the message's content).
+    pub fn file_index(&self) -> Result<Vec<KeptFile>> {
+        let mut st = db(self.db.prepare(
+            "SELECT m.chat, f.author, f.id, f.idx, length(f.bytes), m.stored_ms, m.content
+             FROM files f JOIN messages m ON m.author = f.author AND m.id = f.id",
+        ))?;
+        let rows = db(st.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Vec<u8>>(6)?,
+            ))
+        }))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (c, a, i, idx, len, at, content) = db(row)?;
+            if let (Ok(c), Ok(a), Ok(i)) = (
+                <[u8; 16]>::try_from(c),
+                <[u8; 16]>::try_from(a),
+                <[u8; 16]>::try_from(i),
+            ) {
+                out.push(KeptFile {
+                    chat: c,
+                    author: a,
+                    id: i,
+                    idx: u32::try_from(idx).unwrap_or(0),
+                    bytes: u64::try_from(len).unwrap_or(0),
+                    stored_ms: u64::try_from(at).unwrap_or(0),
+                    content,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Deletes a message's kept files (a view-once message after it was shown).

@@ -100,6 +100,7 @@ pub fn connect() {
                     }
                     // Stored by app-core, then acknowledged; in `seq` order.
                     Event::Deliver { seq, envelope } => {
+                        super::usage::count(super::usage::Lane::Messages, 0, envelope.len() + 16);
                         if super::chat::receive(&envelope).await {
                             if let Some(c) = self::client() {
                                 let _ = c.ack(seq).await;
@@ -110,10 +111,12 @@ pub fn connect() {
                     }
                     // Typing and other ephemeral events: decrypted, never stored or acknowledged.
                     Event::Ephemeral { payload } => {
+                        super::usage::count(super::usage::Lane::Messages, 0, payload.len() + 8);
                         let _ = super::chat::receive(&payload).await;
                     }
                     // Nudges: taken only from the attention class (§10.5).
                     Event::Attention { payload } => {
+                        super::usage::count(super::usage::Lane::Messages, 0, payload.len() + 8);
                         super::chat::receive_attention(&payload).await;
                     }
                     Event::Disconnected { .. } => live().update(|l| l.link = Link::Retrying),

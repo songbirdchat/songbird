@@ -708,6 +708,26 @@ impl Call {
             .map_err(|e| Error::Room(e.to_string()))
     }
 
+    /// The call's traffic so far, (bytes sent, bytes received), over every transport
+    /// (WebRTC's own counters); `(0, 0)` when they cannot be read.
+    pub async fn traffic(&self) -> (u64, u64) {
+        use livekit::webrtc::stats::RtcStats;
+        let Ok(stats) = self.room.get_stats().await else {
+            return (0, 0);
+        };
+        stats
+            .publisher_stats
+            .iter()
+            .chain(stats.subscriber_stats.iter())
+            .filter_map(|s| match s {
+                RtcStats::Transport(t) => {
+                    Some((t.transport.bytes_sent, t.transport.bytes_received))
+                }
+                _ => None,
+            })
+            .fold((0, 0), |(a, b), (x, y)| (a + x, b + y))
+    }
+
     /// Whether the room is connected.
     #[must_use]
     pub fn connected(&self) -> bool {

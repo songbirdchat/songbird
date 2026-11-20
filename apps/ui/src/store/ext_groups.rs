@@ -382,8 +382,8 @@ pub struct StoredFile {
     pub at: Minutes,
 }
 
-/// Mock: the files app-core's storage index will list for a chat, made up
-/// deterministically from the chat's id.
+/// A demo chat's files, made up deterministically from the chat's id (a real account's come
+/// from app-core: `backend::chat::kept_files`).
 pub fn files_for(chat: &Chat) -> Vec<StoredFile> {
     if matches!(chat.kind, ChatKind::Community) {
         return Vec::new();
@@ -468,8 +468,9 @@ pub fn largest_first(files: &[StoredFile], chat: ChatId) -> Vec<StoredFile> {
     out
 }
 
-/// Mock network statistics since the last reset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Network statistics since the last reset (`backend::usage` counts a real account's; the
+/// demo shows sample figures).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkUsage {
     pub messages_sent: u64,
     pub messages_received: u64,
@@ -477,7 +478,7 @@ pub struct NetworkUsage {
     pub media_received: u64,
     pub calls_sent: u64,
     pub calls_received: u64,
-    pub since: &'static str,
+    pub since: String,
 }
 
 impl NetworkUsage {
@@ -519,14 +520,18 @@ impl Default for GroupsState {
             },
             installing: None,
             deleted_files: HashSet::new(),
-            usage: NetworkUsage {
-                messages_sent: 18_400_000,
-                messages_received: 42_900_000,
-                media_sent: 612_000_000,
-                media_received: 1_840_000_000,
-                calls_sent: 311_000_000,
-                calls_received: 298_000_000,
-                since: "1 September 2026",
+            usage: if !crate::store::demo() {
+                crate::backend::usage::load()
+            } else {
+                NetworkUsage {
+                    messages_sent: 18_400_000,
+                    messages_received: 42_900_000,
+                    media_sent: 612_000_000,
+                    media_received: 1_840_000_000,
+                    calls_sent: 311_000_000,
+                    calls_received: 298_000_000,
+                    since: "1 September 2026".into(),
+                }
             },
             next: 500_000,
         }
@@ -898,6 +903,13 @@ impl Store {
     /// Every file kept on this device.
     pub fn stored_files(&self) -> Vec<StoredFile> {
         let deleted = groups_state().with(|g| g.deleted_files.clone());
+        // A real account's files are what app-core keeps, decrypted, in its store.
+        if crate::backend::packs::live() {
+            return crate::backend::chat::kept_files()
+                .into_iter()
+                .filter(|f| !deleted.contains(&f.id))
+                .collect();
+        }
         self.chats.with(|cs| {
             cs.iter()
                 .flat_map(files_for)
@@ -908,21 +920,13 @@ impl Store {
 
     /// Deletes files from this device (the messages stay).
     pub fn delete_files(&self, ids: &[u64]) {
+        crate::backend::chat::delete_kept(ids);
         groups_state().update(|g| g.deleted_files.extend(ids.iter().copied()));
     }
 
     pub fn reset_network_usage(&self) {
-        groups_state().update(|g| {
-            g.usage = NetworkUsage {
-                messages_sent: 0,
-                messages_received: 0,
-                media_sent: 0,
-                media_received: 0,
-                calls_sent: 0,
-                calls_received: 0,
-                since: "today",
-            }
-        });
+        let fresh = crate::backend::usage::reset();
+        groups_state().update(|g| g.usage = fresh);
     }
 }
 

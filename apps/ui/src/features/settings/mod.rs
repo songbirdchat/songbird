@@ -16,6 +16,7 @@ mod extras;
 mod links;
 mod notifications;
 mod privacy;
+pub use privacy::app_lock;
 mod profile;
 
 use std::rc::Rc;

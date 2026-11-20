@@ -572,6 +572,7 @@ impl Net for AppNet {
         body: Vec<u8>,
     ) -> songbird_app_core::Result<SendStatus> {
         let client = super::ws::client().ok_or(songbird_app_core::Error::Network)?;
+        super::usage::count(super::usage::Lane::Messages, body.len() + 40, 0);
         client
             .send_with(
                 idempotency_key,
@@ -591,6 +592,7 @@ impl Net for AppNet {
         payload: Vec<u8>,
     ) -> songbird_app_core::Result<()> {
         let client = super::ws::client().ok_or(songbird_app_core::Error::Network)?;
+        super::usage::count(super::usage::Lane::Messages, payload.len() + 24, 0);
         client
             .ephemeral(DeviceId::from_bytes(device), payload.into())
             .await
@@ -603,6 +605,7 @@ impl Net for AppNet {
         payload: Vec<u8>,
     ) -> songbird_app_core::Result<()> {
         let client = super::ws::client().ok_or(songbird_app_core::Error::Network)?;
+        super::usage::count(super::usage::Lane::Messages, payload.len() + 24, 0);
         client
             .attention(DeviceId::from_bytes(device), payload.into())
             .await
@@ -616,6 +619,8 @@ impl Net for AppNet {
         recipients: Vec<(DeviceIdBytes, Vec<u8>)>,
     ) -> songbird_app_core::Result<SendStatus> {
         let client = super::ws::client().ok_or(songbird_app_core::Error::Network)?;
+        let size: usize = recipients.iter().map(|(_, p)| p.len() + 20).sum();
+        super::usage::count(super::usage::Lane::Messages, size + 40, 0);
         let r = recipients
             .into_iter()
             .map(|(d, e)| Recipient {
@@ -2513,6 +2518,93 @@ pub fn played(msg: MsgId) {
         let mut guard = lock.lock().await;
         if let Some(m) = guard.as_mut() {
             let _ = m.mark_played(&author, &id).await;
+        }
+        Ok(())
+    });
+}
+
+thread_local! {
+    /// Kept files by their storage-page ID: (author, message ID).
+    static KEPT: RefCell<HashMap<u64, ([u8; 16], [u8; 16])>> = RefCell::new(HashMap::new());
+}
+
+/// The files app-core keeps on this device, for Manage storage.
+pub fn kept_files() -> Vec<crate::store::ext_groups::StoredFile> {
+    use crate::store::ext_groups::{FileKind, StoredFile};
+    let lock = core();
+    let Ok(guard) = lock.try_lock() else {
+        return Vec::new();
+    };
+    let Some(m) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let files = m.store.file_index().unwrap_or_default();
+    drop(guard);
+    files
+        .into_iter()
+        .map(|f| {
+            let p = songbird_app_core::messenger::attachments_of(&f.content)
+                .into_iter()
+                .nth(usize::try_from(f.idx).unwrap_or(0));
+            let (kind, name) = match p {
+                Some(p) if p.flags & 1 == 1 || p.content_type.starts_with("audio/") => {
+                    (FileKind::Voice, "Voice message".to_string())
+                }
+                Some(p) if p.content_type.starts_with("image/") => (
+                    FileKind::Photo,
+                    if p.file_name.is_empty() {
+                        "Photo".into()
+                    } else {
+                        p.file_name
+                    },
+                ),
+                Some(p) if p.content_type.starts_with("video/") => (
+                    FileKind::Video,
+                    if p.file_name.is_empty() {
+                        "Video".into()
+                    } else {
+                        p.file_name
+                    },
+                ),
+                Some(p) => (
+                    FileKind::Document,
+                    if p.file_name.is_empty() {
+                        "File".into()
+                    } else {
+                        p.file_name
+                    },
+                ),
+                None => (FileKind::Document, "File".into()),
+            };
+            let id = ui_id(&f.id) ^ u64::from(f.idx);
+            KEPT.with_borrow_mut(|k| k.insert(id, (f.author, f.id)));
+            StoredFile {
+                id,
+                chat: ui_id(&f.chat),
+                name,
+                kind,
+                bytes: f.bytes,
+                at: minutes(f.stored_ms),
+            }
+        })
+        .collect()
+}
+
+/// Deletes kept files from this device (the messages stay; a file is fetched again only while
+/// the server still holds it).
+pub fn delete_kept(ids: &[u64]) {
+    let targets: Vec<([u8; 16], [u8; 16])> =
+        KEPT.with_borrow(|k| ids.iter().filter_map(|i| k.get(i).copied()).collect());
+    if targets.is_empty() {
+        return;
+    }
+    super::run(async move {
+        let lock = core();
+        let guard = lock.lock().await;
+        if let Some(m) = guard.as_ref() {
+            for (a, i) in targets {
+                let _ = m.store.drop_files(&a, &i);
+            }
         }
         Ok(())
     });

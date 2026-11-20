@@ -313,19 +313,68 @@ fn locked() -> impl IntoElement {
                 .empty(empty_state(Icon::Unlock, "No locked chats", "Chats you lock show here.", None))
         })
         .otherwise(move || {
-            empty_state(
-                Icon::Lock,
-                "Your locked chats",
-                "Unlock with your device's fingerprint, face or passcode to see them.",
-                Some(
-                    // mock: the real app asks the OS for biometrics or the
-                    // device passcode (app-core `lock.unlock()`).
-                    btn_with_icon("Unlock", Some(Icon::Unlock), Variant::Primary, BtnSize::Md, move || {
-                        unlocked.set(true)
-                    })
-                    .into_element(),
-                ),
-            )
+            // Locked chats open with the app passcode (kept only on this device, a slow hash,
+            // with the lock screen's wait after wrong tries). Face ID and fingerprints join it
+            // with the native host projects.
+            if !crate::backend::lock::is_set() {
+                return empty_state(
+                    Icon::Lock,
+                    "Your locked chats",
+                    "Locked chats open with your app passcode. Set one in Privacy → App lock.",
+                    Some(
+                        btn("Set a passcode", Variant::Primary, BtnSize::Md, move || {
+                            crate::features::settings::app_lock();
+                        })
+                        .into_element(),
+                    ),
+                )
+                .into_element();
+            }
+            let code = signal(String::new());
+            let wrong = signal(false);
+            let checking = signal(false);
+            let submit = move || {
+                if checking.get_untracked() {
+                    return;
+                }
+                let entered = code.get_untracked();
+                if entered.len() != 6 {
+                    return;
+                }
+                let (_, left) = crate::backend::lock::failures();
+                if left > 0 {
+                    toast(format!("Too many wrong tries. Wait {} seconds.", left.div_ceil(1000)));
+                    code.set(String::new());
+                    return;
+                }
+                checking.set(true);
+                spawn(async move {
+                    let ok = crate::backend::lock::check(entered).await;
+                    checking.set(false);
+                    code.set(String::new());
+                    if ok {
+                        crate::backend::lock::reset_failures();
+                        unlocked.set(true);
+                    } else {
+                        let (_, left) = crate::backend::lock::record_failure();
+                        wrong.set(true);
+                        // The wait is served here too, then cleared (the next try is allowed).
+                        set_timeout(std::time::Duration::from_millis(left), || {
+                            crate::backend::lock::wait_left(0);
+                        });
+                    }
+                });
+            };
+            view()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_4()
+                .px_6()
+                .child(icon(Icon::Lock, 32.0))
+                .child(text("Enter your passcode to see locked chats").text_center())
+                .child(passcode_cells("Passcode", code, move || wrong.get(), submit))
+                .into_element()
         }),
     )
 }

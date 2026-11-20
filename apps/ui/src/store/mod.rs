@@ -401,7 +401,16 @@ impl Store {
     pub fn toggle_favourite(&self, id: ChatId) {
         self.edit_chat(id, |c| c.favourite = !c.favourite);
     }
+    /// Locks or unlocks a chat. Locking needs the app passcode (it is what opens Locked chats):
+    /// without one, nothing changes and the user is told.
     pub fn toggle_lock(&self, id: ChatId) {
+        let locked = self.chat(id).is_some_and(|c| c.locked);
+        if !locked && !crate::backend::lock::is_set() {
+            crate::ui::toast(
+                "Set an app passcode first (Privacy → App lock): it opens locked chats.",
+            );
+            return;
+        }
         self.edit_chat(id, |c| c.locked = !c.locked);
     }
     pub fn set_disappearing(&self, id: ChatId, timer: Option<Disappear>) {

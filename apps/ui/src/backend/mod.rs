@@ -36,6 +36,7 @@ pub mod presence;
 pub mod profile;
 pub mod records;
 pub mod supervision;
+pub mod usage;
 pub mod username;
 pub mod wire;
 mod ws;
@@ -320,8 +321,18 @@ fn endpoint() -> Endpoint {
 }
 
 async fn send(request: HttpRequest) -> Result<(u16, Vec<u8>), Problem> {
+    let lane = usage::lane_of(&request.url);
+    // The request's line, headers and body, roughly as they go out.
+    let body = match &request.body {
+        nsh_core::platform::HttpBody::Bytes(b) => b.len(),
+        _ => 0,
+    };
+    let out = body + request.url.len() + 200;
     match fetch(request).await {
-        Ok(r) => Ok((r.status(), r.body)),
+        Ok(r) => {
+            usage::count(lane, out, r.body.len() + 200);
+            Ok((r.status(), r.body))
+        }
         Err(e) => Err(problem(format!(
             "Can't reach the server ({e:?}). Check the address in Server connection."
         ))),
