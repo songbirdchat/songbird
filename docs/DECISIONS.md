@@ -217,6 +217,13 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
     access: on a fresh install the camera waited, with no prompt, for a button the call
     screen doesn't have. Turning the camera on now asks; refused, it goes off and says where
     to allow it. Checked on an iPhone: its camera seen live, decrypted, on the other device.
+  - **Video on phones**: frames were NSH images, each encoded to PNG and decoded again and
+    loaded asynchronously: they lagged and blinked. A native view, `songbird/video` (iOS: a
+    CGImage on a layer; Android: a reused bitmap), now takes each decoded frame straight from
+    the decoder's thread, at 24 a second. Call tiles rebuild only when what they show changes
+    (they were rebuilt with every audio-level update), and the user's camera preview is made
+    once: iOS aborts the app when a second preview layer attaches to a camera session, which
+    crashed calls.
   - **Names**: the user's own profile lived in memory only (empty after a restart); it is kept
     in the vault. Contacts' names (the username typed, the name their profile gives) are kept
     too, so a restart no longer shows "Songbird user …". A call link's name goes from its admin

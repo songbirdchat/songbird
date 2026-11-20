@@ -27,6 +27,7 @@ pub mod jpeg;
 pub mod linux;
 pub mod mailbox;
 pub mod qr;
+pub mod video;
 #[cfg(target_os = "windows")]
 pub mod windows;
 

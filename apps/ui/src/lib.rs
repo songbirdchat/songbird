@@ -71,6 +71,8 @@ fn camera_components_macos(components: &nsh_platform_macos::Components) {
 #[native_components(ios)]
 fn camera_components_ios(components: &nsh_platform_ios::Components) {
     songbird_camera::apple::register(components);
+    // Call video drawn natively (D-0183).
+    songbird_camera::video::register(components);
 }
 
 /// The camera's live preview on Windows (Media Foundation frames drawn with Direct2D).

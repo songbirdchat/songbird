@@ -54,6 +54,8 @@ const HAND_TOPIC: &str = "songbird.v1/call-hand";
 const LINK_NAME_TOPIC: &str = "songbird.v1/call-link-name";
 /// Remote video frames shown per second at most (the tiles are small; the encoder sends more).
 const VIDEO_FPS: u64 = 15;
+/// Frames a second drawn natively on phones (no engine hop, so smoother than [`VIDEO_FPS`]).
+const NATIVE_VIDEO_FPS: u64 = 24;
 /// The camera's capture size asked of the encoder (it scales what the camera gives).
 const CAMERA: (u32, u32) = (640, 480);
 
@@ -758,6 +760,9 @@ fn check_hello(ui_call: u64, identity: String, hello: Vec<u8>) {
 
 /// Decodes a participant's video into the call's frames, at most [`VIDEO_FPS`] a second.
 fn show_video(ui_call: u64, identity: String, video: songbird_calls_media::RemoteVideo) {
+    if songbird_camera::video::supported() {
+        return show_video_natively(ui_call, identity, video);
+    }
     let (tx, mut rx) = tokio::sync::mpsc::channel::<songbird_calls_media::Rgba>(2);
     drop(background(async move {
         let mut frames = Box::pin(video.frames());
@@ -789,6 +794,49 @@ fn show_video(ui_call: u64, identity: String, video: songbird_calls_media::Remot
             }
         }
         ui::live::frame(&identity, None);
+    });
+}
+
+/// Phones: each decoded frame, turned upright, goes from the decoder's thread straight to the
+/// native view (`songbird/video`, D-0183); the UI hears only that the video started and ended.
+fn show_video_natively(ui_call: u64, identity: String, video: songbird_calls_media::RemoteVideo) {
+    let feed = songbird_camera::video::feed_id(&identity);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(2);
+    drop(background(async move {
+        let mut frames = Box::pin(video.frames());
+        let gap = Duration::from_millis(1000 / NATIVE_VIDEO_FPS);
+        let mut last = std::time::Instant::now()
+            .checked_sub(gap)
+            .unwrap_or_else(std::time::Instant::now);
+        let mut started = false;
+        while let Some(f) = frames.next().await {
+            if last.elapsed() < gap {
+                continue;
+            }
+            last = std::time::Instant::now();
+            let f = upright(f);
+            if f.width == 0 || f.height == 0 {
+                continue;
+            }
+            songbird_camera::video::show(feed, f.width, f.height, f.pixels);
+            if !started {
+                started = true;
+                if tx.send(true).await.is_err() {
+                    break;
+                }
+            }
+        }
+        songbird_camera::video::clear(feed);
+        let _ = tx.send(false).await;
+    }));
+    spawn(async move {
+        while let Some(on) = rx.recv().await {
+            if !is_live(ui_call) {
+                break;
+            }
+            ui::live::feeding(&identity, on);
+        }
+        ui::live::feeding(&identity, false);
     });
 }
 

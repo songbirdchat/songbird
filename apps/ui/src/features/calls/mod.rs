@@ -504,6 +504,11 @@ impl PartialEq for CallFrames {
     }
 }
 
+/// The participants whose video a phone draws natively (`songbird/video`, D-0183), by
+/// participant identity: their frames go to the view, not through here.
+#[derive(Default, Clone, PartialEq)]
+pub struct CallFeeds(pub std::collections::HashSet<String>);
+
 /// The devices a real call can use (the platform's), shown in the devices sheet.
 #[derive(Default, Clone, PartialEq)]
 pub struct CallDevices {
@@ -514,7 +519,9 @@ pub struct CallDevices {
 
 /// What `backend::calls` changes: only the call it names, never another.
 pub mod live {
-    use super::{ActiveCall, CallDevices, CallFrames, CallState, EndReason, Phase, calls};
+    use super::{
+        ActiveCall, CallDevices, CallFeeds, CallFrames, CallState, EndReason, Phase, calls,
+    };
     use nsh_core::prelude::*;
 
     /// Changes call `id` if it is the one going on.
@@ -620,6 +627,18 @@ pub mod live {
     /// Forgets every frame (the call ended).
     pub fn clear_frames() {
         global::<CallFrames>().set(CallFrames::default());
+        global::<CallFeeds>().set(CallFeeds::default());
+    }
+
+    /// A participant's video started (`true`) or stopped on the native view.
+    pub fn feeding(identity: &str, on: bool) {
+        global::<CallFeeds>().update(|f| {
+            if on {
+                f.0.insert(identity.to_owned());
+            } else {
+                f.0.remove(identity);
+            }
+        });
     }
 
     /// Reads the platform's devices again (the call's audio opened, or a device came or went).

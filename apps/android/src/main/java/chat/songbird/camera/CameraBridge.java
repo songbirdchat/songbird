@@ -250,6 +250,15 @@ public final class CameraBridge {
 
     // ------------------------------------------------------------ implemented in Rust
 
+    /** A call's video frame from Rust (D-0183). */
+    static void videoFrame(long feed, int width, int height, java.nio.ByteBuffer rgba) {
+        VideoFrameView.frame(feed, width, height, rgba);
+    }
+
+    static void videoClear(long feed) {
+        VideoFrameView.clear(feed);
+    }
+
     static native void nativeInit();
 
     static native void nativeAccess(int access);

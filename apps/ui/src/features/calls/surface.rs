@@ -269,7 +269,7 @@ fn feed(seed: u64, blurred: bool) -> Option<View> {
 }
 
 /// What a tile shows of a person.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Look {
     name: String,
     seed: u64,
@@ -300,23 +300,50 @@ impl Look {
 }
 
 /// A participant's latest decoded frame filling the tile (real calls).
+/// One image element for the whole call, its source swapped as frames come (D-0183: a new
+/// element per frame flickered and lagged).
 fn live_feed(identity: String) -> View {
+    // Phones: the native view, frames straight from the decoder (D-0183).
+    if songbird_camera::video::supported() {
+        let feeds = global::<super::CallFeeds>();
+        let feed = songbird_camera::video::feed_id(&identity);
+        let has = computed(move || feeds.with(|f| f.0.contains(&identity)));
+        return view()
+            .absolute()
+            .inset_0()
+            .accessibility_elements_hidden(true)
+            .child(when(
+                move || has.get(),
+                move || {
+                    native("songbird/video")
+                        .prop("feed", serde_json::Value::from(feed))
+                        .flex_1()
+                },
+            ));
+    }
+    let frames = global::<super::CallFrames>();
+    let has = {
+        let id = identity.clone();
+        computed(move || frames.with(|f| f.0.contains_key(&id)))
+    };
     view()
         .absolute()
         .inset_0()
         .accessibility_elements_hidden(true)
-        .child(dynamic(move || {
-            let src = global::<super::CallFrames>().with(|f| f.0.get(&identity).cloned());
-            untracked(move || {
-                src.map(|src| {
-                    image(src)
-                        .absolute()
-                        .inset_0()
-                        .object_fit(ResizeMode::Cover)
-                        .into_element()
+        .child(when(
+            move || has.get(),
+            move || {
+                let id = identity.clone();
+                image(move || {
+                    frames
+                        .with(|f| f.0.get(&id).cloned())
+                        .unwrap_or_else(|| nsh_core::element::ImageSrc::rgba(1, 1, vec![0; 4]))
                 })
-            })
-        }))
+                .absolute()
+                .inset_0()
+                .object_fit(ResizeMode::Cover)
+            },
+        ))
 }
 
 /// One person's tile: a video tile (their camera's frames in a real call; their picture in a
@@ -450,16 +477,15 @@ fn my_tile(s: Store, big: bool, cam: crate::camera::Session) -> AnyElement {
     let me = s.me;
     let look = field(|c| (c.video, c.muted, c.hand), (false, false, false));
     let live = crate::camera::has_live_preview();
-    dynamic(move || {
-        let (video, muted, hand) = look.get();
-        let me = me.get();
-        let cam = cam.clone();
-        untracked(move || {
-            let preview = (video && live).then(|| crate::camera::preview_fill(&cam));
-            view()
-                .flex_1()
-                .relative()
-                .child(tile(
+    let video = field(|c| c.video, false);
+    view()
+        .flex_1()
+        .relative()
+        .child(dynamic(move || {
+            let (video, muted, hand) = look.get();
+            let me = me.get();
+            untracked(move || {
+                tile(
                     Look {
                         name: format!("{} (you)", me.name),
                         seed: me.seed,
@@ -471,15 +497,22 @@ fn my_tile(s: Store, big: bool, cam: crate::camera::Session) -> AnyElement {
                         speaking: false,
                     },
                     big,
-                ))
-                .child(preview.map(|p| {
-                    p.rounded(move || radius::lg())
-                        .overflow_hidden()
-                        .pointer_events(PointerEvents::None)
-                }))
-                .into_element()
-        })
-    })
+                )
+            })
+        }))
+        // The camera's preview, made once and kept while the camera is on: iOS allows one
+        // preview layer per camera session and aborts on a second (D-0183: remade with every
+        // change of the tile, it crashed the app).
+        .child(when(
+            move || live && video.get(),
+            move || {
+                crate::camera::preview_fill(&cam)
+                    .rounded(move || radius::lg())
+                    .overflow_hidden()
+                    .pointer_events(PointerEvents::None)
+            },
+        ))
+        .into_element()
 }
 
 /// A group call's tiles: a grid, or the speaker big with the rest in a
@@ -513,22 +546,29 @@ fn group_stage(s: Store) -> View {
         cell().child(
             arrive(0.96, 0.0, motion::SLOW)
                 .aspect_ratio(shape())
-                .child(dynamic(move || {
-                    // Follows their mute and hand without remaking the arrival.
-                    let now = calls().with(|x| {
-                        x.call.as_ref().and_then(|c| {
-                            c.participants
-                                .iter()
-                                .find(|q| {
-                                    q.id == p.id
-                                        || (!p.identity.is_empty() && q.identity == p.identity)
-                                })
-                                .cloned()
-                        })
+                .child({
+                    // Follows what their tile shows (mute, hand, camera, speaking) without
+                    // remaking the arrival, and only when that changes: the call's state also
+                    // carries audio levels many times a second (D-0183).
+                    let look = computed(move || {
+                        let now = calls().with(|x| {
+                            x.call.as_ref().and_then(|c| {
+                                c.participants
+                                    .iter()
+                                    .find(|q| {
+                                        q.id == p.id
+                                            || (!p.identity.is_empty() && q.identity == p.identity)
+                                    })
+                                    .cloned()
+                            })
+                        });
+                        Look::of(&now.unwrap_or_else(|| p.clone()))
                     });
-                    let q = now.unwrap_or_else(|| p.clone());
-                    untracked(move || tile(Look::of(&q), false))
-                })),
+                    dynamic(move || {
+                        let l = look.get();
+                        untracked(move || tile(l, false))
+                    })
+                }),
         )
     };
     view().flex_1().child(dynamic(move || {
@@ -575,7 +615,12 @@ fn group_stage(s: Store) -> View {
                             .min_w(relative(1.0))
                             .justify_center()
                             .gap_2()
-                            .child(view().w(px(160.0)).child(my_tile(s, false, cam.clone())))
+                            // The user's tile is big while no one else is: never twice (one
+                            // camera preview per session).
+                            .child(when(move || speaker.with(Option::is_some), {
+                                let cam = cam.clone();
+                                move || view().w(px(160.0)).child(my_tile(s, false, cam.clone()))
+                            }))
                             .child(each(
                                 move || {
                                     let big = speaker.with(|p| p.as_ref().map(|p| p.id));

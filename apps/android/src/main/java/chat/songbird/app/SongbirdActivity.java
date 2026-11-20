@@ -31,6 +31,7 @@ public final class SongbirdActivity extends Activity {
         CameraBridge.attach(this);
         DeviceBridge.attach(this);
         view.registerComponent("songbird/camera", CameraPreview::new);
+        view.registerComponent("songbird/video", chat.songbird.camera.VideoFrameView::new);
         setContentView(view);
         view.handleNotificationIntent(getIntent());
         if (state == null) view.handleUrlSchemeIntent(getIntent());
