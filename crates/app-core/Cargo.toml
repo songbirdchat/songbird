@@ -27,6 +27,9 @@ tls_codec = "0.5"
 # The group wire formats and rules the server checks (Bundle, roles, DS key): shared, not copied.
 songbird-groups.workspace = true
 songbird-types.workspace = true
+# Key transparency on the device (D-0168): akd's lookup verifier and its protobuf proofs.
+akd.workspace = true
+protobuf.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

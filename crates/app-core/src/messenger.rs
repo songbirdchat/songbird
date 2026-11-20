@@ -642,9 +642,26 @@ impl<N: Net> Messenger<N> {
         if status != 200 {
             return Err(Error::Server(status));
         }
-        let list = DeviceList::verify(&list, account, &identity)?;
+        let raw = list;
+        let list = DeviceList::verify(&raw, account, &identity)?;
         let pairs: Vec<_> = list.devices.iter().map(|(d, _, ik, _)| (*d, *ik)).collect();
+        let before: Vec<[u8; 16]> = self
+            .store
+            .devices(account)?
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect();
         let removed = self.store.set_devices(account, list.version, &pairs)?;
+        // New devices on an account this device already knew (D-0168): a security notice.
+        let added = pairs.iter().filter(|(d, _)| !before.contains(d)).count();
+        if !before.is_empty() && added > 0 {
+            self.notice(crate::kt::Notice::NewDevices {
+                account: *account,
+                count: u32::try_from(added).unwrap_or(u32::MAX),
+            })?;
+        }
+        // The log must publish this very list (§4.9); a server without the log answers 503.
+        let _ = self.kt_check_list(account, &raw).await;
         for d in removed {
             self.sessions.remove(&(*account, d));
             self.store.save_sessions(&self.sessions, &(*account, d))?;

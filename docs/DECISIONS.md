@@ -199,6 +199,40 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0168 — Key transparency checked on the device; security notices shown
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: app-core checks the log (PROTOCOL §4.9) with akd's own verifier: the log's keys
+  are pinned on first read; every signed head is checked and must move forward (an older
+  epoch, or the same epoch with another root, is a fork); whenever a device accepts a newer
+  signed device list (a contact's or its own) it verifies a lookup proof that the log publishes
+  exactly that list. A list the log hasn't published yet is checked again with the next fetch;
+  the same list contradicted twice is noticed. New devices on an account the device already
+  knew are noticed too. The app shows: a line in the contact's chat for their new devices or a
+  list the log doesn't vouch for, a warning for the user's own new devices, and a lasting
+  problem banner for a fork. The A2 gate now runs with the real log.
+- Consequences: audit proofs need every epoch's root, which no endpoint serves one by one, so
+  devices rely on forward-only heads and leave audits to auditors (`POST /v1/kt/audit`). The
+  log's keys are trusted on first use until release builds ship them pinned (A12).
+
+## D-0167 — A new device joins its account's groups by external commit
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: every device keeps an encrypted record `g/<group ID hex>` per group the account is
+  in (§10.2); a device that finds one for a group it isn't in joins by external commit through
+  `POST /v1/groups/commit` (§6.3 rule 5: a listed device of an account in the group, removing
+  nothing). Members follow such a join only when the joiner is on the signed device list of an
+  account that already has a device in the group, checked from lists they verify themselves, so
+  the server can't slip a device in under someone's account. No line shows in the chat (it's
+  the same person). A restore joins the restored groups the same way. Leaving or being removed
+  deletes the record.
+- Consequences: the joining device doesn't get the change log's key until the next key handoff
+  (D-0156); the dead leaf of a reinstalled device stays until a member removes it (§6.3).
+
 ## D-0166 — The parent's app-side rules are enforced on the child's app
 
 - Date: 2026-11-20

@@ -2226,6 +2226,7 @@ Inside the ciphertext only:
 | --- | --- |
 | `s/<name>` | An account-wide setting |
 | `c/<chat>/<name>` | A per-chat preference; `<chat>` is the hex of the peer's account ID or the group ID |
+| `g/<group>` | The account is in this group (`1`): its other devices join it by external commit (D-0167) |
 | `c/<chat>/state` | The chat's list state: `a=,p=,m=<muted until ms>,u=,f=,l=<lists>` joined by `;` (D-0163) |
 | `k/<id>` | A saved contact (name, notes, buddy-list groups) |
 | `l/<id>` | A custom chat list |

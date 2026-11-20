@@ -154,6 +154,8 @@ impl Store {
         self.scenes().set(ChatScenes(scenes));
         // Real chats' list state another device wrote (D-0163).
         crate::backend::chat_state::reload(*self);
+        // Groups the account joined on another device (D-0167).
+        crate::backend::group_sync::join_missing(*self);
     }
 
     /// Saves a contact (a new one when its id is empty) and returns its id.

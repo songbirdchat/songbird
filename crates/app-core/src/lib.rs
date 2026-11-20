@@ -22,6 +22,7 @@ pub mod blob;
 pub mod call_links;
 pub mod calls;
 pub mod crypto;
+pub mod kt;
 pub mod maps;
 pub mod messenger;
 pub mod mls;

@@ -28,6 +28,7 @@ pub mod backup;
 pub mod calls;
 pub mod chat;
 pub mod chat_state;
+pub mod group_sync;
 pub mod link;
 pub mod lock;
 pub mod nudge;

@@ -44,6 +44,8 @@ songbird-send.workspace = true
 songbird-keys.workspace = true
 songbird-content.workspace = true
 songbird-app-core.workspace = true
+# Key transparency in the A2 gate (D-0168): the real log, published by the worker's publisher.
+songbird-akd.workspace = true
 hyper.workspace = true
 songbird-worker = { path = "../../services/worker" }
 # A stand-in for delivery's device link in the Prompt 6 gate.

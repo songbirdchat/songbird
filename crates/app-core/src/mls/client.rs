@@ -763,7 +763,7 @@ impl<N: Net> Messenger<N> {
     /// the server's group state; every pair checked against the account's signed device list
     /// (a device no longer listed has no account: it is dead). Devices the server leaves out are
     /// left out here.
-    async fn member_accounts(
+    pub(crate) async fn member_accounts(
         &mut self,
         gid: &[u8; 16],
         devices: &BTreeSet<[u8; 16]>,
@@ -993,7 +993,7 @@ impl<N: Net> Messenger<N> {
 
     /// Learns (and verifies) the accounts of every member device now; failures leave the cache
     /// as it was.
-    async fn warm_accounts(&mut self, gid: &[u8; 16], group: &MlsGroup) {
+    pub(crate) async fn warm_accounts(&mut self, gid: &[u8; 16], group: &MlsGroup) {
         let devices: BTreeSet<[u8; 16]> = group
             .members()
             .filter_map(|m| <[u8; 16]>::try_from(m.credential.serialized_content()).ok())
@@ -1113,8 +1113,13 @@ impl<N: Net> Messenger<N> {
         let aad = processed.aad().to_vec();
         match processed.into_content() {
             ProcessedMessageContent::StagedCommitMessage(staged) => {
-                // A join by link (an external commit): the rule and the link proof (§6.8).
-                if join && !Self::join_allowed(&group, &staged, &aad, from_epoch) {
+                // A join by link (an external commit): the rule and the link proof (§6.8); or a
+                // member account's new device (§6.3 rule 5, D-0167), checked against the signed
+                // device lists of the accounts in the group.
+                let by_link = join && Self::join_allowed(&group, &staged, &aad, from_epoch);
+                let own_device =
+                    join && !by_link && self.own_account_join(&gid, &group, &staged).await;
+                if join && !by_link && !own_device {
                     return Ok(Received::Nothing);
                 }
                 let ds = self
@@ -1157,6 +1162,10 @@ impl<N: Net> Messenger<N> {
                 // Who is who now, while this device may still ask (a later commit removing a
                 // member is checked from it).
                 self.warm_accounts(&gid, &group).await;
+                if own_device {
+                    // A member's new device: the same person, no line in the chat.
+                    return Ok(Received::System);
+                }
                 if join {
                     // Someone joined by a link: they get the change log's key.
                     let _ = self

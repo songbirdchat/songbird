@@ -122,6 +122,7 @@ pub fn ui_id(bytes: &[u8; 16]) -> u64 {
 thread_local! {
     /// Whether presence's contacts are read again periodically.
     static PRESENCE_TIMER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NOTICING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Whether the disappearing-message sweep runs.
     static SWEEPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Real groups by UI chat ID (D-0146).
@@ -225,7 +226,13 @@ where
 /// Leaves a real group.
 pub fn leave_group(chat: ChatId) {
     group_op(chat, "Leaving the group failed. Try again.", |m, gid| {
-        Box::pin(async move { m.leave_group(&gid).await })
+        Box::pin(async move {
+            m.leave_group(&gid).await?;
+            if let Some(s) = crate::store::try_store() {
+                super::group_sync::mark(s, &gid, false);
+            }
+            Ok(())
+        })
     });
 }
 
@@ -722,6 +729,10 @@ pub async fn start() -> Result<(), super::Problem> {
     let _ = m.flush_outbox().await;
     if let Some(s) = crate::store::try_store() {
         show_all(s, &m);
+        // The account's groups, recorded for its other devices; ones it joined elsewhere,
+        // joined here (D-0167).
+        super::group_sync::publish(s, &m);
+        super::group_sync::join_missing(s);
     }
     super::calls::show_links(&m);
     if let Some(s) = crate::store::try_store() {
@@ -740,6 +751,21 @@ pub async fn start() -> Result<(), super::Problem> {
     }
     super::packs::show(&m);
     clear_media_cache();
+    // Security notices (key transparency, new devices; D-0168): shown as they come.
+    show_notices(&m);
+    if !NOTICING.replace(true) {
+        Owner::detached().run(|| {
+            set_interval(std::time::Duration::from_secs(20), || {
+                let lock = core();
+                let Ok(guard) = lock.try_lock() else {
+                    return;
+                };
+                if let Some(m) = guard.as_ref() {
+                    show_notices(m);
+                }
+            });
+        });
+    }
     // Disappearing messages go on time, even with the app left open.
     if !SWEEPING.replace(true) {
         sweep_expired();
@@ -1369,6 +1395,7 @@ pub async fn receive(envelope: &[u8]) -> bool {
         return false;
     };
     let me = m.local().account;
+    show_notices(m);
     match m.receive(envelope).await {
         Ok(Received::Message(row)) => {
             let fresh = row.author != me && !PROFILED.with_borrow(|p| p.contains(&row.chat));
@@ -1450,6 +1477,7 @@ pub async fn receive(envelope: &[u8]) -> bool {
                 let chat = ensure_group(s, group, &title);
                 apply_kind(s, chat, group, &title, kind, community.as_deref());
                 s.push_message(chat, None, Body::System("You were added".into()));
+                super::group_sync::mark(s, &group, true);
             }
             true
         }
@@ -1470,6 +1498,7 @@ pub async fn receive(envelope: &[u8]) -> bool {
             super::calls::group_left(&group);
             if let Some(s) = crate::store::try_store() {
                 let chat = ui_id(&group);
+                super::group_sync::mark(s, &group, false);
                 s.push_message(chat, None, Body::System("You were removed".into()));
                 s.edit_chat(chat, |c| c.members.retain(|x| x.contact.is_some()));
             }
@@ -2689,6 +2718,68 @@ async fn start_with(username: &str, link: Option<[u8; 16]>) -> Result<ChatId, su
         account,
         Some(username.trim().trim_start_matches('@')),
     ))
+}
+
+// ---------------------------------------------------------------- security notices (D-0168)
+
+/// Shows what app-core noticed about the people the user talks to: new devices, a device list
+/// the key log doesn't vouch for, a log that contradicts itself.
+fn show_notices(m: &Core) {
+    use songbird_app_core::kt::Notice;
+    let Ok(notices) = m.take_notices() else {
+        return;
+    };
+    let Some(s) = crate::store::try_store() else {
+        return;
+    };
+    let me = m.local().account;
+    for n in notices {
+        match n {
+            Notice::NewDevices { account, count } if account == me => {
+                let what = if count == 1 {
+                    "A new device was"
+                } else {
+                    "New devices were"
+                };
+                crate::ui::toast(format!(
+                    "{what} linked to your account. If it wasn't you, remove it in Linked devices."
+                ));
+            }
+            Notice::NewDevices { account, count } => {
+                let chat = ui_id(&account);
+                if owns(chat) {
+                    let name = s.chat(chat).map(|c| c.title).unwrap_or_default();
+                    let line = if count == 1 {
+                        format!("{name} linked a new device")
+                    } else {
+                        format!("{name} linked {count} new devices")
+                    };
+                    s.push_message(chat, None, Body::System(line));
+                }
+            }
+            Notice::ListNotInLog { account } => {
+                let chat = ui_id(&account);
+                if owns(chat) {
+                    s.push_message(
+                        chat,
+                        None,
+                        Body::System(
+                            "Songbird's key log doesn't match this person's devices. Check your safety number with them before sharing anything sensitive."
+                                .into(),
+                        ),
+                    );
+                }
+            }
+            Notice::Fork => {
+                live().update(|l| {
+                    l.problem = Some(
+                        "Songbird's key log contradicts itself: the server may be showing you something others don't see. Check safety numbers in person."
+                            .into(),
+                    );
+                });
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- backups (D-0165)

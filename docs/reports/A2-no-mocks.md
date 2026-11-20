@@ -53,15 +53,18 @@ Status: ☐ open · ☑ done (with the commit).
 
 - ☑ Parental rules enforced on the child's app; new contacts approved in person (D-0166)
 
+- ☑ New devices join the account's groups by external commit (D-0167)
+
+- ☑ Key transparency checked on the device; security notices shown (D-0168)
+
 ## Open, by what they need
 
 **a (app only, or an existing endpoint):**
 - Google Drive, OneDrive and Dropbox stores (the crate has them; OAuth needs the owner's apps)
 
 **b (app-core):**
-- security notifications (KT)
 
-**Groups, the rest (b, c):** new devices joining by external commit. (Roles on received commits: D-0155; the change log: D-0156.)
+**Groups:** roles on received commits (D-0155), the change log (D-0156), new devices joining by external commit (D-0167).
 
 **M6 attachments, the rest (a, b, c):** the user's own GPS position (e; picking on the map is done). (View-once and video playback: D-0158; voice notes: D-0161.)
 

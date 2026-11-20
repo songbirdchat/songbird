@@ -8,6 +8,7 @@
 pub mod client;
 pub mod crypto;
 pub mod links;
+mod rejoin;
 
 /// A member's role in a group (§6.6).
 pub use songbird_groups::roles::Role;

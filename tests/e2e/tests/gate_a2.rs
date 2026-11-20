@@ -36,6 +36,12 @@ use tokio::sync::{mpsc, watch};
 
 const API: &str = "api.test";
 const SYSTEM_SEED: [u8; 32] = [0x51; 32];
+const KT_LOG_SEED: [u8; 32] = [0x61; 32];
+const KT_VRF_SEED: [u8; 32] = [0x62; 32];
+
+/// Each stack's key-transparency store, by its api address (tests run side by side).
+static KT_STORES: std::sync::Mutex<Vec<(std::net::SocketAddr, songbird_akd::SurrealStore)>> =
+    std::sync::Mutex::new(Vec::new());
 
 fn env(name: &str) -> Option<String> {
     let v = std::env::var(name).ok();
@@ -57,6 +63,7 @@ struct TestNet {
     api: ApiClient,
     addr: std::net::SocketAddr,
     ws: Arc<Client>,
+    ws_addr: std::net::SocketAddr,
 }
 
 impl Net for TestNet {
@@ -233,6 +240,7 @@ async fn person(r: Registered, api: std::net::SocketAddr, ws: std::net::SocketAd
             Ed25519KeyPair::from_seed_unchecked(&r.auth_seed).unwrap(),
         ),
         ws: Arc::new(client),
+        ws_addr: ws,
     };
     let local = Local {
         account: *r.n.account.as_bytes(),
@@ -295,7 +303,7 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
     ))
     .unwrap();
     s3.create_bucket().await.unwrap();
-    let db = Db::connect(songbird_surreal::Config {
+    let cfg = songbird_surreal::Config {
         addr: surreal,
         host: "localhost".into(),
         tls: None,
@@ -305,9 +313,11 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
         database: format!("gatea2_{}", DeviceId::random().unwrap().to_hex_unredacted()),
         timeout: Duration::from_secs(30),
         max_message_bytes: 16 << 20,
-    })
-    .await
-    .unwrap();
+    };
+    let db = Db::connect(cfg.clone()).await.unwrap();
+    let akd_store = songbird_akd::SurrealStore::connect(Arc::new(Db::connect(cfg).await.unwrap()))
+        .await
+        .unwrap();
     let registry = Arc::new(Registry::connect(db).await.unwrap());
     let (alice, bob) = (register(&registry).await, register(&registry).await);
     // The production send policy: franking stamps and the contact gate (requests, access keys).
@@ -502,7 +512,22 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
         ),
         storage: None,
         vault: None,
-        kt: None,
+        kt: Some(
+            songbird_api::kt::Transparency::new(
+                songbird_api::config::KtSettings {
+                    secret: songbird_types::SecretRef::Env("UNUSED".into()),
+                    log_key: songbird_types::SecretRef::Env("UNUSED".into()),
+                    vrf_key: songbird_types::SecretRef::Env("UNUSED".into()),
+                    fetches_per_hour: 100_000,
+                    fetch_burst: 10_000,
+                },
+                &random32(),
+                &KT_LOG_SEED,
+                &KT_VRF_SEED,
+                akd_store.clone(),
+            )
+            .unwrap(),
+        ),
         profiles: Some(
             songbird_api::profiles::Profiles::new(
                 songbird_api::config::ProfileSettings {
@@ -548,6 +573,7 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
         64,
         stop_rx,
     ));
+    KT_STORES.lock().unwrap().push((api_addr, akd_store));
     let alice = person(alice, api_addr, ws_addr).await;
     let bob = person(bob, api_addr, ws_addr).await;
     // Let the directory follower see both profiles.
@@ -2097,4 +2123,264 @@ async fn a_voice_note_arrives_with_its_waveform_and_is_marked_played() {
     ) {
         st = pump_app(&mut alice).await;
     }
+}
+
+/// D-0167: a member account's new device joins the account's group by external commit (§6.3
+/// rule 5); the other members follow it only because it is on that account's signed device
+/// list. Messages then reach it, and it can send. Another account's device can't join.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_device_joins_its_accounts_groups() {
+    let Some((app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    let gid = alice
+        .core
+        .create_group("Family", &[bob.account])
+        .await
+        .unwrap();
+    assert_eq!(pump_app(&mut bob).await, Received::Joined { group: gid });
+    let _ = pump_app(&mut bob).await; // the title
+
+    // Alice links a second device (the registry's link, then her signed list names it).
+    let device = DeviceId::random().unwrap();
+    let (_, auth_seed) = DeviceKey::generate(device).unwrap();
+    let auth = DeviceKey::from_seed(device, &auth_seed).unwrap();
+    let identity = X25519Pair::generate().unwrap();
+    let token = random32();
+    app.registry
+        .create_link_token(
+            &DeviceId::from_bytes(alice.core.local().device),
+            &token,
+            &device,
+            Duration::from_secs(600),
+            6,
+        )
+        .await
+        .unwrap();
+    app.registry
+        .link_device(
+            &token,
+            &device,
+            &auth.public_key(),
+            &songbird_app_core::crypto::serialize_x25519(&identity.public()),
+            &random32(),
+            6,
+        )
+        .await
+        .unwrap();
+    alice
+        .core
+        .publish_device_list(&alice.account_key, |_, _| true)
+        .await
+        .unwrap();
+    let r = Registered {
+        n: NewAccount {
+            account: AccountId::from_bytes(alice.account),
+            identity: alice.account_key.public_key().as_ref().try_into().unwrap(),
+            device,
+            auth_key: auth.public_key(),
+            allowance: 3,
+        },
+        account_key: Ed25519KeyPair::from_seed_unchecked(&random32()).unwrap(),
+        auth_seed,
+    };
+    let (api, ws) = (alice.core.net().addr, alice.core.net().ws_addr);
+    let mut phone = linked(r, identity, api, ws).await;
+
+    phone.core.join_own_group(&gid).await.unwrap();
+    assert!(phone.core.in_group(&gid).unwrap());
+    // Both members follow the join (no line in the chat: it's Alice).
+    assert_eq!(pump(&mut alice).await, Received::System);
+    assert_eq!(pump(&mut bob).await, Received::System);
+    assert_eq!(bob.core.group_devices(&gid).unwrap().len(), 3);
+    assert_eq!(alice.core.group_devices(&gid).unwrap().len(), 3);
+
+    let id = bob.core.send_group_text(&gid, "Hi both").await.unwrap();
+    let Received::Message(m) = pump_app(&mut phone).await else {
+        panic!("a group message on the new device")
+    };
+    assert_eq!((m.id, m.text.as_str()), (id, "Hi both"));
+    let _ = pump_app(&mut alice).await;
+    let id = phone
+        .core
+        .send_group_text(&gid, "From my laptop")
+        .await
+        .unwrap();
+    let Received::Message(m) = pump_app(&mut bob).await else {
+        panic!("a group message from the new device")
+    };
+    assert_eq!((m.author, m.id), (alice.account, id));
+
+    // Another account's device: the server refuses its state, so it can't join.
+    let gid2 = alice.core.create_group("Just us", &[]).await.unwrap();
+    assert!(matches!(
+        bob.core.join_own_group(&gid2).await,
+        Err(songbird_app_core::Error::Server(404))
+    ));
+}
+
+/// A device linked to an existing account: its own keys, no new account.
+async fn linked(
+    r: Registered,
+    identity: X25519Pair,
+    api: std::net::SocketAddr,
+    ws: std::net::SocketAddr,
+) -> Person {
+    let mut c = ClientConfig::new(ws.to_string(), SERVER_NAME);
+    c.backoff.initial = Duration::from_millis(20);
+    c.new_device_grace = Duration::from_secs(5);
+    let (mut client, events) = Client::start(
+        c,
+        DeviceKey::from_seed(r.n.device, &r.auth_seed).unwrap(),
+        ResumeState::default(),
+    );
+    client.wait_for(State::Connected).await;
+    let net = TestNet {
+        addr: api,
+        api: ApiClient::new(
+            api,
+            API,
+            r.n.device,
+            Ed25519KeyPair::from_seed_unchecked(&r.auth_seed).unwrap(),
+        ),
+        ws: Arc::new(client),
+        ws_addr: ws,
+    };
+    let local = Local {
+        account: *r.n.account.as_bytes(),
+        device: *r.n.device.as_bytes(),
+        identity,
+    };
+    let mut core = Messenger::create(
+        Store::memory(&random32()).unwrap(),
+        net,
+        local,
+        Some(songbird_send_system_public()),
+    )
+    .unwrap();
+    core.publish_keys(true).await.unwrap();
+    core.publish_key_packages(5, true).await.unwrap();
+    Person {
+        account: *r.n.account.as_bytes(),
+        account_key: r.account_key,
+        core,
+        events,
+    }
+}
+
+/// The key-transparency store of the stack whose api `p` talks to.
+fn kt_store(p: &Person) -> songbird_akd::SurrealStore {
+    let addr = p.core.net().addr;
+    KT_STORES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(a, _)| *a == addr)
+        .map(|(_, s)| s.clone())
+        .unwrap()
+}
+
+/// D-0168: a device checks that the log publishes the device list it accepts, notices a list
+/// the log doesn't vouch for, and notices new devices on an account it knows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn key_transparency_vouches_for_device_lists_and_new_devices_are_noticed() {
+    use songbird_app_core::kt::Notice;
+    let Some((app, alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    let publisher =
+        songbird_akd::Publisher::open(kt_store(&alice), songbird_akd::SecretVrf::new(&KT_VRF_SEED))
+            .await
+            .unwrap();
+    publisher.publish_pending(&app.registry, 100).await.unwrap();
+    // Bob reads Alice's list: the log holds exactly it.
+    let list = fetch_list(&bob, alice.account).await;
+    assert!(bob.core.kt_check_list(&alice.account, &list).await.unwrap());
+    // A list the log doesn't hold: once is "not yet published", twice is noticed.
+    let forged = b"not alice's list".to_vec();
+    assert!(
+        !bob.core
+            .kt_check_list(&alice.account, &forged)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !bob.core
+            .kt_check_list(&alice.account, &forged)
+            .await
+            .unwrap()
+    );
+    assert!(
+        bob.core
+            .take_notices()
+            .unwrap()
+            .contains(&Notice::ListNotInLog {
+                account: alice.account
+            })
+    );
+
+    // Alice links a second device; Bob's next fetch of her list notices it, and once the
+    // epoch is published the log vouches for the new list too.
+    let _ = bob.core.devices_of(&alice.account, true).await.unwrap();
+    let _ = bob.core.take_notices();
+    let device = DeviceId::random().unwrap();
+    let (_, auth_seed) = DeviceKey::generate(device).unwrap();
+    let auth = DeviceKey::from_seed(device, &auth_seed).unwrap();
+    let token = random32();
+    app.registry
+        .create_link_token(
+            &DeviceId::from_bytes(alice.core.local().device),
+            &token,
+            &device,
+            Duration::from_secs(600),
+            6,
+        )
+        .await
+        .unwrap();
+    app.registry
+        .link_device(
+            &token,
+            &device,
+            &auth.public_key(),
+            &songbird_app_core::crypto::serialize_x25519(&X25519Pair::generate().unwrap().public()),
+            &random32(),
+            6,
+        )
+        .await
+        .unwrap();
+    let mut alice = alice;
+    alice
+        .core
+        .publish_device_list(&alice.account_key, |_, _| true)
+        .await
+        .unwrap();
+    publisher.publish_pending(&app.registry, 100).await.unwrap();
+    assert_eq!(
+        bob.core
+            .devices_of(&alice.account, true)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        bob.core.take_notices().unwrap(),
+        [Notice::NewDevices {
+            account: alice.account,
+            count: 1
+        }]
+    );
+    let list = fetch_list(&bob, alice.account).await;
+    assert!(bob.core.kt_check_list(&alice.account, &list).await.unwrap());
+}
+
+/// An account's signed device list, as the server serves it.
+async fn fetch_list(p: &Person, account: [u8; 16]) -> Vec<u8> {
+    let body = format!(r#"{{"account":"{}"}}"#, hex::encode(account)).into_bytes();
+    p.core
+        .net()
+        .api("POST", "/v1/devices/list/fetch", body)
+        .await
+        .unwrap()
+        .1
 }

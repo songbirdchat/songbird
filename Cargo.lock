@@ -5004,6 +5004,7 @@ dependencies = [
 name = "songbird-app-core"
 version = "0.1.0"
 dependencies = [
+ "akd",
  "aws-lc-rs",
  "bytes",
  "openmls",
@@ -5011,6 +5012,7 @@ dependencies = [
  "openmls_traits",
  "proptest",
  "prost",
+ "protobuf",
  "rusqlite",
  "serde_json",
  "songbird-aws-lc-ext",
@@ -5237,6 +5239,7 @@ dependencies = [
  "serde_json",
  "sockudo-ws",
  "songbird-accounts",
+ "songbird-akd",
  "songbird-alloc-count",
  "songbird-api",
  "songbird-app-core",

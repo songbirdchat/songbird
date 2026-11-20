@@ -1153,6 +1153,13 @@ pub async fn import_core(s: Store, r: &Restored) -> Result<(), Problem> {
     let (path, key) = super::chat::core_db(true)
         .ok_or_else(|| problem("This device has no place to keep messages."))?;
     let media = Arc::clone(&r.media);
+    let groups_restored: Vec<([u8; 16], bool)> = real_chats
+        .iter()
+        .filter_map(|c| {
+            let id: [u8; 16] = c.chat_id.as_slice().try_into().ok()?;
+            Some((id, c.kind == i32::from(schema::ChatKind::Group)))
+        })
+        .collect();
     // Held while writing: app-core doesn't open (and migrate) the same store meanwhile.
     let lock = super::chat::core();
     let held = lock.lock().await;
@@ -1178,6 +1185,13 @@ pub async fn import_core(s: Store, r: &Restored) -> Result<(), Problem> {
     .map_err(|_| problem("Your messages couldn't be written on this device."))?;
     drop(held);
     super::chat::reload_all(s).await;
+    // The restored groups: this device joins them by external commit (D-0167).
+    for (id, group) in &groups_restored {
+        if *group {
+            super::group_sync::mark(s, id, true);
+        }
+    }
+    super::group_sync::join_missing(s);
     // The list state the backup kept, on chats this device shows.
     for c in &real_chats {
         let Ok(id) = <[u8; 16]>::try_from(c.chat_id.as_slice()) else {
