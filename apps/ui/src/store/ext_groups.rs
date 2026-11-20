@@ -10,7 +10,7 @@ use std::{collections::HashSet, time::Duration};
 
 use nsh_core::prelude::*;
 
-use super::{Body, Chat, ChatId, ChatKind, ContactId, Member, Minutes, NOW, Role, Store, seed};
+use super::{Body, Chat, ChatId, ChatKind, ContactId, Member, Minutes, Role, Store, now, seed};
 
 // ------------------------------------------------------------------ roles
 
@@ -552,7 +552,7 @@ impl Store {
     }
 
     fn log_change(&self, chat: ChatId, text: String) {
-        groups_state().update(|g| g.history.push((chat, MemberChange { at: NOW, text })));
+        groups_state().update(|g| g.history.push((chat, MemberChange { at: now(), text })));
     }
 
     /// Makes `contact` an admin or a member again, with a system line.

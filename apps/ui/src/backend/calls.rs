@@ -49,6 +49,9 @@ use crate::ui::toast;
 pub use core_calls::HELLO_TOPIC;
 /// A raised hand: one byte, 1 raised, 0 lowered, on the encrypted data channel.
 const HAND_TOPIC: &str = "songbird.v1/call-hand";
+/// A call link's name, from its admin to each person who joins, sealed under the link (D-0183):
+/// the name is in neither the URL nor the server, so without it everyone else saw "Call link".
+const LINK_NAME_TOPIC: &str = "songbird.v1/call-link-name";
 /// Remote video frames shown per second at most (the tiles are small; the encoder sends more).
 const VIDEO_FPS: u64 = 15;
 /// The camera's capture size asked of the encoder (it scales what the camera gives).
@@ -1354,8 +1357,32 @@ fn send_card(ui_call: u64, call: &Arc<Call>, to: Option<String>) {
 fn link_joined(ui_call: u64, identity: &str) {
     if let Some(media) = media_of(ui_call) {
         send_card(ui_call, &media, Some(identity.to_owned()));
+        send_link_name(&media, identity);
     }
     rotate(ui_call);
+}
+
+/// This device's link (it administers it): its name, sealed, to `identity`.
+fn send_link_name(media: &Arc<Call>, identity: &str) {
+    let Some(root) =
+        with_live(|l| l.link.as_ref().filter(|k| k.admin).map(|k| k.root.clone())).flatten()
+    else {
+        return;
+    };
+    let id = link_id(&root);
+    let Some(name) = crate::store::try_store().and_then(|s| {
+        s.call_links
+            .with_untracked(|l| l.iter().find(|x| x.id == id).map(|x| x.name.clone()))
+    }) else {
+        return;
+    };
+    let Ok(payload) = seal_link_data(&root, name.as_bytes()) else {
+        return;
+    };
+    let (media, to) = (Arc::clone(media), identity.to_owned());
+    drop(background(async move {
+        let _ = media.send_data(LINK_NAME_TOPIC, payload, Some(&to)).await;
+    }));
 }
 
 /// Someone left: those still present get a new key from this device (so the leaver cannot
@@ -1504,6 +1531,16 @@ fn link_data(ui_call: u64, identity: String, topic: &str, payload: Vec<u8>) {
                 }
                 Ok(())
             });
+        }
+        t if t == LINK_NAME_TOPIC => {
+            if let Ok(b) = open_link_data(&root, &payload)
+                && let Ok(name) = String::from_utf8(b)
+            {
+                let name: String = name.trim().chars().take(64).collect();
+                if !name.is_empty() {
+                    ui::live::update(ui_call, |c| c.title = name);
+                }
+            }
         }
         t if t == HAND_TOPIC => {
             if let Ok(b) = open_link_data(&root, &payload) {

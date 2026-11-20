@@ -662,7 +662,7 @@ fn profile_card() -> AnyElement {
             let (emoji, until) = ext.with(|x| (x.status_emoji.clone(), x.status_until));
             format!(
                 "{emoji} {line} · {}",
-                until_label(until, crate::store::NOW).to_lowercase()
+                until_label(until, crate::store::now()).to_lowercase()
             )
         })
     };

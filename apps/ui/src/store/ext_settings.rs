@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use nsh_core::prelude::*;
 
-use super::{Audience, ChatId, ContactId, Minutes, NOW, Presence, Settings, Store};
+use super::{Audience, ChatId, ContactId, Minutes, Presence, Settings, Store, now};
 use crate::backend::supervision as sup;
 
 /// When a custom status clears itself.
@@ -275,7 +275,7 @@ impl Store {
     /// expiry (`backend::profile` publishes on the change). mock: the
     /// "profile changed" signal to contacts is app-core's (Prompt 9).
     pub fn set_status(&self, line: String, emoji: String, expiry: StatusExpiry) {
-        let now = NOW;
+        let now = now();
         let until = expiry.until(now);
         let line = line.trim().to_string();
         let expires_ms = until.map_or(0, |u| {

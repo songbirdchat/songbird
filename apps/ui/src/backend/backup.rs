@@ -915,7 +915,7 @@ pub fn apply(s: Store, r: &Restored) {
                     chat,
                     from: from16(&m.sender),
                     body: Body::Text(String::from_utf8_lossy(&m.content).into_owned()),
-                    at: i64::try_from(m.sent_ms / 60_000).unwrap_or(0),
+                    at: crate::store::minutes_of_ms(m.sent_ms),
                     status: Tick::Read,
                     reply_to: None,
                     reactions: vec![],

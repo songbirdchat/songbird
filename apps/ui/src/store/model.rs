@@ -354,6 +354,9 @@ pub enum CallDirection {
     Incoming,
     Outgoing,
     Missed,
+    /// A call that never connected: the server refused it or the connection failed (D-0183: it
+    /// was logged as "No answer").
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq)]

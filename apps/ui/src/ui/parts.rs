@@ -1013,9 +1013,11 @@ pub fn empty_state(
     action: Option<AnyElement>,
 ) -> View {
     // Rhythm: the mark, then the words as one group (title and sentence 6
-    // apart), then the action set off by a section gap.
+    // apart), then the action set off by a section gap. It fills an empty screen from its own
+    // size (`flex_auto`): with `flex_1`'s zero basis it collapsed in a scrolling page, its words
+    // running over what followed (D-0183).
     view()
-        .flex_1()
+        .flex_auto()
         .items_center()
         .justify_center()
         .px_8()

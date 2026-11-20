@@ -363,6 +363,20 @@ fn toggle_video() {
     announce_for_accessibility(if on { "Camera on" } else { "Camera off" });
 }
 
+/// The camera can't be used (access refused, or restricted): the call's camera goes off and the
+/// person is told where to allow it (D-0183: before, it stayed "on" and sent nothing).
+pub(super) fn camera_refused() {
+    let was_on = calls().with_untracked(|s| s.call.as_ref().is_some_and(|c| c.video));
+    if !was_on {
+        return;
+    }
+    with_call(|c| c.video = false);
+    if let Some(id) = real_id() {
+        crate::backend::calls::set_video(id, false);
+    }
+    toast("Songbird can't use the camera. Allow it in Settings, then turn it on again.");
+}
+
 fn set_minimised(minimised: bool) {
     with_call(|c| {
         if c.live() && !c.ended() {

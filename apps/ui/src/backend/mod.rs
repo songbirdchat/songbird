@@ -239,10 +239,12 @@ pub fn erase_local() {
     rules::forget();
 }
 
-/// Forgets this device's account locally (the server keeps it).
+/// Forgets this device's account locally (the server keeps it), with its messages on this
+/// device (D-0182): the next account here starts with its own store.
 pub fn forget() {
     disconnect();
     chat::stop();
+    chat::erase_store();
     for k in [K_IDENTITY, K_DEVICE_SEED, K_ACCOUNT, K_DEVICE, K_USERNAME] {
         Storage::remove_item(k);
     }

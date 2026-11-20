@@ -928,7 +928,7 @@ pub(crate) fn rich_text(
                                 .underline()
                                 .role(AccessibilityRole::Link)
                                 .on_press(move || {
-                                    let _ = open_url(url.clone());
+                                    crate::features::open_link_or_url(&url);
                                 });
                         }
                         el
@@ -974,7 +974,7 @@ fn link_body(cv: Conv, item: ItemMemo) -> AnyElement {
         .child(
             pressable()
                 .on_press(move || {
-                    let _ = open_url(card.with_untracked(|c| c.0.clone()));
+                    crate::features::open_link_or_url(&card.with_untracked(|c| c.0.clone()));
                 })
                 .accessibility_label(super::say(move || {
                     card.with(|c| format!("Link preview: {}, {}", c.1, c.2))

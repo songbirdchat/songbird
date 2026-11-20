@@ -26,7 +26,7 @@
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use super::vault::Storage;
-use nsh_core::{prelude::*, time::unix_ms};
+use nsh_core::prelude::*;
 use songbird_app_core::{
     crypto::X25519Pair,
     messenger::{DeviceIdBytes, Messenger, Net, Received},
@@ -85,6 +85,9 @@ pub async fn refresh_profile(account: [u8; 16], key: [u8; 32]) {
         return;
     };
     let id = ui_id(&account);
+    if !p.name.trim().is_empty() {
+        remember_name(&account, "name", p.name.trim());
+    }
     if let Some(s) = crate::store::try_store() {
         let name = p.name.trim().to_owned();
         s.contacts.update(|cs| {
@@ -661,6 +664,19 @@ fn hex16(s: &str) -> Option<[u8; 16]> {
     wire::unhex(s)?.try_into().ok()
 }
 
+/// Erases app-core's database on this device (D-0182): its key first, so whatever a deletion
+/// leaves on flash can't be read, then the file and SQLite's journals. For Forget, and for a
+/// store another account left.
+pub(super) fn erase_store() {
+    Storage::remove_item(K_DB_KEY);
+    Storage::remove_item(K_NAMES);
+    if let Some(dir) = data_dir() {
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let _ = std::fs::remove_file(dir.join(format!("{DB_FILE}{suffix}")));
+        }
+    }
+}
+
 /// Opens app-core for this device (once per connection), publishing its keys,
 /// device list and profile on the first run. Shows every stored chat.
 pub async fn start() -> Result<(), super::Problem> {
@@ -680,9 +696,24 @@ pub async fn start() -> Result<(), super::Problem> {
     let path = data_dir()
         .ok_or_else(|| super::problem("This device has no place to keep messages."))?
         .join(DB_FILE);
-    let db_key = stored_seed(K_DB_KEY);
-    let store = CoreStore::open(&path, &db_key)
-        .map_err(|_| super::problem("Your messages on this device couldn't be opened."))?;
+    let open = || {
+        CoreStore::open(&path, &stored_seed(K_DB_KEY))
+            .map_err(|_| super::problem("Your messages on this device couldn't be opened."))
+    };
+    let mut store = open()?;
+    // A store another account left on this device (signed up again after Forget, from a build
+    // before it erased the store, D-0182): never this account's, so it starts over, and this
+    // account's keys and device list are published as on any first run.
+    if store
+        .local()
+        .ok()
+        .flatten()
+        .is_some_and(|l| l.account != account)
+    {
+        drop(store);
+        erase_store();
+        store = open()?;
+    }
     // The profile key the app publishes (`profile`) is the one app-core shares.
     store
         .put_secret("profile_key", &super::profile::profile_key())
@@ -811,8 +842,7 @@ pub fn stop() {
 }
 
 fn minutes(ms: u64) -> i64 {
-    let now = unix_ms() as i64;
-    (ms as i64 - now).div_euclid(60_000)
+    crate::store::minutes_of_ms(ms)
 }
 
 fn tick(s: Status) -> Tick {
@@ -827,17 +857,63 @@ fn tick(s: Status) -> Tick {
 }
 
 /// The UI contact and chat for a real account, created on first sight.
+/// Contacts' names on this device, by account (hex): the username typed to reach them, and the
+/// name their profile gave. Kept in the vault: app-core's store has no names, so without this a
+/// restart showed every contact as "Songbird user …" (D-0183).
+const K_NAMES: &str = "sb.contact_names";
+
+fn names() -> serde_json::Map<String, serde_json::Value> {
+    Storage::get_item(K_NAMES)
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// Remembers `account`'s `field` (`username` or `name`).
+fn remember_name(account: &[u8; 16], field: &str, value: &str) {
+    let mut all = names();
+    let entry = all
+        .entry(wire::hex(account))
+        .or_insert_with(|| serde_json::json!({}));
+    if entry[field].as_str() == Some(value) {
+        return;
+    }
+    entry[field] = serde_json::Value::String(value.to_owned());
+    if let Err(e) = Storage::set_item(K_NAMES, serde_json::Value::Object(all).to_string()) {
+        log::warn!("contact names: {e}");
+    }
+}
+
+/// What this device knows `account` as: their profile's name, else the username typed.
+fn known_name(account: &[u8; 16]) -> (Option<String>, Option<String>) {
+    let all = names();
+    let e = all.get(&wire::hex(account));
+    let get = |k: &str| {
+        e.and_then(|e| e[k].as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    (get("name"), get("username"))
+}
+
 fn ensure_chat(s: Store, account: [u8; 16], name: Option<&str>) -> ChatId {
     let id = ui_id(&account);
     ACCOUNTS.with_borrow_mut(|a| a.insert(id, account));
+    if let Some(n) = name.filter(|n| !n.is_empty()) {
+        remember_name(&account, "username", n);
+    }
     if s.contact(id).is_none() {
         let hex = wire::hex(&account);
-        let title = name.map_or_else(|| format!("Songbird user {}", &hex[..6]), str::to_owned);
+        let (profile_name, username) = known_name(&account);
+        let username = name.map(str::to_owned).or(username);
+        let title = profile_name
+            .or_else(|| username.clone())
+            .unwrap_or_else(|| format!("Songbird user {}", &hex[..6]));
         s.contacts.update(|cs| {
             cs.push(Contact {
                 id,
                 name: title.clone(),
-                username: name.unwrap_or_default().to_owned(),
+                username: username.unwrap_or_default(),
                 about: String::new(),
                 status_line: None,
                 presence: Presence::LastSeen(None),

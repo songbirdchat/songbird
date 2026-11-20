@@ -199,6 +199,44 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0183 — What the first real-device call found
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Context: the first test between a real iPhone and a simulator, on a LAN copy of the backend.
+- Decision (each a fix in the app):
+  - **Accounts and stores**: a device signing up a second account reopened the first account's
+    message store, so it never published its keys or device list and no one could reach it.
+    Forget now erases the store (its key first, then the files) with the contacts' names, and
+    a store another account left is reset at start.
+  - **Video**: a group or link call never opened the camera (only the one-to-one corner
+    self-view did), so it published an empty video track: black for everyone, and the user's
+    own tile showed initials. The call's stage now owns one camera session; the user's tile
+    shows its live preview and its frames go to the call. And a call never asked for camera
+    access: on a fresh install the camera waited, with no prompt, for a button the call
+    screen doesn't have. Turning the camera on now asks; refused, it goes off and says where
+    to allow it. Checked on an iPhone: its camera seen live, decrypted, on the other device.
+  - **Names**: the user's own profile lived in memory only (empty after a restart); it is kept
+    in the vault. Contacts' names (the username typed, the name their profile gives) are kept
+    too, so a restart no longer shows "Songbird user …". A call link's name goes from its admin
+    to each person who joins, sealed under the link, over the call's data channel; it is in
+    neither the URL nor the server.
+  - **Time**: the clock was the demo's fixed Tuesday 17 Nov 2026, 10:24, so real messages
+    showed made-up times. Times now count from the app's start and show in the device's time
+    zone; tests keep the fixed day.
+  - **Links**: Songbird's call, group and username links open in the app, not the browser.
+  - **History and screens**: a call that never connected is "Couldn't connect", not "No
+    answer"; the first run no longer opens the demo's welcome chat ("Chat not found"); a
+    username no one has says so; every empty state grows from its own size (`flex_1`'s zero
+    basis collapsed it in scrolling pages, its words over what followed); the Server connection page says what the server carries and can't read.
+  - **Development builds** may trust one extra certificate authority, set when built
+    (`SONGBIRD_DEV_CA`), for a test server on a local network; release builds never set it.
+- Consequences: a development backend needs `[api.profiles]`, `[api.storage]`,
+  `[api.requests]` with `[delivery.requests]`, and `[delivery] franking_key`, or profiles,
+  message requests and first messages are refused (the LAN test lacked them).
+  `scripts/dev-app-backend.sh` should gain them. Ringing one-to-one calls need Iggy.
+
 ## D-0181 — Passkeys on Windows
 
 - Date: 2026-11-20

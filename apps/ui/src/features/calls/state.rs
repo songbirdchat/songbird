@@ -252,6 +252,7 @@ impl ActiveCall {
             EndReason::TheyDeclined | EndReason::Busy | EndReason::NoAnswer => {
                 Some((CallDirection::Outgoing, 0))
             }
+            EndReason::Failed if !reached => Some((CallDirection::Failed, 0)),
             EndReason::Failed if self.incoming => Some((CallDirection::Incoming, self.secs())),
             EndReason::Failed => Some((CallDirection::Outgoing, self.secs())),
             EndReason::Hangup if self.incoming => Some((CallDirection::Incoming, self.secs())),
@@ -596,6 +597,13 @@ mod tests {
         assert_eq!(c.phase, Phase::Connected);
         run(&mut c, 42 * PER_SEC);
         assert_eq!(status(&c), "0:42");
+    }
+
+    #[test]
+    fn a_call_that_never_connected_logs_as_failed() {
+        let mut c = outgoing();
+        run(&mut c, CALLING_TICKS);
+        assert_eq!(c.end(EndReason::Failed), Some((CallDirection::Failed, 0)));
     }
 
     #[test]

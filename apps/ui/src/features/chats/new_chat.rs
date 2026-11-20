@@ -153,7 +153,13 @@ fn body() -> impl IntoElement {
                                                 features::settings::ask_approval();
                                                 return Ok(());
                                             }
-                                            r => r?,
+                                            // Said where the person is looking ("No one on
+                                            // Songbird has that username."), D-0183.
+                                            Err(p) => {
+                                                crate::ui::toast(p.0);
+                                                return Ok(());
+                                            }
+                                            Ok(c) => c,
                                         };
                                         nav::pop_to_root();
                                         features::chat::open(chat);

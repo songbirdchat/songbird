@@ -4,7 +4,7 @@
 use nsh_core::prelude::*;
 
 use crate::{
-    store::{NOW, StatusExpiry, store, until_label},
+    store::{StatusExpiry, now, store, until_label},
     ui::*,
 };
 
@@ -337,7 +337,7 @@ pub fn status_sheet(open: Signal<bool>) -> nsh_base::SheetElement {
                             chip(x.label(), move || expiry.get() == x, move || expiry.set(x))
                         })),
                 )
-                .child(muted(move || until_label(expiry.get().until(NOW), NOW))),
+                .child(muted(move || until_label(expiry.get().until(now()), now()))),
         )
         .child(
             view()

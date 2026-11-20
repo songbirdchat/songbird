@@ -33,8 +33,51 @@ pub(crate) mod seed_for_tests {
 
 use crate::ui::Tick;
 
-/// "Now" in mock minutes: Tuesday 17 Nov 2026, 10:24.
-pub const NOW: Minutes = 0;
+/// The minute (since the Unix epoch) `Minutes` count from: when the app started; in tests a fixed
+/// Tuesday, 17 Nov 2026 at 10:24 UTC, so labels are the same on every run (D-0183: before, the
+/// app's clock was that mock Tuesday everywhere, and real messages showed made-up times).
+pub fn anchor() -> i64 {
+    #[cfg(test)]
+    {
+        29_915_184
+    }
+    #[cfg(not(test))]
+    {
+        static ANCHOR: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+        *ANCHOR.get_or_init(|| (nsh_core::time::unix_ms() as i64).div_euclid(60_000))
+    }
+}
+
+/// Now, in `Minutes` (the start of the test day in tests).
+pub fn now() -> Minutes {
+    #[cfg(test)]
+    {
+        0
+    }
+    #[cfg(not(test))]
+    {
+        (nsh_core::time::unix_ms() as i64).div_euclid(60_000) - anchor()
+    }
+}
+
+/// The `Minutes` of a Unix time in milliseconds.
+pub fn minutes_of_ms(ms: u64) -> Minutes {
+    i64::try_from(ms).unwrap_or(i64::MAX).div_euclid(60_000) - anchor()
+}
+
+/// `at` in this device's time zone (UTC in tests).
+fn local(at: Minutes) -> chrono::NaiveDateTime {
+    let secs = (anchor() + at).saturating_mul(60);
+    let utc = chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default();
+    #[cfg(test)]
+    {
+        utc.naive_utc()
+    }
+    #[cfg(not(test))]
+    {
+        utc.with_timezone(&chrono::Local).naive_local()
+    }
+}
 
 /// The time of day `at` shows as ("09:41").
 /// A link's host without `www.` ("songbird.chat").
@@ -68,13 +111,12 @@ fn link_title(url: &str) -> String {
 }
 
 pub fn clock(at: Minutes) -> String {
-    let m = (10 * 60 + 24 + at).rem_euclid(24 * 60);
-    format!("{:02}:{:02}", m / 60, m % 60)
+    local(at).format("%H:%M").to_string()
 }
 
 /// The day `at` falls on, relative to today (0), as the list shows it.
 pub fn day_of(at: Minutes) -> i64 {
-    (10 * 60 + 24 + at).div_euclid(24 * 60)
+    (local(at).date() - local(now()).date()).num_days()
 }
 
 /// The chat list's time: today's clock, "Yesterday", a weekday, a date.
@@ -82,23 +124,14 @@ pub fn when_label(at: Minutes) -> String {
     match day_of(at) {
         0 => clock(at),
         -1 => "Yesterday".into(),
-        d if d > -7 => [
-            "Wednesday",
-            "Thursday",
-            "Friday",
-            "Saturday",
-            "Sunday",
-            "Monday",
-            "Tuesday",
-        ][(d.rem_euclid(7)) as usize]
-            .into(),
-        // Older: the day and month, as WhatsApp shows them ("7 Nov").
-        d => {
-            let day = 17 + d;
-            if day >= 1 {
-                format!("{day} Nov")
+        d if d > -7 => local(at).format("%A").to_string(),
+        // Older: the day and month ("7 Nov"), with the year when it isn't this one.
+        _ => {
+            let (t, today) = (local(at), local(now()));
+            if chrono::Datelike::year(&t) == chrono::Datelike::year(&today) {
+                t.format("%-d %b").to_string()
             } else {
-                format!("{} Oct", 31 + day)
+                t.format("%-d %b %Y").to_string()
             }
         }
     }
@@ -486,8 +519,8 @@ impl Store {
         let id = self.id();
         let at = self
             .last_message(chat)
-            .map(|m| m.at.max(NOW))
-            .unwrap_or(NOW);
+            .map(|m| m.at.max(now()))
+            .unwrap_or(now());
         let system = matches!(body, Body::System(_));
         let msg = Message {
             id,
@@ -978,7 +1011,7 @@ impl Store {
             video,
             group,
             direction,
-            at: NOW,
+            at: now(),
             secs,
         };
         self.calls.update(|cs| cs.insert(0, record));
@@ -1079,6 +1112,19 @@ mod tests {
         assert_eq!(day_of(-60 * 11), -1);
         assert_eq!(when_label(-60 * 11), "Yesterday");
         assert_eq!(day_label(0), "Today");
+    }
+
+    #[test]
+    fn real_times_show_as_their_clock_and_day() {
+        // A message sent at 11:59 UTC on the test day, and one ten days before.
+        let at = |minutes_after_anchor: i64| {
+            u64::try_from((anchor() + minutes_after_anchor) * 60_000).unwrap()
+        };
+        assert_eq!(minutes_of_ms(at(95)), 95);
+        assert_eq!(clock(minutes_of_ms(at(95))), "11:59");
+        assert_eq!(when_label(minutes_of_ms(at(-10 * 24 * 60))), "7 Nov");
+        assert_eq!(when_label(minutes_of_ms(at(-2 * 24 * 60))), "Sunday");
+        assert_eq!(when_label(minutes_of_ms(at(-400 * 24 * 60))), "13 Oct 2025");
     }
 
     #[test]

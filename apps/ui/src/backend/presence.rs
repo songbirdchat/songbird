@@ -88,9 +88,9 @@ pub fn received(account: [u8; 16], p: &Presence) {
         Ok(songbird_content::presence::State::Online) => store::Presence::Online,
         Ok(songbird_content::presence::State::Away) => store::Presence::Away,
         Ok(songbird_content::presence::State::Busy) => store::Presence::Busy,
-        _ if p.last_seen_ms > 0 => store::Presence::LastSeen(Some(
-            (i64::try_from(p.last_seen_ms).unwrap_or(0) - unix_ms() as i64).div_euclid(60_000),
-        )),
+        _ if p.last_seen_ms > 0 => {
+            store::Presence::LastSeen(Some(crate::store::minutes_of_ms(p.last_seen_ms)))
+        }
         _ => store::Presence::LastSeen(None),
     };
     s.contacts.update(|cs| {

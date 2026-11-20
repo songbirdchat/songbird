@@ -33,6 +33,44 @@ use crate::store::{Audience, Profile, Settings, SettingsExt, Store};
 
 const K_KEY: &str = "sb.profile_key";
 const K_VERSION: &str = "sb.profile_version";
+/// The user's own profile on this device (name, username, about, status, avatar seed), kept in
+/// the vault so it survives a restart (D-0183: it lived in memory only, and came back empty).
+const K_ME: &str = "sb.me";
+
+fn save_me(me: &Profile) {
+    let v = serde_json::json!({
+        "name": me.name,
+        "username": me.username,
+        "about": me.about,
+        "status": me.status_line,
+        "seed": me.seed,
+    });
+    if let Err(e) = Storage::set_item(K_ME, v.to_string()) {
+        log::warn!("profile storage: {e}");
+    }
+}
+
+/// Puts back the profile this device kept (not over a demo's).
+fn restore_me(store: Store) {
+    if crate::store::demo() {
+        return;
+    }
+    let Some(v) =
+        Storage::get_item(K_ME).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    else {
+        return;
+    };
+    let text = |k: &str| v[k].as_str().unwrap_or_default().to_owned();
+    store.me.update(|me| {
+        me.name = text("name");
+        me.username = text("username");
+        me.about = text("about");
+        me.status_line = v["status"].as_str().map(str::to_owned);
+        if let Some(seed) = v["seed"].as_u64() {
+            me.seed = seed;
+        }
+    });
+}
 
 /// Who sees the photo, the about line and the status.
 pub type Audiences = (Audience, Audience, Audience);
@@ -171,8 +209,10 @@ thread_local! {
 /// edit, a status set, cleared or expired, a narrower or wider audience.
 /// Called once at the root (its effect belongs to it).
 pub fn install(store: Store) {
+    restore_me(store);
     let ext = store.ext();
     effect(move || {
+        store.me.with(|me| untracked(|| save_me(me)));
         let now = store.me.with(|me| {
             store
                 .settings

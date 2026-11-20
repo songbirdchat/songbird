@@ -25,6 +25,7 @@ enum Filter {
 fn direction(r: &CallRecord) -> (Icon, &'static str, bool) {
     match r.direction {
         CallDirection::Missed => (Icon::PhoneMissed, "Missed", true),
+        CallDirection::Failed => (Icon::PhoneOff, "Couldn't connect", true),
         CallDirection::Incoming if r.secs == 0 => (Icon::PhoneIncoming, "Declined", false),
         CallDirection::Incoming => (Icon::PhoneIncoming, "Incoming", false),
         CallDirection::Outgoing if r.secs == 0 => (Icon::PhoneOutgoing, "No answer", false),
@@ -65,82 +66,88 @@ pub fn calls_tab() -> AnyElement {
                 .collect::<Vec<_>>()
         })
     });
-    let header = view()
-        .pb_1()
-        .child(view().px_4().pt_3().child(segmented(
-            vec![(Filter::All, "All"), (Filter::Missed, "Missed")],
-            move || filter.get(),
-            move |f| filter.set(f),
-        )))
-        // Links are made on the server (real) or are the demo's samples.
-        .child((crate::store::demo() || real_links()).then(|| {
-            view().pt_3().child(group([Row::new("Create call link")
-                .leading(
+    let header = move || {
+        view()
+            .pb_1()
+            .child(view().px_4().pt_3().child(segmented(
+                vec![(Filter::All, "All"), (Filter::Missed, "Missed")],
+                move || filter.get(),
+                move |f| filter.set(f),
+            )))
+            // Links are made on the server (real) or are the demo's samples.
+            .child((crate::store::demo() || real_links()).then(|| {
+                view().pt_3().child(group([Row::new("Create call link")
+                    .leading(
+                        view()
+                            .size(px(40.0))
+                            .rounded_full()
+                            .items_center()
+                            .justify_center()
+                            .bg(move || c::accent())
+                            .text_color(move || c::primary())
+                            .child(icon(Icon::Link, 20.0)),
+                    )
+                    .subtitle("Anyone with the link can join")
+                    .on_press(move || link_open.set(true))
+                    .build()]))
+            }))
+            .child(when(
+                move || {
+                    (crate::store::demo() || real_links()) && s.call_links.with(|l| !l.is_empty())
+                },
+                move || {
                     view()
-                        .size(px(40.0))
-                        .rounded_full()
-                        .items_center()
-                        .justify_center()
-                        .bg(move || c::accent())
-                        .text_color(move || c::primary())
-                        .child(icon(Icon::Link, 20.0)),
-                )
-                .subtitle("Anyone with the link can join")
-                .on_press(move || link_open.set(true))
-                .build()]))
-        }))
-        .child(when(
-            move || (crate::store::demo() || real_links()) && s.call_links.with(|l| !l.is_empty()),
-            move || {
-                view()
-                    .child(section_title("Call links"))
-                    .child(group_links(s))
-            },
-        ))
-        .child(section_title(move || {
-            if filter.get() == Filter::Missed {
-                "Missed"
+                        .child(section_title("Call links"))
+                        .child(group_links(s))
+                },
+            ))
+            .child(section_title(move || {
+                if filter.get() == Filter::Missed {
+                    "Missed"
+                } else {
+                    "Recent"
+                }
+            }))
+    };
+    // No calls: a plain page (the empty state sizes itself; D-0183: inside the list's footer
+    // it collapsed under the rows' header and its text ran over the footnote).
+    let empty = move || {
+        let missed = filter.get_untracked() == Filter::Missed;
+        empty_state(
+            if missed {
+                Icon::PhoneMissed
             } else {
-                "Recent"
-            }
-        }));
-    let footer = view()
-        .pb_safe_area_plus(px(24.0))
-        .child(when(
-            move || list.with(Vec::is_empty),
-            move || {
-                let missed = filter.get_untracked() == Filter::Missed;
-                empty_state(
-                    if missed {
-                        Icon::PhoneMissed
-                    } else {
-                        Icon::Calls
-                    },
-                    if missed {
-                        "No missed calls"
-                    } else {
-                        "No calls yet"
-                    },
-                    if missed {
-                        "Calls you didn't answer show here."
-                    } else {
-                        "Start a call from a chat, or with New call."
-                    },
-                    None,
-                )
-                .flex_none()
-                .py_8()
+                Icon::Calls
             },
-        ))
-        .child(footnote(
+            if missed {
+                "No missed calls"
+            } else {
+                "No calls yet"
+            },
+            if missed {
+                "Calls you didn't answer show here."
+            } else {
+                "Start a call from a chat, or with New call."
+            },
+            None,
+        )
+        .flex_none()
+        .py_8()
+    };
+    let footer = move || {
+        view().pb_safe_area_plus(px(24.0)).child(footnote(
             "Your call history is end-to-end encrypted and synced across your devices.",
-        ));
+        ))
+    };
     // Developer and preview builds only (never a release): rows that make
     // the demo ring, to test calls and their notifications on a device.
-    let footer = if crate::store::demo() {
-        footer.child(demo(s))
-    } else {
-        footer
+    let footer = move || {
+        let f = footer();
+        if crate::store::demo() {
+            f.child(demo(s))
+        } else {
+            f
+        }
     };
     view()
         .flex_1()
@@ -149,24 +156,36 @@ pub fn calls_tab() -> AnyElement {
             false,
             Some(icon_btn(Icon::Plus, "New call", move || new_call(s)).into_element()),
         ))
-        .child(
-            virtual_list(
-                move || list.with(Vec::len),
-                move |at| {
-                    let rec = computed(move || list.with(|l| l.get(at.index()).cloned()));
-                    dynamic(move || {
-                        let r = rec.get();
-                        untracked(move || r.map(|r| call_row(s, r)))
-                    })
-                },
-            )
-            .keys(move || list.with(|l| l.iter().map(|r| r.id).collect::<Vec<_>>()))
-            .estimated_item_size(px(if is_desktop() { 60.0 } else { 72.0 }))
-            .header(header)
-            .footer(footer)
-            .label("Call history")
-            .flex_1(),
-        )
+        .child(dynamic(move || {
+            let none = list.with(Vec::is_empty);
+            untracked(move || {
+                if none {
+                    return scroll()
+                        .flex_1()
+                        .child(header())
+                        .child(empty())
+                        .child(footer())
+                        .into_element();
+                }
+                virtual_list(
+                    move || list.with(Vec::len),
+                    move |at| {
+                        let rec = computed(move || list.with(|l| l.get(at.index()).cloned()));
+                        dynamic(move || {
+                            let r = rec.get();
+                            untracked(move || r.map(|r| call_row(s, r)))
+                        })
+                    },
+                )
+                .keys(move || list.with(|l| l.iter().map(|r| r.id).collect::<Vec<_>>()))
+                .estimated_item_size(px(if is_desktop() { 60.0 } else { 72.0 }))
+                .header(header())
+                .footer(footer())
+                .label("Call history")
+                .flex_1()
+                .into_element()
+            })
+        }))
         .child(link_sheet(s, link_open))
         .into_element()
 }

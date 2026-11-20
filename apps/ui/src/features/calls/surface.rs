@@ -444,27 +444,40 @@ fn tile(look: Look, big: bool) -> View {
         }))
 }
 
-/// The user's own tile.
-fn my_tile(s: Store, big: bool) -> AnyElement {
-    let me = s.me.get_untracked();
+/// The user's own tile: their live camera while it's on (a phone's or computer's preview), else
+/// their picture or initials.
+fn my_tile(s: Store, big: bool, cam: crate::camera::Session) -> AnyElement {
+    let me = s.me;
     let look = field(|c| (c.video, c.muted, c.hand), (false, false, false));
+    let live = crate::camera::has_live_preview();
     dynamic(move || {
         let (video, muted, hand) = look.get();
-        let name = me.name.clone();
+        let me = me.get();
+        let cam = cam.clone();
         untracked(move || {
-            tile(
-                Look {
-                    name: format!("{name} (you)"),
-                    seed: me.seed,
-                    video,
-                    muted,
-                    hand,
-                    identity: String::new(),
-                    decrypting: true,
-                    speaking: false,
-                },
-                big,
-            )
+            let preview = (video && live).then(|| crate::camera::preview_fill(&cam));
+            view()
+                .flex_1()
+                .relative()
+                .child(tile(
+                    Look {
+                        name: format!("{} (you)", me.name),
+                        seed: me.seed,
+                        video: video && !live,
+                        muted,
+                        hand,
+                        identity: String::new(),
+                        decrypting: true,
+                        speaking: false,
+                    },
+                    big,
+                ))
+                .child(preview.map(|p| {
+                    p.rounded(move || radius::lg())
+                        .overflow_hidden()
+                        .pointer_events(PointerEvents::None)
+                }))
+                .into_element()
         })
     })
 }
@@ -472,6 +485,9 @@ fn my_tile(s: Store, big: bool) -> AnyElement {
 /// A group call's tiles: a grid, or the speaker big with the rest in a
 /// strip. Tiles arrive one by one as people join.
 fn group_stage(s: Store) -> View {
+    // The user's camera, shown on their own tile (D-0183: before, a group or link call never
+    // opened it, and sent an empty video track).
+    let cam = call_camera();
     let st = calls();
     let joined =
         computed(move || st.with(|x| x.call.as_ref().map(|c| c.joined()).unwrap_or_default()));
@@ -517,6 +533,7 @@ fn group_stage(s: Store) -> View {
     };
     view().flex_1().child(dynamic(move || {
         let l = layout.get();
+        let cam = cam.clone();
         untracked(move || match l {
             Layout::Grid => scroll()
                 .flex_1()
@@ -526,7 +543,11 @@ fn group_stage(s: Store) -> View {
                         .flex_wrap()
                         .justify_center()
                         .p(px(4.0))
-                        .child(cell().child(view().aspect_ratio(shape()).child(my_tile(s, false))))
+                        .child(cell().child(view().aspect_ratio(shape()).child(my_tile(
+                            s,
+                            false,
+                            cam.clone(),
+                        ))))
                         .child(each(move || joined.get(), |p: &Participant| p.id, person)),
                 )
                 .into_element(),
@@ -534,12 +555,16 @@ fn group_stage(s: Store) -> View {
                 .flex_1()
                 .gap_2()
                 .p_2()
-                .child(dynamic(move || {
-                    let first = speaker.get();
-                    untracked(move || match first {
-                        Some(p) => tile(Look::of(&p), true).into_element(),
-                        None => my_tile(s, true),
-                    })
+                .child(dynamic({
+                    let cam = cam.clone();
+                    move || {
+                        let first = speaker.get();
+                        let cam = cam.clone();
+                        untracked(move || match first {
+                            Some(p) => tile(Look::of(&p), true).into_element(),
+                            None => my_tile(s, true, cam),
+                        })
+                    }
                 }))
                 .child(
                     scroll().horizontal().h(px(132.0)).child(
@@ -550,7 +575,7 @@ fn group_stage(s: Store) -> View {
                             .min_w(relative(1.0))
                             .justify_center()
                             .gap_2()
-                            .child(view().w(px(160.0)).child(my_tile(s, false)))
+                            .child(view().w(px(160.0)).child(my_tile(s, false, cam.clone())))
                             .child(each(
                                 move || {
                                     let big = speaker.with(|p| p.as_ref().map(|p| p.id));
@@ -684,25 +709,19 @@ fn direct_stage(s: Store, big: f32) -> View {
                             .tabular_nums(),
                     ),
             )
-            .child(self_view(s))
+            .child(self_view(s, call_camera()))
     };
     view()
         .flex_1()
         .child(when(move || video_on.get(), video).otherwise(voice))
 }
 
-/// The user's self-view in a corner, with flip camera on phones.
-fn self_view(s: Store) -> View {
-    let me = s.me.get_untracked();
+/// The call's camera: runs while the user's video is on and stops with it and with the call
+/// (D-0110); in a real call each time it (re)opens its frames go to the call's encoder; the
+/// lens picked in the devices sheet. One per call stage, shared by whatever shows the user's
+/// own picture (the corner self-view, or the user's tile in a group or link call).
+fn call_camera() -> crate::camera::Session {
     let video = field(|c| c.video, false);
-    let front = field(|c| c.front_camera, true);
-    let (w, h) = if is_desktop() {
-        (180.0, 112.0)
-    } else {
-        (104.0, 150.0)
-    };
-    // The camera runs while the user's video is on, and stops with it and with the call
-    // (D-0110). A demo or test camera has no live picture: the portrait stands in.
     let session =
         crate::camera::use_session(songbird_camera::Purpose::Call, move || video.get(), |_| {});
     // A real call sends what the camera sees: each time the camera (re)opens, its frames go to
@@ -719,6 +738,24 @@ fn self_view(s: Store) -> View {
             }
         });
     }
+    // Turning the camera on is the request for it: never asked, the system asks now; refused,
+    // the call's camera goes off and says where to allow it.
+    {
+        let sess = session.clone();
+        effect(move || {
+            let shown = sess.shown.get();
+            if !video.get() {
+                return;
+            }
+            match shown {
+                crate::camera::Shown::NotAsked => sess.ask(),
+                crate::camera::Shown::Denied | crate::camera::Shown::Restricted => {
+                    untracked(super::camera_refused);
+                }
+                _ => {}
+            }
+        });
+    }
     // The camera picked in the devices sheet.
     let lens = field(|c| c.camera, 0);
     {
@@ -732,6 +769,19 @@ fn self_view(s: Store) -> View {
             }
         });
     }
+    session
+}
+
+/// The user's self-view in a corner, with flip camera on phones.
+fn self_view(s: Store, session: crate::camera::Session) -> View {
+    let me = s.me.get_untracked();
+    let video = field(|c| c.video, false);
+    let front = field(|c| c.front_camera, true);
+    let (w, h) = if is_desktop() {
+        (180.0, 112.0)
+    } else {
+        (104.0, 150.0)
+    };
     let live = crate::camera::has_live_preview();
     let flip = session.clone();
     arrive(0.9, 8.0, motion::BASE)

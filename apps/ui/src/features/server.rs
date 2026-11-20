@@ -91,8 +91,9 @@ fn body() -> impl IntoElement {
             .child(view().pt_4().child(callout(
                 Icon::Server,
                 "Songbird's server",
-                "Sign-up, your username and your devices use Songbird's server. In this preview your \
-                 messages, groups and calls stay on this device, so nothing readable leaves it.",
+                "Your messages, calls, groups and profile go through Songbird's server, end-to-end \
+                 encrypted: it carries them but can't read them. It knows your account, your \
+                 devices and a hash of your username.",
                 crate::features::settings::privacy_centre,
             )))
             .child(section_title("Connection"))
