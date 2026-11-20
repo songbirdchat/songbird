@@ -184,6 +184,9 @@ pub(super) fn transfer_body() -> AnyElement {
                             return fail(p.0);
                         }
                         bk::apply(s, &restored);
+                        if let Err(p) = bk::import_core(s, &restored).await {
+                            return fail(p.0);
+                        }
                         s.backup_extra().update(|b| {
                             b.messages = restored.messages;
                             b.chats = restored.chats;

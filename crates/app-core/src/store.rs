@@ -926,6 +926,11 @@ impl Store {
         .map(|v| v.map(Zeroizing::new))
     }
 
+    /// The connection (for `crate::backup`).
+    pub(crate) fn db_ref(&self) -> &Connection {
+        &self.db
+    }
+
     fn put_meta(&self, key: &str, value: &[u8]) -> Result<()> {
         db(self.db.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2",
@@ -1496,7 +1501,7 @@ impl Store {
     }
 }
 
-fn row_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<MessageRow>> {
+pub(crate) fn row_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<MessageRow>> {
     let chat: Vec<u8> = r.get(0)?;
     let author: Vec<u8> = r.get(1)?;
     let id: Vec<u8> = r.get(2)?;

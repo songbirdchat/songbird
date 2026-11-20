@@ -108,7 +108,7 @@ pub async fn refresh_profile(account: [u8; 16], key: [u8; 32]) {
     }
 }
 
-pub(super) fn core() -> Rc<tokio::sync::Mutex<Option<Core>>> {
+pub(crate) fn core() -> Rc<tokio::sync::Mutex<Option<Core>>> {
     CORE.with(Rc::clone)
 }
 
@@ -2682,6 +2682,36 @@ async fn start_with(username: &str, link: Option<[u8; 16]>) -> Result<ChatId, su
         account,
         Some(username.trim().trim_start_matches('@')),
     ))
+}
+
+// ---------------------------------------------------------------- backups (D-0165)
+
+/// app-core's database for a backup's own connection: (path, key). `create`: a restore on a
+/// new device makes the key the store will be opened with; a backup needs a store that exists.
+pub fn core_db(create: bool) -> Option<(std::path::PathBuf, zeroize::Zeroizing<[u8; 32]>)> {
+    let path = data_dir()?.join(DB_FILE);
+    if !create && (!path.exists() || Storage::get_item(K_DB_KEY).is_none()) {
+        return None;
+    }
+    Some((path, zeroize::Zeroizing::new(stored_seed(K_DB_KEY))))
+}
+
+/// The UI chat showing app-core chat `real`, if shown.
+pub fn ui_chat(s: Store, real: &[u8; 16]) -> Option<ChatId> {
+    s.chats.with_untracked(|cs| {
+        cs.iter()
+            .map(|c| c.id)
+            .find(|id| core_chat(*id) == Some(*real))
+    })
+}
+
+/// Shows every stored chat again (after a restore wrote into the store).
+pub async fn reload_all(s: Store) {
+    let lock = core();
+    let guard = lock.lock().await;
+    if let Some(m) = guard.as_ref() {
+        show_all(s, m);
+    }
 }
 
 #[cfg(test)]

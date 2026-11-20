@@ -2510,8 +2510,9 @@ device list's version, the server name); the profile; settings (the record store
 with their values, and device-only settings under `d/`); contacts; groups (ID, name, metadata
 key, members, role: enough to rejoin by re-add or external commit, §6); chats; messages (the
 content protobuf of §5 as sent or received, with media references, status and star); media.
-**Never**: ratchet sessions, prekeys, device identity keys, MLS epoch secrets, KeyPackages. A
-restored device starts fresh sessions.
+**Never**: ratchet sessions, prekeys, device identity keys, MLS epoch secrets, KeyPackages,
+disappearing messages, view-once messages, deleted messages (D-0165). A restored device starts
+fresh sessions. A device keeps its rollback state (§11.4) per vault and per destination.
 
 ### 11.6 Restoring
 

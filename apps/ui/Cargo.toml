@@ -65,3 +65,5 @@ nsh-platform-windows = { version = "0.6.0", default-features = false, features =
 # The real engine, headless, for tests of the reactive wiring (NSH testing guide).
 nsh-engine = { version = "0.6.0", default-features = false }
 nsh-testing = { version = "0.6.0", default-features = false }
+# Building `Content` in the backup tests.
+prost = { version = "0.14.5", default-features = false, features = ["std"] }

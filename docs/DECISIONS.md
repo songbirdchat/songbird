@@ -199,7 +199,35 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
-## D-0164 — HTTPS to Songbird's hosts goes through the proxy too
+## D-0165 — Backups hold app-core's chats; schedule, media and a second copy are real
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **What a backup holds** for a real account: every chat and message app-core keeps, as its
+    `Content` protobuf with real IDs (PROTOCOL §11.5), read on the backup's own thread from a
+    second connection to the SQLCipher store (WAL lets it read while the app writes). Before
+    this, backups held only what the screen showed, as text, and restored into the screen alone
+    (gone at the next start). A restore writes chats, messages and files back into app-core,
+    holding app-core's lock so the store isn't opened twice, then shows them.
+  - **Never in a backup:** disappearing messages (their timer is a promise to the whole chat),
+    view-once messages, deleted ones, sessions, keys.
+  - **Include media** puts the files this device has into the backup (deduplicated by the
+    format); off, messages keep their pointers only.
+  - **Frequency** runs backups: checked a minute after start and every ten minutes; a backup is
+    due a day, a week or 30 days after the last.
+  - **A second destination** gets the same content after the main one; its failure is reported
+    without undoing the main backup. Rollback state (§11.4) is kept per destination, since
+    each place has its own generations.
+  - **The settings are kept on this device** (they weren't: a restart turned backups off): on,
+    destination, media, frequency, second copy, last time and size (both real now; the size was
+    a made-up "1.2 GB"). The destination's sign-in sits with the device's other secrets and
+    moves to the keychain with them.
+- Consequences: a backup made before this restores as before (its IDs are the app's own); a
+  restored group shows its history but needs a re-add or external commit to send again (§6).
+
+ to Songbird's hosts goes through the proxy too
 
 - Date: 2026-11-20
 - Status: proposed (waiting for the owner)

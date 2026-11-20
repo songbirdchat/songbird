@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 pub mod attachments;
+pub mod backup;
 pub mod blob;
 pub mod call_links;
 pub mod calls;

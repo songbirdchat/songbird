@@ -49,10 +49,11 @@ Status: ☐ open · ☑ done (with the commit).
 
 - ☑ HTTPS to Songbird's hosts goes through the proxy too, fail closed (D-0164)
 
+- ☑ Backups hold app-core's chats and files; frequency, media, a second copy and saved settings (D-0165)
+
 ## Open, by what they need
 
 **a (app only, or an existing endpoint):**
-- backup frequency, include media and second destination
 - Google Drive, OneDrive and Dropbox stores (the crate has them; OAuth needs the owner's apps)
 - parental rules enforced on the child's app
 

@@ -96,6 +96,8 @@ pub fn App() -> impl IntoElement {
     // reads the proxy setting.
     backend::records::restore(s);
     backend::chat_state::install(s);
+    // The backup settings, saved on this device, and backups on their schedule (D-0165).
+    backend::backup::install(s);
     // A status whose real expiry passed while the app was closed goes now.
     s.schedule_status_expiry();
     camera::install_for_app();

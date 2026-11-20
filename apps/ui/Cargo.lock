@@ -3868,6 +3868,7 @@ dependencies = [
  "nsh-platform-macos",
  "nsh-platform-windows",
  "nsh-testing",
+ "prost",
  "qrcode",
  "serde",
  "serde_json",

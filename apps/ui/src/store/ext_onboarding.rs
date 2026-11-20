@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use nsh_core::prelude::*;
 
-use super::{BackupDestination, DeviceKind, NOW, Store, clock};
+use super::{BackupDestination, DeviceKind, Store};
 
 // ---------------------------------------------------------------- invite codes
 
@@ -303,6 +303,16 @@ pub enum Frequency {
 }
 
 impl Frequency {
+    /// How long after a backup the next is due.
+    pub fn period_ms(self) -> u64 {
+        const DAY: u64 = 24 * 60 * 60 * 1000;
+        match self {
+            Frequency::Daily => DAY,
+            Frequency::Weekly => 7 * DAY,
+            Frequency::Monthly => 30 * DAY,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Frequency::Daily => "Daily",
@@ -329,6 +339,8 @@ pub enum BackupProblem {
 pub struct BackupExtra {
     pub frequency: Frequency,
     pub second: Option<BackupDestination>,
+    /// When the last backup finished (ms since the epoch; 0: never).
+    pub last_ms: u64,
     /// A backup running now: 0.0 to 1.0.
     pub running: Option<f32>,
     pub problem: Option<BackupProblem>,
@@ -673,20 +685,44 @@ impl Store {
         let messages = snap.messages;
         let chats = snap.chats;
         let target = extra.get_untracked();
+        // The second copy (D-0165): the same content, after the main one, to its own place.
+        let second = target
+            .second
+            .filter(|d| *d != dest && crate::backend::backup::available(*d));
+        let snap2 = second.map(|_| snap.clone());
         Owner::detached().run(|| {
             spawn(async move {
-                let r = crate::backend::backup::back_up(dest, target, snap, records).await;
+                let r = crate::backend::backup::back_up(dest, target.clone(), snap, records).await;
                 poll.cancel();
                 match r {
-                    Ok(_) => {
+                    Ok(stats) => {
+                        let now = nsh_core::time::unix_ms() as u64;
                         extra.update(|b| {
                             b.running = None;
                             b.messages = messages;
                             b.chats = chats;
+                            b.last_ms = now;
                         });
                         store.settings_update(|s| {
-                            s.backup_last = Some(format!("Today at {}", clock(NOW)))
+                            s.backup_last = Some(crate::backend::backup::ago(now));
+                            s.backup_size =
+                                crate::store::ext_groups::format_bytes(stats.plaintext_bytes);
                         });
+                        if let (Some(d2), Some(snap2)) = (second, snap2) {
+                            let none = Arc::new(AtomicU32::new(0));
+                            if let Err(p) =
+                                crate::backend::backup::back_up(d2, target, snap2, none).await
+                            {
+                                extra.update(|b| {
+                                    b.problem = Some(BackupProblem::Other);
+                                    b.note = Some(format!(
+                                        "Your main backup is done, but the second copy, to {}, didn't finish. {}",
+                                        d2.label(),
+                                        p.0
+                                    ));
+                                });
+                            }
+                        }
                     }
                     Err(p) => extra.update(|b| {
                         b.running = None;
@@ -789,6 +825,11 @@ impl Store {
                     .session
                     .update(|s| s.recovery_key = key.display().to_string());
                 crate::backend::backup::apply(store, &r);
+                if let Err(p) = crate::backend::backup::import_core(store, &r).await {
+                    extra.update(|b| b.note = Some(p.0));
+                    stage.set(RestoreStage::Failed);
+                    return;
+                }
                 extra.update(|b| {
                     b.messages = r.messages;
                     b.chats = r.chats;
