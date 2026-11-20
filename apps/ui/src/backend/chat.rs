@@ -842,7 +842,11 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
     IDS.with_borrow_mut(|m| m.insert(id, (row.author, row.id)));
     let media = matches!(
         body,
-        Body::Image { .. } | Body::File { .. } | Body::Video { .. } | Body::ViewOnce { .. }
+        Body::Image { .. }
+            | Body::File { .. }
+            | Body::Video { .. }
+            | Body::ViewOnce { .. }
+            | Body::Voice { .. }
     ) || (matches!(body, Body::Sticker { .. })
         && songbird_app_core::packs::sticker_in(&row.content).is_some_and(|(_, _, img)| img));
     if media {
@@ -975,10 +979,23 @@ pub fn media_file(msg: MsgId, then: impl FnOnce(String) + 'static) {
     });
 }
 
+/// The file's extension the platform's player goes by.
+fn extension_of(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {
+        "wav"
+    } else if bytes.get(4..8) == Some(b"ftyp") {
+        "mp4"
+    } else if bytes.starts_with(b"OggS") {
+        "ogg"
+    } else {
+        "bin"
+    }
+}
+
 fn write_playing(msg: MsgId, bytes: &[u8]) -> Option<String> {
     let dir = media_cache()?;
     std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(format!("{msg:016x}.mp4"));
+    let path = dir.join(format!("{msg:016x}.{}", extension_of(bytes)));
     std::fs::write(&path, bytes).ok()?;
     Some(format!("file://{}", path.display()))
 }
@@ -1229,6 +1246,13 @@ fn body_of(row: &MessageRow) -> Body {
             return Body::ViewOnce {
                 photo: !p.content_type.starts_with("video/"),
                 opened: false,
+            };
+        }
+        // A voice note (its flag, or any audio).
+        if p.flags & 1 == 1 || p.content_type.starts_with("audio/") {
+            return Body::Voice {
+                secs: p.duration_ms.div_ceil(1000).max(1),
+                played: row.status == Status::Played,
             };
         }
         if p.content_type.starts_with("video/") {
@@ -2396,6 +2420,102 @@ pub async fn receive_attention(payload: &[u8]) {
             }
         }
     }
+}
+
+/// Sends a voice note in a real chat.
+pub fn send_voice(s: Store, chat: ChatId, rec: songbird_recorder::Recording) {
+    let Some(target) = core_chat(chat) else {
+        return;
+    };
+    let ui = s.push_message(
+        chat,
+        None,
+        Body::Voice {
+            secs: rec.duration_ms.div_ceil(1000).max(1),
+            played: false,
+        },
+    );
+    let meta = songbird_app_core::attachments::FileMeta {
+        content_type: "audio/wav".into(),
+        file_name: "voice-note.wav".into(),
+        duration_ms: rec.duration_ms,
+        flags: 1, // FLAG_VOICE_NOTE
+        waveform: rec.waveform.clone(),
+        ..Default::default()
+    };
+    let bytes = rec.wav;
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        let me = m.local().account;
+        let r = if m.is_group(&target) {
+            m.send_group_files(&target, vec![(bytes, meta)], "").await
+        } else {
+            m.send_files(&target, vec![(bytes, meta)], "").await
+        };
+        match r {
+            Ok(id) => {
+                let status = m
+                    .store
+                    .message(&me, &id)
+                    .ok()
+                    .flatten()
+                    .map_or(Status::Sent, |r| r.status);
+                drop(guard);
+                OUTGOING.with_borrow_mut(|o| o.insert(ui, id));
+                IDS.with_borrow_mut(|x| x.insert(ui, (me, id)));
+                MEDIA.with_borrow_mut(|x| x.insert(ui, (me, id)));
+                set_status(s, &id, status);
+                Ok(())
+            }
+            Err(_) => {
+                drop(guard);
+                s.fail(chat, ui);
+                Err(super::problem("The voice message couldn't be sent."))
+            }
+        }
+    });
+}
+
+/// A real voice note's waveform in `bars` bars (0 to 1), from what its sender measured.
+pub fn waveform(msg: MsgId, bars: usize) -> Option<Vec<f32>> {
+    let (author, id) = MEDIA.with_borrow(|m| m.get(&msg).copied())?;
+    let lock = core();
+    let guard = lock.try_lock().ok()?;
+    let row = guard.as_ref()?.store.message(&author, &id).ok()??;
+    let w = songbird_app_core::messenger::attachments_of(&row.content)
+        .into_iter()
+        .next()?
+        .waveform;
+    if w.is_empty() || bars == 0 {
+        return None;
+    }
+    Some(
+        (0..bars)
+            .map(|i| {
+                let at = i * w.len() / bars;
+                (f32::from(w.get(at).copied().unwrap_or(0)) / 255.0).max(0.08)
+            })
+            .collect(),
+    )
+}
+
+/// A received voice note began playing: kept as played, and its author told (1:1 chats).
+pub fn played(msg: MsgId) {
+    let Some((author, id)) = MEDIA.with_borrow(|m| m.get(&msg).copied()) else {
+        return;
+    };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        if let Some(m) = guard.as_mut() {
+            let _ = m.mark_played(&author, &id).await;
+        }
+        Ok(())
+    });
 }
 
 /// Marks every real chat read (Chats → Mark all as read).

@@ -2033,3 +2033,68 @@ async fn presence_and_nudges_reach_contacts_sealed() {
     // The same payload as an ordinary event is no nudge.
     assert_eq!(bob.core.receive(&payload).await.unwrap(), Received::Nothing);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_note_arrives_with_its_waveform_and_is_marked_played() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    alice.core.send_text(&bob.account, "hi").await.unwrap();
+    assert!(matches!(pump_app(&mut bob).await, Received::Message(_)));
+    // 16 kHz mono 16-bit WAV, as the recorder makes it: one second.
+    let mut wav = b"RIFF".to_vec();
+    wav.extend_from_slice(&(36u32 + 32_000).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    for v in [
+        16u32.to_le_bytes().to_vec(),
+        1u16.to_le_bytes().to_vec(),
+        1u16.to_le_bytes().to_vec(),
+        16_000u32.to_le_bytes().to_vec(),
+        32_000u32.to_le_bytes().to_vec(),
+        2u16.to_le_bytes().to_vec(),
+        16u16.to_le_bytes().to_vec(),
+    ] {
+        wav.extend_from_slice(&v);
+    }
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&32_000u32.to_le_bytes());
+    wav.extend(std::iter::repeat_n(0x11u8, 32_000));
+    let meta = songbird_app_core::attachments::FileMeta {
+        content_type: "audio/wav".into(),
+        file_name: "voice-note.wav".into(),
+        duration_ms: 1_000,
+        flags: 1,
+        waveform: (0..=255u8).collect(),
+        ..Default::default()
+    };
+    let id = alice
+        .core
+        .send_files(&bob.account, vec![(wav.clone(), meta)], "")
+        .await
+        .unwrap();
+    let mut got = pump_app(&mut bob).await;
+    while !matches!(got, Received::Message(_)) {
+        got = pump_app(&mut bob).await;
+    }
+    let Received::Message(row) = got else {
+        unreachable!()
+    };
+    let p = &songbird_app_core::messenger::attachments_of(&row.content)[0];
+    assert_eq!((p.flags, p.duration_ms, p.waveform.len()), (1, 1_000, 256));
+    assert_eq!(
+        &*bob.core.file(&alice.account, &id, 0).await.unwrap(),
+        &wav[..]
+    );
+    // Played: kept here, and Alice is told.
+    bob.core.mark_played(&alice.account, &id).await.unwrap();
+    let mut st = pump_app(&mut alice).await;
+    while !matches!(
+        st,
+        Received::Status {
+            status: Status::Played,
+            ..
+        }
+    ) {
+        st = pump_app(&mut alice).await;
+    }
+}

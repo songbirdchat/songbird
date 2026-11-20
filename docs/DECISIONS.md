@@ -199,6 +199,42 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0161 — Voice notes: a recorder on every platform, WAV, played receipts
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Context: D-0158 found that libwebrtc's audio device module does not record outside a call.
+- Decision:
+  - **`apps/recorder`** (its own workspace, no `unsafe`): the default microphone through
+    `cpal` 0.16 (Apache-2.0: CoreAudio on macOS and iOS, WASAPI on Windows, ALSA on Linux,
+    AAudio on Android), one API instead of a native module per platform. Whatever the device
+    gives is mixed to mono and averaged down (or repeated up) to 16 kHz, kept in memory as
+    16-bit PCM, at most 10 minutes; the level of the last 100 ms; at the end a waveform of at
+    most 256 bytes and a WAV file. Nothing touches the disk before encryption.
+  - **Why WAV, not Opus**: no codec library to vendor and review, played by every platform's
+    own player; 32 KB a second (a minute is about 1.9 MB, inside the attachment limits). An
+    Opus encoder can come later without changing the protocol (the pointer's content type says
+    what it is).
+  - **Sending**: the composer's record button records in real chats (the system asks for the
+    microphone the first time, with the purpose string added to `nsh.json` in D-0152); release or
+    Send sends a `FLAG_VOICE_NOTE` attachment with its duration and waveform, to a 1:1 chat or a
+    group; under half a second is not sent; deleting or sliding away discards it.
+  - **Receiving and playing**: a voice note is a voice note in the chat; it plays in the
+    platform's audio player (from a decrypted copy in the app's `media-playing` folder, D-0158),
+    its bar moved by the player's own progress events, at the chosen speed, then the next unplayed
+    note; the bubble draws the waveform the sender measured. Playing a received note keeps it
+    played and sends the author a played receipt (`Messenger::mark_played`).
+- Evidence: the recorder's unit tests (48 kHz stereo to 16 kHz mono at the right level, slower
+  devices brought up, the WAV header, the waveform's bounds, the 10-minute stop); a live capture
+  on this Mac (two seconds recorded, a WAV and a 256-byte waveform); `gate_a2::a_voice_note_
+  arrives_with_its_waveform_and_is_marked_played` against the real stack (flag, duration and
+  waveform arrive; the file opens; the played receipt reaches the sender); the A2 gate (19) and
+  `apps/ui` (213) pass. `cargo deny` passes licences, bans and sources for the recorder.
+- Not exercised: recording inside the packaged app on iOS, Android, Windows and Linux (cpal
+  builds there; Linux needs `libasound`'s headers to build; iOS needs the record audio session
+  category, which cpal sets for an input stream).
+
 ## D-0160 — Broadcast lists, presence and nudges on the real backend
 
 - Date: 2026-11-20

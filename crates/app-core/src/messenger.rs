@@ -1342,6 +1342,13 @@ impl<N: Net> Messenger<N> {
         }
     }
 
+    /// Marks a received voice note played and, in a 1:1 chat, tells its author (§5.7).
+    pub async fn mark_played(&mut self, author: &[u8; 16], id: &[u8; 16]) -> Result<()> {
+        self.store.advance(author, id, Status::Played)?;
+        self.send_receipt(author, &[*id], receipt_message::Kind::Played)
+            .await
+    }
+
     /// Whether `id` is one of this device's groups (else a 1:1 chat's account).
     pub fn is_group(&self, id: &[u8; 16]) -> bool {
         self.load_group(id).is_ok()

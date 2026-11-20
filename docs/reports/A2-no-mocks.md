@@ -60,7 +60,7 @@ Status: ☐ open · ☑ done (with the commit).
 
 **Groups, the rest (b, c):** new devices joining by external commit. (Roles on received commits: D-0155; the change log: D-0156.)
 
-**M6 attachments, the rest (a, b, c):** voice notes (a platform recorder, e), the user's own GPS position (e; picking on the map is done). (View-once and video playback: D-0158.)
+**M6 attachments, the rest (a, b, c):** the user's own GPS position (e; picking on the map is done). (View-once and video playback: D-0158; voice notes: D-0161.)
 
 **Calls (b, c, e):** done for 1:1 and group calls (D-0151, D-0152): LiveKit media end-to-end
 encrypted, devices, screen share, verification symbols from the call's key, signed hellos, raised

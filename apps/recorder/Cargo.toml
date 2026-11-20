@@ -1,0 +1,22 @@
+[package]
+name = "songbird-recorder"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "LicenseRef-Proprietary"
+description = "Songbird's voice-note recorder (D-0161): the microphone through cpal (CoreAudio, WASAPI, ALSA, AAudio), 16 kHz mono PCM, a waveform, WAV out"
+
+# Its own workspace, as apps/ui and apps/camera: the app's crates are outside the server's.
+[workspace]
+
+[dependencies]
+cpal = "0.16"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Platform names (CoreAudio, AAudio) are words in these docs, not code.
+doc_markdown = "allow"
