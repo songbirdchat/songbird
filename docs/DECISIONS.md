@@ -199,6 +199,27 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0181 — Passkeys on Windows
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - Windows makes and uses passkeys through its own WebAuthn (`webauthn.dll`, Windows 10 1903
+    and later): the system's Windows Security dialog chooses Windows Hello, a security key or a
+    phone nearby. Discoverable credentials, user verification required, no attestation, ES256
+    then RS256. The dialog is modal, so it runs on its own thread, owned by Songbird's window.
+  - Windows binds no app to a domain, so the app writes `clientDataJSON` itself, as a browser
+    on the relying party's site would: `type`, the challenge, `origin` `https://<rp_id>`,
+    `crossOrigin` false. The server checks the origin against `[api.keys.devices] origins`
+    like a browser's; with the site's origin there, Windows needs no extra entry.
+  - Cancelling answers Cancelled (`ERROR_CANCELLED`, which the dialog's Cancel gives on
+    Windows 11 25H2, or `NTE_USER_CANCELLED`); any other refusal, Not allowed.
+  - `apps/device/examples/passkey.rs` makes one and asserts with it against a test relying
+    party, to check a real system.
+- Consequences: Account → Passkeys and linking with a passkey now show on Windows. Linux still
+  has no system passkeys (no platform API); it keeps the PIN.
+
 ## D-0180 — Sharing the screen from a phone
 
 - Date: 2026-11-20
@@ -308,7 +329,7 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
   `webcredentials:songbird.chat` entitlement and `apple-app-site-association` (team ID), the
   Android app `assetlinks.json` (signing key), and `[api.keys.devices]` the apps' origins.
   Until then the system refuses, and the app says so. Windows Hello passkeys (webauthn.dll) and
-  Linux have none yet.
+  Linux have none yet. (Windows since: D-0181.)
 
 ## D-0176 — Calls and push on phones
 

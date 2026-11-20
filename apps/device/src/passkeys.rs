@@ -1,5 +1,5 @@
-//! The platform's passkeys (D-0177): WebAuthn credentials kept by the system (iCloud Keychain,
-//! the Android credential provider), for the account's second factor (PROTOCOL §4.7). Songbird
+//! The platform's passkeys (D-0177, D-0181): WebAuthn credentials kept by the system (iCloud
+//! Keychain, the Android credential provider, Windows Hello or a security key or phone), for the account's second factor (PROTOCOL §4.7). Songbird
 //! makes one on the main device and later asks any device holding it for an assertion when a
 //! new device links.
 //!
@@ -52,16 +52,13 @@ pub type AssertDone = Box<dyn FnOnce(Result<Assertion, Failure>) + Send>;
 /// Whether this platform has passkeys the app can use.
 #[must_use]
 pub fn available() -> bool {
-    cfg!(any(target_os = "macos", target_os = "ios")) || {
-        #[cfg(target_os = "android")]
-        {
-            crate::android::passkeys_available()
-        }
-        #[cfg(not(target_os = "android"))]
-        {
-            false
-        }
-    }
+    #[cfg(target_os = "android")]
+    let yes = crate::android::passkeys_available();
+    #[cfg(target_os = "windows")]
+    let yes = crate::windows::passkeys::available();
+    #[cfg(not(any(target_os = "android", target_os = "windows")))]
+    let yes = cfg!(any(target_os = "macos", target_os = "ios"));
+    yes
 }
 
 /// Makes a passkey for `rp_id`, for the user `user_id` called `name`, over `challenge`. Call it
@@ -72,6 +69,8 @@ pub fn create(rp_id: &str, user_id: &[u8], name: &str, challenge: &[u8], done: C
     return crate::apple::passkeys::create(rp_id, user_id, name, challenge, done);
     #[cfg(target_os = "android")]
     return crate::android::passkey_create(rp_id, user_id, name, challenge, done);
+    #[cfg(target_os = "windows")]
+    return crate::windows::passkeys::create(rp_id, user_id, name, challenge, done);
     #[allow(unreachable_code, reason = "other platforms")]
     done(Err(Failure::Unavailable));
 }
@@ -84,6 +83,8 @@ pub fn assert(rp_id: &str, challenge: &[u8], allow: &[Vec<u8>], done: AssertDone
     return crate::apple::passkeys::assert(rp_id, challenge, allow, done);
     #[cfg(target_os = "android")]
     return crate::android::passkey_assert(rp_id, challenge, allow, done);
+    #[cfg(target_os = "windows")]
+    return crate::windows::passkeys::assert(rp_id, challenge, allow, done);
     #[allow(unreachable_code, reason = "other platforms")]
     done(Err(Failure::Unavailable));
 }
