@@ -37,6 +37,8 @@ Status: ☐ open · ☑ done (with the commit).
 
 - ☑ Disappearing messages, polls, pins, safety numbers from real keys (and accepting a changed key), mute durations, GIFs, mark all read; group reactions, edits and deletes (D-0154)
 
+- ☑ Retries: the outbox flushed every 15 s, offline sends kept, group operations retried after 409, 429, 503 (D-0157)
+
 ## Open, by what they need
 
 **a (app only, or an existing endpoint):**

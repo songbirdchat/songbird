@@ -199,6 +199,24 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0157 — Retries: the outbox, group operations, offline sends
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - Messages a budget (429) or a busy server held back already waited in the outbox, but went
+    out again only on a reconnect. The app now flushes the outbox every 15 seconds while it has
+    entries, and updates each message's ticks.
+  - A send that fails for want of a network keeps its message (status Sending) and its outbox
+    entry instead of showing it failed; the flush sends it.
+  - Group operations (add, remove, leave, answer a request) are tried up to four times, 2, 4
+    and 8 seconds apart, when the failure may pass (409: another commit came first; 429; 503;
+    the network). The core is unlocked in between, so the commit that came first is received
+    and the next try starts from the new epoch.
+- Evidence: the A2 gate (15) passes with the changes; not exercised against an induced 409 or
+  429 (the test stack's budgets are raised for the gate).
+
 ## D-0156 — The group change log on the device
 
 - Date: 2026-11-20

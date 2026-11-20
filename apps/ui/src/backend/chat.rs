@@ -162,10 +162,31 @@ fn ensure_group(s: Store, gid: [u8; 16], title: &str) -> ChatId {
     id
 }
 
-/// A group operation in app-core, its failure shown in plain words.
+/// Waits `ms` milliseconds (on the UI's timers, so no runtime timer is needed).
+pub(super) async fn pause(ms: u64) {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    set_timeout(std::time::Duration::from_millis(ms), move || {
+        let _ = tx.send(());
+    });
+    let _ = rx.await;
+}
+
+/// Whether an operation that failed this way may succeed if tried again: another commit came
+/// first (409, the group moved on), a budget ran out (429), the server was busy (503), or the
+/// network dropped.
+fn worth_retrying(e: &songbird_app_core::Error) -> bool {
+    matches!(
+        e,
+        songbird_app_core::Error::Server(409 | 429 | 503) | songbird_app_core::Error::Network
+    )
+}
+
+/// A group operation in app-core, its failure shown in plain words. Tried up to four times,
+/// 2, 4 and 8 seconds apart, when the failure may pass: the lock is let go in between, so the
+/// commit that came first is received and the next try starts from it.
 fn group_op<F>(chat: ChatId, failed: &'static str, op: F)
 where
-    F: for<'a> FnOnce(
+    F: for<'a> Fn(
             &'a mut Core,
             [u8; 16],
         ) -> std::pin::Pin<
@@ -174,15 +195,28 @@ where
 {
     let Some(gid) = group_of(chat) else { return };
     super::run(async move {
-        let lock = core();
-        let mut guard = lock.lock().await;
-        let m = guard
-            .as_mut()
-            .ok_or_else(|| super::problem("Not connected yet."))?;
-        op(m, gid).await.map_err(|_| super::problem(failed))?;
-        // This device's own commit: a call in the group moves to the new epoch's keys too.
-        super::calls::group_changed(m, &gid);
-        Ok(())
+        let mut wait = 2_000;
+        for attempt in 0..4 {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let m = guard
+                .as_mut()
+                .ok_or_else(|| super::problem("Not connected yet."))?;
+            match op(m, gid).await {
+                Ok(()) => {
+                    // This device's own commit: a call in the group moves to the new keys too.
+                    super::calls::group_changed(m, &gid);
+                    return Ok(());
+                }
+                Err(e) if attempt < 3 && worth_retrying(&e) => {
+                    drop(guard);
+                    pause(wait).await;
+                    wait *= 2;
+                }
+                Err(_) => return Err(super::problem(failed)),
+            }
+        }
+        Err(super::problem(failed))
     });
 }
 
@@ -197,6 +231,7 @@ pub fn leave_group(chat: ChatId) {
 pub fn add_to_group(chat: ChatId, contacts: Vec<ContactId>) {
     let accounts: Vec<[u8; 16]> = contacts.iter().filter_map(|c| account_of(*c)).collect();
     group_op(chat, "They couldn't be added. Try again.", move |m, gid| {
+        let accounts = accounts.clone();
         Box::pin(async move { m.add_members(&gid, &accounts).await })
     });
 }
@@ -1817,14 +1852,36 @@ pub fn set_timer(chat: ChatId, t: Option<crate::store::Disappear>) {
 /// app-core is open.
 fn sweep_expired() {
     super::run(async move {
-        let gone = {
+        let (gone, retried) = {
             let lock = core();
             let mut guard = lock.lock().await;
             let Some(m) = guard.as_mut() else {
                 return Ok(());
             };
-            m.expire_messages().unwrap_or_default()
+            // Messages a budget or a busy server held back go out again (they wait in the
+            // outbox, in order).
+            let waiting: Vec<[u8; 16]> = m
+                .store
+                .outbox()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, _, id, _)| id)
+                .collect();
+            if !waiting.is_empty() {
+                let _ = m.flush_outbox().await;
+            }
+            let me = m.local().account;
+            let retried: Vec<([u8; 16], Status)> = waiting
+                .into_iter()
+                .filter_map(|id| Some((id, m.store.message(&me, &id).ok().flatten()?.status)))
+                .collect();
+            (m.expire_messages().unwrap_or_default(), retried)
         };
+        if let Some(s) = crate::store::try_store() {
+            for (id, status) in retried {
+                set_status(s, &id, status);
+            }
+        }
         if let Some(s) = crate::store::try_store() {
             for (chat, author, id) in gone {
                 if let Some(msg) = ui_of(&author, &id) {

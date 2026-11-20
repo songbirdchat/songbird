@@ -1020,8 +1020,11 @@ impl<N: Net> Messenger<N> {
         )?;
         let idem = *random::<16>()?;
         self.store.outbox_put(&idem, to, &id, &bytes, sent_at)?;
-        self.deliver(idem, to, &id, &content).await?;
-        Ok(id)
+        match self.deliver(idem, to, &id, &content).await {
+            // Offline: it waits in the outbox (status Sending) and goes on the next flush.
+            Ok(()) | Err(Error::Network) => Ok(id),
+            Err(e) => Err(e),
+        }
     }
 
     /// Retries everything in the outbox (after a reconnect).
