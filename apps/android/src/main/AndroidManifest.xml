@@ -10,6 +10,9 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Scanning link and safety-number codes, photos and videos to send, video calls. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Calls and voice messages (D-0176): the microphone, and the audio route of a call. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <!-- Songbird works without a camera (tablets, Chromebooks): the screens say so. -->
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
     <!-- Sharing where you are, once, when you ask (D-0174); never in the background. -->

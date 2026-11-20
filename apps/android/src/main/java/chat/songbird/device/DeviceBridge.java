@@ -216,6 +216,11 @@ public final class DeviceBridge {
 
     /** The activity's permission answers: only the location request is ours. */
     public static void onPermissionResult(int request, int[] results) {
+        if (request == MIC_REQUEST) {
+            nativeMicrophone(results.length > 0
+                    && results[0] == android.content.pm.PackageManager.PERMISSION_GRANTED);
+            return;
+        }
         if (request != LOCATION_REQUEST) return;
         boolean ok = false;
         for (int r : results) ok |= r == android.content.pm.PackageManager.PERMISSION_GRANTED;
@@ -325,6 +330,57 @@ public final class DeviceBridge {
             return false;
         }
     }
+
+    // ------------------------------------------------------------ call audio (D-0176)
+
+    static final int MIC_REQUEST = 7203;
+
+    /** 1 granted; 0 asked now (the answer goes to nativeMicrophone); -1 no activity. */
+    static int microphone() {
+        Activity a = activity.get();
+        if (a == null) return -1;
+        if (a.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                == android.content.pm.PackageManager.PERMISSION_GRANTED) return 1;
+        MAIN.post(() -> a.requestPermissions(
+                new String[] {android.Manifest.permission.RECORD_AUDIO}, MIC_REQUEST));
+        return 0;
+    }
+
+    /** The communication mode while a call runs; the normal mode after. */
+    static void audioMode(boolean call) {
+        Activity a = activity.get();
+        if (a == null) return;
+        android.media.AudioManager am = a.getSystemService(android.media.AudioManager.class);
+        if (am == null) return;
+        am.setMode(call ? android.media.AudioManager.MODE_IN_COMMUNICATION : android.media.AudioManager.MODE_NORMAL);
+        a.setVolumeControlStream(call ? android.media.AudioManager.STREAM_VOICE_CALL
+                : android.media.AudioManager.USE_DEFAULT_STREAM_TYPE);
+    }
+
+    /** The call's sound through the loudspeaker, or back to the earpiece (or a headset). */
+    @SuppressWarnings("deprecation") // setSpeakerphoneOn before Android 12
+    static void speaker(boolean on) {
+        Activity a = activity.get();
+        if (a == null) return;
+        android.media.AudioManager am = a.getSystemService(android.media.AudioManager.class);
+        if (am == null) return;
+        if (Build.VERSION.SDK_INT >= 31) {
+            if (!on) {
+                am.clearCommunicationDevice();
+                return;
+            }
+            for (android.media.AudioDeviceInfo d : am.getAvailableCommunicationDevices()) {
+                if (d.getType() == android.media.AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
+                    am.setCommunicationDevice(d);
+                    return;
+                }
+            }
+        } else {
+            am.setSpeakerphoneOn(on);
+        }
+    }
+
+    static native void nativeMicrophone(boolean granted);
 
     static native void nativeLocation(long id, int code, double lat, double lon, double accuracy);
 

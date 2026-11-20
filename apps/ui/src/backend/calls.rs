@@ -304,6 +304,17 @@ async fn join(
     } = ticket;
     // A link call's data channel carries only what the app sealed itself (D-0153).
     let encrypt_data = !LIVE.with_borrow(|l| l.as_ref().is_some_and(|l| l.link.is_some()));
+    // The microphone (Android asks now; D-0176), and the system's call audio mode. Without the
+    // microphone the call still joins: the others are heard, and the screen says why they
+    // don't hear you.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    songbird_device::audio::microphone(Box::new(move |ok| {
+        let _ = tx.send(ok);
+    }));
+    if !rx.await.unwrap_or(false) {
+        crate::ui::toast("Songbird can't use the microphone, so others won't hear you. Allow it in your device's settings.");
+    }
+    songbird_device::audio::call_started();
     let joined =
         background(
             async move { Call::join_with(&url, &token, &identity, source, encrypt_data).await },
@@ -1646,6 +1657,8 @@ pub fn group_left(gid: &[u8; 16]) {
 /// the camera and screen. Idempotent.
 pub fn closed(ui_call: u64, reason: EndReason, by_user: bool) {
     PREPARED.with_borrow_mut(|p| p.remove(&ui_call));
+    // The audio route and mode, as they were before the call (D-0176).
+    songbird_device::audio::call_ended();
     let Some(live) = LIVE.with_borrow_mut(|l| {
         if l.as_ref().is_some_and(|x| x.ui == ui_call) {
             l.take()

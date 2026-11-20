@@ -645,6 +645,17 @@ fn start_recording(cv: Conv, how: Rec) {
     // A real chat records from the microphone (the system asks the first time); a demo chat
     // only counts.
     if crate::backend::chat::owns(cv.chat) {
+        // Android asks for the microphone first (D-0176): answered at once when allowed;
+        // otherwise the system's dialog shows and the next press records.
+        let allowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let answer = allowed.clone();
+        songbird_device::audio::microphone(Box::new(move |ok| {
+            answer.store(ok, std::sync::atomic::Ordering::SeqCst);
+        }));
+        if !allowed.load(std::sync::atomic::Ordering::SeqCst) {
+            toast("Allow Songbird to use the microphone, then record again.");
+            return;
+        }
         match songbird_recorder::Recorder::start() {
             Ok(r) => RECORDER.with_borrow_mut(|x| *x = Some(r)),
             Err(songbird_recorder::RecordError::NoMicrophone) => {

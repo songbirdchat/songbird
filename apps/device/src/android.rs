@@ -290,3 +290,38 @@ pub(crate) fn save_media(
         Err(crate::photos::Failure::Failed)
     });
 }
+
+// ---------------------------------------------------------------- call audio (D-0176)
+
+static MIC: Mutex<Vec<crate::audio::Done>> = Mutex::new(Vec::new());
+
+pub(crate) fn microphone(done: crate::audio::Done) {
+    let granted = call("microphone", "()I", |_| Some(Vec::new()), |_, v| v.i().ok());
+    match granted {
+        // 1: granted already; 0: asked now, the answer comes to `nativeMicrophone`.
+        Some(1) => done(true),
+        Some(0) => MIC.lock().unwrap_or_else(PoisonError::into_inner).push(done),
+        _ => done(false),
+    }
+}
+
+/// `DeviceBridge.nativeMicrophone(granted)`: the permission dialog answered.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_chat_songbird_device_DeviceBridge_nativeMicrophone(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    granted: jni::sys::jboolean,
+) {
+    let waiting = std::mem::take(&mut *MIC.lock().unwrap_or_else(PoisonError::into_inner));
+    for d in waiting {
+        d(granted != 0);
+    }
+}
+
+pub(crate) fn audio_mode(call: bool) {
+    call_bool("audioMode", call);
+}
+
+pub(crate) fn speaker(on: bool) {
+    call_bool("speaker", on);
+}

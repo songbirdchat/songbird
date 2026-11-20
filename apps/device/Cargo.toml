@@ -27,6 +27,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"
 
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std", "UIScreen", "UIApplication", "UIResponder"] }
+objc2-avf-audio = { version = "0.3.2", default-features = false, features = ["std", "AVAudioSession", "AVAudioSessionTypes"] }
 objc2-photos = { version = "0.3.2", default-features = false, features = ["std", "block2", "dispatch2", "PHPhotoLibrary", "PHAssetCreationRequest", "PHAssetChangeRequest", "PHChangeRequest", "PhotosTypes"] }
 dispatch2 = "0.3.1"
 

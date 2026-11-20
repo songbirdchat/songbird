@@ -466,3 +466,18 @@ pub(crate) fn register_push(on_token: crate::push::OnToken) -> bool {
     app.registerForRemoteNotifications();
     true
 }
+
+// ---------------------------------------------------------------- call audio (D-0176)
+
+/// iOS: the call's sound to the loudspeaker, or back to the route WebRTC's session chose.
+#[cfg(target_os = "ios")]
+pub(crate) fn speaker(on: bool) {
+    use objc2_avf_audio::{AVAudioSession, AVAudioSessionPortOverride};
+    let port = if on {
+        AVAudioSessionPortOverride::Speaker
+    } else {
+        AVAudioSessionPortOverride::None
+    };
+    // SAFETY: the app's shared audio session; overriding the output port has no other effect.
+    let _ = unsafe { AVAudioSession::sharedInstance().overrideOutputAudioPort_error(port) };
+}

@@ -1252,7 +1252,13 @@ fn controls(sheets: Sheets) -> View {
                 move || speaker.get(),
                 size,
                 true,
-                || with_call(|c| c.speaker = !c.speaker),
+                || {
+                    with_call(|c| {
+                        c.speaker = !c.speaker;
+                        // The sound to the loudspeaker, or back to the earpiece (D-0176).
+                        songbird_device::audio::speaker(c.speaker);
+                    });
+                },
             ))
             .child(camera())
             .child(mute())

@@ -3,6 +3,7 @@
 //!
 //! - [`secure`]: the vault key, kept by the system's secure store (the Keychain, the Android
 //!   Keystore, DPAPI, the Secret Service). The app encrypts its device secrets under it.
+//! - [`audio`]: a call's audio on a phone: the microphone's permission, the speaker.
 //! - [`biometrics`]: Face ID, Touch ID, fingerprints, Windows Hello.
 //! - [`photos`]: saving a photo or video the person chose (or received, with "Save to photos").
 //! - [`push`]: the device's push token (APNs, FCM).
@@ -15,6 +16,7 @@
 pub mod android;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod apple;
+pub mod audio;
 pub mod biometrics;
 #[cfg(target_os = "linux")]
 mod linux;
