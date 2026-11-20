@@ -579,3 +579,64 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------- the store (D-0178)
+
+static STORE: Mutex<Vec<(u64, crate::store::Done)>> = Mutex::new(Vec::new());
+
+fn store_call(method: &str, product: Option<&str>, done: crate::store::Done) {
+    let id = NEXT.fetch_add(1, Ordering::Relaxed);
+    STORE.lock().unwrap_or_else(PoisonError::into_inner).push((id, done));
+    let long = JValueOwned::Long(i64::try_from(id).unwrap_or(i64::MAX));
+    let started = match product {
+        Some(p) => call(
+            method,
+            "(Ljava/lang/String;J)V",
+            |env| Some(vec![JValueOwned::Object(env.new_string(p).ok()?.into()), long]),
+            |_, _| Some(()),
+        ),
+        None => call(method, "(J)V", |_| Some(vec![long]), |_, _| Some(())),
+    };
+    if started.is_none() {
+        finish_store(id, 3, "");
+    }
+}
+
+fn finish_store(id: u64, code: i32, token: &str) {
+    use crate::store::{Failure, Proof};
+    let done = {
+        let mut l = STORE.lock().unwrap_or_else(PoisonError::into_inner);
+        l.iter().position(|(i, _)| *i == id).map(|i| l.remove(i).1)
+    };
+    if let Some(done) = done {
+        done(match code {
+            0 if !token.is_empty() => Ok(Proof::Google(token.to_owned())),
+            1 => Err(Failure::Cancelled),
+            2 => Err(Failure::NotFound),
+            _ => Err(Failure::Failed),
+        });
+    }
+}
+
+pub(crate) fn store_buy(product: &str, done: crate::store::Done) {
+    store_call("storeBuy", Some(product), done);
+}
+
+pub(crate) fn store_current(done: crate::store::Done) {
+    store_call("storeCurrent", None, done);
+}
+
+/// `DeviceBridge.nativeStore(id, code, token)`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_chat_songbird_device_DeviceBridge_nativeStore(
+    mut env: JNIEnv<'_>,
+    _class: JClass<'_>,
+    id: jlong,
+    code: jint,
+    token: jni::objects::JString<'_>,
+) {
+    let token = env.get_string(&token).map(String::from).unwrap_or_default();
+    if let Ok(id) = u64::try_from(id) {
+        finish_store(id, code, &token);
+    }
+}

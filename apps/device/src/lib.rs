@@ -10,6 +10,7 @@
 //! - [`photos`]: saving a photo or video the person chose (or received, with "Save to photos").
 //! - [`push`]: the device's push token (APNs, FCM).
 //! - [`location`]: one position, when the person asks to share where they are.
+//! - [`store`]: buying a plan through the App Store (StoreKit 2) or Google Play.
 //! - [`screen`]: keeping the app's windows out of screenshots and screen recording.
 //!
 //! `unsafe` is allowed in the platform modules only, each block saying why it holds.
@@ -29,6 +30,7 @@ pub mod photos;
 pub mod push;
 pub mod screen;
 pub mod secure;
+pub mod store;
 #[cfg(target_os = "windows")]
 mod windows;
 

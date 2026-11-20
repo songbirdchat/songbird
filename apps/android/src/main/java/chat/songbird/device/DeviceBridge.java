@@ -504,6 +504,28 @@ public final class DeviceBridge {
 
     static native void nativePasskey(long id, int code, String json);
 
+    // ------------------------------------------------------------ the store (D-0178)
+
+    static void storeBuy(String product, long id) {
+        Activity a = activity.get();
+        if (a == null) {
+            nativeStore(id, 3, "");
+            return;
+        }
+        chat.songbird.store.PlayStore.buy(a, product, (code, token) -> nativeStore(id, code, token == null ? "" : token));
+    }
+
+    static void storeCurrent(long id) {
+        Activity a = activity.get();
+        if (a == null) {
+            nativeStore(id, 3, "");
+            return;
+        }
+        chat.songbird.store.PlayStore.current(a, (code, token) -> nativeStore(id, code, token == null ? "" : token));
+    }
+
+    static native void nativeStore(long id, int code, String token);
+
     static native void nativeInit();
 
     static native void nativeAuthResult(long id, int code);

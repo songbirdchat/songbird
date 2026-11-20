@@ -185,13 +185,37 @@ impl Store {
         self.settings.with(|s| s.plan)
     }
 
-    /// Buys `plan` through the platform's store. The sheet shows as busy
-    /// for a moment, as a store's confirmation does.
-    /// mock: app-core `billing.purchase(plan, period)` after StoreKit /
-    /// Play Billing / the EU provider confirms; the server grants it.
+    /// Buys `plan` through the platform's store: StoreKit 2 or Play Billing on phones and the
+    /// Mac, the EU provider's checkout in the browser elsewhere; billing then issues the
+    /// anonymous tokens this account redeems (D-0129, D-0178).
     pub fn purchase(&self, plan: Plan, billing: Billing, done: impl FnOnce() + 'static) {
         let s = *self;
         extras().update(|e| e.purchasing = true);
+        if live_ready() && crate::backend::plans::in_store() {
+            let p = if plan == Plan::Family {
+                "family"
+            } else {
+                "plus"
+            };
+            let i = if billing == Billing::Yearly {
+                "year"
+            } else {
+                "month"
+            };
+            extras().update(|e| e.billing = billing);
+            crate::backend::run(async move {
+                match crate::backend::plans::buy_in_store(p, i).await {
+                    Ok(true) => s.await_store(0, Box::new(done)),
+                    Ok(false) => extras().update(|x| x.purchasing = false),
+                    Err(e) => {
+                        extras().update(|x| x.purchasing = false);
+                        return Err(e);
+                    }
+                }
+                Ok(())
+            });
+            return;
+        }
         if live_ready() {
             // The EU provider in the browser: the app keeps only its subscriber secret, then
             // waits for the payment and fetches its anonymous tokens (D-0129).
@@ -242,11 +266,22 @@ impl Store {
         });
     }
 
-    /// Asks the store for purchases made on another device. Returns
-    /// whether one was found.
-    /// mock: app-core `billing.restore()`; nothing to restore here.
+    /// Asks the store (or, off the stores, the EU provider) for a subscription bought on another
+    /// device or before a reinstall, and fetches this month's tokens on it. Returns whether
+    /// this account has a plan now; the refresh that follows shows a restored one.
     pub fn restore_purchases(&self) -> bool {
-        if live_ready() {
+        if live_ready() && crate::backend::plans::in_store() {
+            let s = *self;
+            crate::backend::run(async move {
+                if crate::backend::plans::restore_from_store().await? {
+                    crate::backend::plans::renew().await?;
+                } else {
+                    crate::ui::toast("This store account has no Songbird subscription.");
+                }
+                s.refresh_plan();
+                Ok(())
+            });
+        } else if live_ready() {
             let s = *self;
             crate::backend::run(async move {
                 if crate::backend::plans::subscription().await?.is_some() {
@@ -257,6 +292,31 @@ impl Store {
             });
         }
         self.plan() != Plan::Free
+    }
+
+    /// After a store purchase: fetches this month's tokens, retrying every 5 s (for up to
+    /// 15 minutes) while billing hasn't confirmed the purchase with the store yet.
+    fn await_store(&self, attempt: u32, done: Box<dyn FnOnce()>) {
+        let s = *self;
+        crate::backend::run(async move {
+            match crate::backend::plans::renew().await {
+                Ok(()) => {
+                    extras().update(|e| e.purchasing = false);
+                    s.refresh_plan();
+                    done();
+                }
+                Err(e) if crate::backend::plans::not_paid_yet(&e) && attempt < 180 => {
+                    set_timeout(Duration::from_secs(5), move || {
+                        s.await_store(attempt + 1, done)
+                    });
+                }
+                Err(e) => {
+                    extras().update(|x| x.purchasing = false);
+                    return Err(e);
+                }
+            }
+            Ok(())
+        });
     }
 
     /// Polls billing every 5 s (for up to 15 minutes) until the payment is confirmed, then

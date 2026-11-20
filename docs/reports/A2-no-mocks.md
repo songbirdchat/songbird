@@ -81,7 +81,7 @@ Android Keystore, DPAPI and the Secret Service; Face ID, Touch ID, fingerprint a
 unlock; screen protection and the app switcher cover; saving photos and videos; "Use my
 location". Left:
 - passkeys (the server's are real; the platform sheets need the domain association, apple-app-site-association and assetlinks.json on songbird.chat, and the Apple team ID)
-- StoreKit and Play billing (products in App Store Connect and Play Console)
+- StoreKit and Play billing: done (D-0178); the products in App Store Connect and the Play Console are the owner's
 - push hosts: APNs (token callbacks added to NSH's app delegate at run time), PushKit and CallKit, FCM or UnifiedPush (Apple and Firebase registrations)
 - mobile call media and the speaker route (libwebrtc's mobile archives are pinned; mobile builds need CMake, and Android its SDK and NDK)
 - notification actions and background backups: NSH has no notification actions or categories and owns the delegate; iOS background tasks must be registered before launch finishes (NSH's runner). Requests for NSH.

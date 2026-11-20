@@ -199,6 +199,36 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0178 — Buying a plan in the App Store and Google Play
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **iOS and macOS** buy with StoreKit 2 (`apps/device/swift/Store.swift`, built by the device
+    crate's `build.rs` with `xcrun swiftc` into a static library, called from Rust through two
+    C functions). **Android** buys with Google Play Billing 9.1.0 in the Gradle host
+    (`chat.songbird.store.PlayStore`). Windows and Linux keep the EU provider (D-0129).
+  - The plan sheet chooses the interval; Subscribe opens the store's own sheet. Its proof, the
+    signed transaction (`{"apple": jws}`) or the purchase token (`{"google": token}`), is kept
+    in the vault and is the proof `POST /v1/billing/tokens` takes instead of the subscriber
+    secret; tokens are fetched and redeemed as before (§14.4). While billing hasn't confirmed
+    the purchase (402), the app retries every 5 s for 15 minutes.
+  - **Restore** asks the store for the account's current subscription (StoreKit's current
+    entitlements, Play's `queryPurchasesAsync`), keeps its proof and fetches this month's
+    tokens. Billing verifies and acknowledges the purchase with the store itself.
+  - No appAccountToken and no obfuscated account ID: the store never learns the Songbird
+    account, and billing never learns it either.
+  - Product IDs, the same in both stores: `plus.monthly`, `plus.yearly`, `family.monthly`,
+    `family.yearly`. Before this, buying on a phone opened the EU provider in the browser, which
+    the App Store and Play don't allow for digital subscriptions, and Restore did nothing there.
+  - Apple's Swift runtime is in the OS; the app links it from `/usr/lib/swift` (an rpath in
+    `apps/ui/.cargo/config.toml`, as Xcode sets for any Swift app).
+- Consequences: the products must exist in App Store Connect and the Play Console, with
+  billing's App Store Server API key and Play service account configured; until then the store
+  says the plan isn't offered, and the app says so. A Mac build sold outside the Mac App Store
+  can't use StoreKit; it would need the EU provider instead (decide with distribution).
+
 ## D-0177 — Passkeys on the device; the IP setting that wasn't one
 
 - Date: 2026-11-20

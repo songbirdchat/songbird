@@ -1,8 +1,9 @@
 # libwebrtc (call media, D-0151) keeps its Objective-C code in categories inside a static
 # library; Apple's linker drops them unless told to load every Objective-C member, and the app
-# then aborts at start.
+# then aborts at start. StoreKit's Swift (D-0178) links the system's Swift runtime, which some
+# libraries name by `@rpath`: `/usr/lib/swift` is where it lives, as Xcode sets for any Swift app.
 [target.'cfg(target_vendor = "apple")']
-rustflags = ["-C", "link-arg=-ObjC"]
+rustflags = ["-C", "link-arg=-ObjC", "-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]
 
 # libwebrtc per target (D-0175): LiveKit's build helper, patched to read
 # `LK_CUSTOM_WEBRTC_<target>` first (apps/vendor/webrtc-sys-build/PATCH.md).

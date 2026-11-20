@@ -930,3 +930,75 @@ pub(crate) mod passkeys {
         run(Retained::into_super(req), Done::Assert(done));
     }
 }
+
+// ---------------------------------------------------------------- StoreKit 2 (D-0178)
+
+pub(crate) mod store {
+    use std::{
+        collections::HashMap,
+        ffi::{CStr, CString, c_char},
+        sync::{
+            Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
+
+    use crate::store::{Done, Failure, Proof};
+
+    type Callback = unsafe extern "C" fn(u64, i32, *const c_char);
+
+    unsafe extern "C" {
+        fn sb_store_buy(product: *const c_char, id: u64, done: Callback);
+        fn sb_store_current(id: u64, done: Callback);
+    }
+
+    static WAITING: Mutex<Option<HashMap<u64, Done>>> = Mutex::new(None);
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+
+    fn park(done: Done) -> u64 {
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        WAITING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert_with(HashMap::new)
+            .insert(id, done);
+        id
+    }
+
+    unsafe extern "C" fn answered(id: u64, code: i32, jws: *const c_char) {
+        let done = WAITING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .and_then(|w| w.remove(&id));
+        let Some(done) = done else { return };
+        let r = match code {
+            0 if !jws.is_null() => {
+                // SAFETY: the Swift side passes a NUL-terminated string alive for this call.
+                let s = unsafe { CStr::from_ptr(jws) }.to_string_lossy().into_owned();
+                Ok(Proof::Apple(s))
+            }
+            1 => Err(Failure::Cancelled),
+            2 => Err(Failure::NotFound),
+            _ => Err(Failure::Failed),
+        };
+        done(r);
+    }
+
+    pub(crate) fn buy(product: &str, done: Done) {
+        let Ok(p) = CString::new(product) else {
+            done(Err(Failure::NotFound));
+            return;
+        };
+        let id = park(done);
+        // SAFETY: `p` outlives the call (the Swift side copies it at once); the callback is a
+        // plain C function.
+        unsafe { sb_store_buy(p.as_ptr(), id, answered) };
+    }
+
+    pub(crate) fn current(done: Done) {
+        let id = park(done);
+        // SAFETY: as above.
+        unsafe { sb_store_current(id, answered) };
+    }
+}

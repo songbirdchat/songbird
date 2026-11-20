@@ -7,6 +7,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Buying a plan in Google Play (D-0178). -->
+    <uses-permission android:name="com.android.vending.BILLING" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Scanning link and safety-number codes, photos and videos to send, video calls. -->
     <uses-permission android:name="android.permission.CAMERA" />

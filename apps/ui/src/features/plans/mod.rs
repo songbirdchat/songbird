@@ -415,10 +415,9 @@ fn paywall_sheet(
         )
 }
 
-/// The store's purchase sheet. mock: on iOS and macOS this is StoreKit's
-/// own sheet, on Android Play Billing's; on Windows and Linux the EU
-/// provider's checkout. Here it is drawn by the app so the flow can be
-/// reviewed.
+/// Choosing the plan's interval before paying: Subscribe opens the store's own sheet
+/// (StoreKit on iOS and macOS, Play Billing on Android) or, on Windows and Linux, the EU
+/// provider's checkout in the browser (D-0178).
 fn purchase_sheet(
     s: Store,
     buying: Signal<Option<Plan>>,
