@@ -443,7 +443,6 @@ fn more_menu(cv: Conv, nudge: bool) -> AnyElement {
             "Report",
             move || {
                 s.report(chat);
-                toast("Reported. Thank you.");
             },
         )
     }));

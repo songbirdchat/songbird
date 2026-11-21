@@ -1,4 +1,4 @@
-//! The conversation's sheets: emoji, attachments and their mock pickers
+//! The conversation's sheets: emoji, attachments and their pickers
 //! (poll and event creators, contacts, stickers), forward (up to five
 //! chats), delete, more reactions, disappearing messages.
 
@@ -147,8 +147,8 @@ fn run_chosen(chosen: Signal<Option<fn(Conv)>>, cv: Conv) {
 }
 
 /// Photo & video, Camera, Document, Location, Contact, Poll, Event,
-/// Sticker: four to a row. Each picker is a mock that sends a realistic
-/// body. A sheet on phones; on desktops a popover above the paperclip.
+/// Sticker: four to a row. Real chats send what app-core carries; a kind
+/// it doesn't carry yet fails honestly. A sheet on phones; on desktops a popover above the paperclip.
 fn attach_sheet(cv: Conv) -> AnyElement {
     let open = cv.attach_open;
     // A tile's choice runs once the sheet has gone (`app_sheet_then`): on a phone the next sheet
@@ -570,11 +570,21 @@ fn camera_sheet(cv: Conv) -> AnyElement {
                                             shoot.take_photo(move |result| {
                                                 let _ = busy.try_set(false);
                                                 match result {
+                                                    Ok(still) if crate::backend::chat::owns(cv.chat) => {
+                                                        open.set(false);
+                                                        // A real chat: the JPEG is encrypted and uploaded as
+                                                        // an attachment (Prompt 6, D-0184).
+                                                        // Its size is read from the bytes.
+                                                        let f = nsh_core::picker::PickedFile::new(
+                                                            "Photo.jpg",
+                                                            still.mime,
+                                                            nsh_core::image::ImageData::new(still.bytes),
+                                                        );
+                                                        crate::backend::chat::send_picked(cv.s, cv.chat, vec![f], true);
+                                                    }
                                                     Ok(still) => {
                                                         open.set(false);
-                                                        // mock: app-core encrypts the JPEG with the attachment
-                                                        // format (Prompt 6) and uploads it; until then only its
-                                                        // size reaches the message, and the bytes are dropped.
+                                                        // The demo's chat: the photo's size only.
                                                         cv.send_body(Body::Image {
                                                             caption: String::new(),
                                                             alt: "A photo you took".into(),

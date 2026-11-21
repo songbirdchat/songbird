@@ -135,10 +135,19 @@ pub(super) fn link_device(s: Store, f: Flow) -> View {
             });
         }
     };
-    if crate::backend::is_live() && !crate::backend::registered() {
-        (attempt.clone())();
+    if !crate::store::demo() {
+        // A real device links for real. One that already has an account here (Help → Replay
+        // welcome) says so instead of pretending to link again (D-0184).
+        if crate::backend::registered() {
+            failed.set(Some(
+                "This device already has an account. Sign out of it first to link this device to another."
+                    .to_string(),
+            ));
+        } else {
+            (attempt.clone())();
+        }
     } else {
-        // mock: the phone scans this code and approves after a moment.
+        // The demo: the "phone" scans this code and approves after a moment.
         set_timeout(Duration::from_millis(4500), move || {
             if f.history
                 .try_get()

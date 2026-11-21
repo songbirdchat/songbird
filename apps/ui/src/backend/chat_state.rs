@@ -1,6 +1,7 @@
 //! Chat-list state that follows the user across devices (PROTOCOL §10.2, D-0163): each real
-//! chat's archived, pinned, muted-until, marked-unread and favourite state, and the custom lists
-//! it is in, as one encrypted record `c/<account or group, hex>/state`, last writer wins.
+//! chat's archived, pinned, muted-until, marked-unread and favourite state, its theme (D-0184),
+//! and the custom lists it is in, as one encrypted record `c/<account or group, hex>/state`,
+//! last writer wins.
 //!
 //! A change on this device is written when the chat list changes (an effect compares each real
 //! chat's state with what was last written); a change from another device arrives with a sync
@@ -24,13 +25,18 @@ thread_local! {
 pub fn encode(c: &Chat) -> String {
     let mut lists = c.lists.clone();
     lists.sort();
+    let theme = crate::store::ChatTheme::ALL
+        .iter()
+        .position(|t| *t == c.theme)
+        .unwrap_or(0);
     format!(
-        "a={};p={};m={};u={};f={};l={}",
+        "a={};p={};m={};u={};f={};t={};l={}",
         u8::from(c.archived),
         u8::from(c.pinned),
         if c.muted { c.muted_until } else { 0 },
         u8::from(c.marked_unread),
         u8::from(c.favourite),
+        theme,
         lists
             .iter()
             .map(|l| l.replace([';', ','], " "))
@@ -55,6 +61,16 @@ pub fn apply(v: &str, c: &mut Chat) {
                 if let Ok(until) = val.parse::<u64>() {
                     c.muted = until > 0;
                     c.muted_until = until;
+                }
+            }
+            // The chat's theme (this user's view of it only; the others never see it).
+            "t" => {
+                if let Some(t) = val
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| crate::store::ChatTheme::ALL.get(i))
+                {
+                    c.theme = *t;
                 }
             }
             "l" => {
@@ -165,9 +181,11 @@ mod tests {
         c.muted = true;
         c.muted_until = 99;
         c.lists = vec!["Work".into(), "Family".into()];
+        c.theme = crate::store::ChatTheme::Moss;
         let v = encode(&c);
         let mut d = crate::store::seed::chat(1, crate::store::ChatKind::Group, "x");
         apply(&format!("{v};z=7"), &mut d);
+        assert_eq!(d.theme, crate::store::ChatTheme::Moss);
         assert_eq!(
             (d.archived, d.muted, d.muted_until, d.lists.clone()),
             (

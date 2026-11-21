@@ -100,9 +100,8 @@ pub struct ContactBook(pub Vec<SavedContact>);
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ChatScenes(pub HashMap<ChatId, u64>);
 
-/// The per-chat record key. mock: `<chat>` is the hex of the peer's
-/// account ID or the group ID (PROTOCOL §10.2); the mock's chat ids stand
-/// in until app-core has real ones.
+/// The per-chat record key: `<chat>` is the chat's ID, derived from the peer's account ID or
+/// the group ID (`backend::chat::ui_id`), the same on each of the user's devices.
 pub fn chat_key(chat: ChatId, name: &str) -> String {
     format!("c/{chat:032x}/{name}")
 }
@@ -152,8 +151,20 @@ impl Store {
             .collect();
         self.book().set(ContactBook(sorted_az(book)));
         self.scenes().set(ChatScenes(scenes));
-        // Real chats' list state another device wrote (D-0163).
+        // People the user muted nudges from, as the records say (D-0184).
+        let muted: std::collections::HashSet<ChatId> = records::under("c/")
+            .iter()
+            .filter(|(_, v)| v == "off")
+            .filter_map(|(k, _)| chat_of_key(k, "nudges"))
+            .collect();
+        self.contacts.update(|cs| {
+            for c in cs.iter_mut().filter(|c| crate::backend::chat::owns(c.id)) {
+                c.nudges_off = muted.contains(&c.id);
+            }
+        });
+        // Real chats' list state another device wrote (D-0163), and their stars (D-0184).
         crate::backend::chat_state::reload(*self);
+        crate::backend::chat::apply_stars(*self);
         // Groups the account joined on another device (D-0167).
         crate::backend::group_sync::join_missing(*self);
     }

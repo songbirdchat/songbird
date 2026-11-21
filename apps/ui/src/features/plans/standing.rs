@@ -101,9 +101,15 @@ fn standing_page() -> Screen {
                     if !ready() {
                         return;
                     }
-                    s.appeal(&message.get_untracked());
-                    sent.set(true);
-                    toast("Appeal sent. A moderator will review it.");
+                    // Said only once the server has it (D-0184).
+                    s.appeal(&message.get_untracked(), move |ok| {
+                        if ok {
+                            let _ = sent.try_set(true);
+                            toast("Appeal sent. A moderator will review it.");
+                        } else {
+                            toast("Your appeal couldn't be sent. Check your connection and try again.");
+                        }
+                    });
                 })
                 .disabled(move || !ready()),
             ),

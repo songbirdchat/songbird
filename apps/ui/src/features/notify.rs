@@ -194,7 +194,8 @@ fn watch(
 /// tray would, then has the first direct contact write and, later, call: to
 /// see the notifications on screen without driving the UI (D-0098).
 pub fn demo_from_env() {
-    let preview = crate::PREVIEW_BUILD;
+    // The demo fixtures only: a real account's chats never get made-up messages (D-0184).
+    let preview = crate::store::demo();
     // The environment, or (emulators and devices, which pass none through) a
     // `songbird-demo-arrivals` file in the app's data folder.
     let from_file =

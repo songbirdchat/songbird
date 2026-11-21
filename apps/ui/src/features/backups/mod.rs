@@ -532,8 +532,10 @@ fn backups_on(s: Store) -> View {
                         move || match problem() {
                             Some(BackupProblem::StorageFull) => choose_open.set(true),
                             Some(BackupProblem::Other) => s.back_up_now(),
+                            // Signed out of the destination: choose it again (its sign-in
+                            // happens there). Only the demo says it signed in by itself.
+                            _ if !crate::store::demo() => choose_open.set(true),
                             _ => {
-                                // mock: the provider's sign-in sheet (app-core `connect_destination`).
                                 s.back_up_now();
                                 toast(format!("Signed in to {}", dest().label()));
                             }

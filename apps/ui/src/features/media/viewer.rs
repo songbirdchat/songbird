@@ -111,7 +111,7 @@ pub(super) fn viewer_page(chat: ChatId, start: MsgId) -> Screen {
     on_key("right", move |_| go(1));
     on_key("plus", move |_| set_zoom(zoom.get_untracked() + 0.5));
     on_key("minus", move |_| set_zoom(zoom.get_untracked() - 0.5));
-    // mock: playback; the real player reports its position.
+    // The demo's stand-in playback (a real video's player keeps its own position).
     set_interval(Duration::from_millis(250), move || {
         if playing.get_untracked() {
             let secs = match s.message(chat, current.get_untracked()).map(|m| m.body) {
@@ -139,6 +139,11 @@ pub(super) fn viewer_page(chat: ChatId, start: MsgId) -> Screen {
     let has = move |delta: i32| step(&items.get(), current.get(), delta).is_some();
     let is_video =
         move || msg.with(|m| matches!(m.as_ref().map(|m| &m.body), Some(Body::Video { .. })));
+    // A real video plays in the platform's player with its own controls and position; only
+    // the demo's stand-in has the simulated scrubber (D-0184).
+    let demo_video = move || {
+        is_video() && !crate::backend::chat::is_media(current.get())
+    };
 
     let stage = view()
         .flex_1()
@@ -205,7 +210,7 @@ pub(super) fn viewer_page(chat: ChatId, start: MsgId) -> Screen {
                 .child(top_bar(s, msg, counter, zoom, set_zoom))
                 .child(stage)
                 .child(caption(msg))
-                .child(when(is_video, move || scrubber(msg, playing, position)))
+                .child(when(demo_video, move || scrubber(msg, playing, position)))
                 .child(action_bar(s, chat, msg, current, items, forward_open))
                 .child(app_sheet(
                     forward_open,
@@ -423,7 +428,7 @@ fn caption(msg: Memo<Option<Message>>) -> View {
     )
 }
 
-/// Mock scrubber: play or pause, position and length.
+/// The demo video's scrubber: play or pause, position and length.
 fn scrubber(msg: Memo<Option<Message>>, playing: Signal<bool>, position: Signal<f32>) -> View {
     let secs = move || match msg.with(|m| m.as_ref().map(|m| m.body.clone())) {
         Some(Body::Video { secs, .. }) => secs,

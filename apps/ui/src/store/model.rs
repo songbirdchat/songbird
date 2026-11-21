@@ -66,7 +66,7 @@ pub struct Member {
 }
 
 /// What a group's roles may do (owners and admins toggle these).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GroupPermissions {
     pub members_edit_info: bool,
     pub members_add: bool,

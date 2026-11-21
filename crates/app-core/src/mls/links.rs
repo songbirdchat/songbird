@@ -50,6 +50,18 @@ impl<N: Net> Messenger<N> {
     /// Makes an invite link for a group: publishes its proof key in the roles (a commit), then
     /// registers it (`POST /v1/groups/links`). `approval`: joins wait for an admin.
     pub async fn create_link(&mut self, gid: &[u8; 16], approval: bool) -> Result<String> {
+        self.create_link_with(gid, approval, 0, 0).await
+    }
+
+    /// [`Self::create_link`] with limits the server enforces: the link stops working after
+    /// `ttl_s` seconds (0: never, at most a year) or `max_uses` joins (0: any) (§6.8).
+    pub async fn create_link_with(
+        &mut self,
+        gid: &[u8; 16],
+        approval: bool,
+        ttl_s: u64,
+        max_uses: u32,
+    ) -> Result<String> {
         use aws_lc_rs::signature::KeyPair as _;
         let link = GroupLink {
             handle: *random::<16>()?,
@@ -71,8 +83,8 @@ impl<N: Net> Messenger<N> {
         body.extend_from_slice(&crate::crypto::sha256(&[
             derive(&link.secret, b"auth")?.as_ref()
         ]));
-        body.extend_from_slice(&0u64.to_be_bytes());
-        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&ttl_s.to_be_bytes());
+        body.extend_from_slice(&max_uses.to_be_bytes());
         body.push(u8::from(approval));
         let (status, _) = self.net.api("POST", "/v1/groups/links", body).await?;
         if status != 204 && status != 200 {
@@ -81,7 +93,112 @@ impl<N: Net> Messenger<N> {
         let url = link.to_link();
         self.store
             .put_secret(&format!("group_link.{}", hex(gid)), url.as_bytes())?;
+        // Its limits, to show them: when it expires (ms, 0: never), how many may join, approval.
+        let expires = if ttl_s == 0 {
+            0
+        } else {
+            crate::messenger::now_ms().saturating_add(ttl_s.saturating_mul(1000))
+        };
+        let mut opts = expires.to_be_bytes().to_vec();
+        opts.extend_from_slice(&max_uses.to_be_bytes());
+        opts.push(u8::from(approval));
+        self.store
+            .put_secret(&format!("group_link_opts.{}", hex(gid)), &opts)?;
         Ok(url)
+    }
+
+    /// The limits of the link this device made for a group: (expires at ms, 0: never; most
+    /// joins, 0: any; joins wait for approval).
+    pub fn group_link_limits(&self, gid: &[u8; 16]) -> Result<Option<(u64, u32, bool)>> {
+        Ok(self
+            .store
+            .secret(&format!("group_link_opts.{}", hex(gid)))?
+            .and_then(|v| {
+                let e = u64::from_be_bytes(v.get(..8)?.try_into().ok()?);
+                let n = u32::from_be_bytes(v.get(8..12)?.try_into().ok()?);
+                Some((e, n, v.get(12) == Some(&1)))
+            }))
+    }
+
+    /// The group's roles as this device sees them: its policy and every account whose role is
+    /// not the default.
+    pub fn group_roles(&self, gid: &[u8; 16]) -> Result<songbird_groups::roles::Roles> {
+        let group = self.load_group(gid)?;
+        songbird_groups::ds::roles_in(group.extensions()).map_err(|_| Error::Malformed)
+    }
+
+    /// Gives `account` another role in a group (a commit every member checks against the
+    /// roles rule, §6.6: an admin who outranks both roles, or an owner).
+    pub async fn set_role(
+        &mut self,
+        gid: &[u8; 16],
+        account: &[u8; 16],
+        role: songbird_groups::roles::Role,
+    ) -> Result<()> {
+        let mut roles = self.group_roles(gid)?;
+        let who = songbird_types::AccountId::from_bytes(*account);
+        if role == roles.policy.default_role {
+            roles.explicit.remove(&who);
+        } else {
+            roles.explicit.insert(who, role);
+        }
+        let line =
+            super::client::LogLine::of(songbird_content::schema::group_update::Kind::RoleChanged, &[*account]);
+        self.commit_roles_logged(gid, &roles, line).await
+    }
+
+    /// Changes a group's policy ("only admins can send", "only admins can edit group info",
+    /// approving new members): a commit only admins may make (§6.6).
+    pub async fn set_policy(
+        &mut self,
+        gid: &[u8; 16],
+        change: impl FnOnce(&mut songbird_groups::roles::Policy),
+    ) -> Result<()> {
+        let mut roles = self.group_roles(gid)?;
+        let before = roles.policy;
+        change(&mut roles.policy);
+        if roles.policy == before {
+            return Ok(());
+        }
+        self.commit_roles(gid, &roles).await
+    }
+
+    /// Renames a group or changes its description: a group update every member shows, from
+    /// those its roles let edit the info (checked here and by every receiver).
+    pub async fn set_group_info(
+        &mut self,
+        gid: &[u8; 16],
+        title: Option<&str>,
+        about: Option<&str>,
+    ) -> Result<()> {
+        use songbird_content::schema::{DataMessage, GroupUpdate, data_message, group_update};
+        let me = songbird_types::AccountId::from_bytes(self.local.account);
+        if !self.group_roles(gid)?.may_edit_info(&me) {
+            return Err(Error::Server(403));
+        }
+        let changes = [
+            (title, group_update::Kind::TitleChanged, "group_title"),
+            (about, group_update::Kind::DescriptionChanged, "group_about"),
+        ];
+        for (value, kind, key) in changes {
+            let Some(value) = value else { continue };
+            let update = GroupUpdate {
+                kind: kind.into(),
+                actor: self.local.account.to_vec(),
+                subjects: Vec::new(),
+                value: value.into(),
+                log_key: Vec::new(),
+            };
+            let data = DataMessage {
+                group_id: gid.to_vec(),
+                kind: Some(data_message::Kind::GroupUpdate(update)),
+                ..Default::default()
+            };
+            self.send_group_data(gid, data, "").await?;
+            self.store
+                .put_secret(&format!("{key}.{}", hex(gid)), value.as_bytes())?;
+        }
+        Ok(())
     }
 
     /// The link this device made for a group, if any.
@@ -120,14 +237,23 @@ impl<N: Net> Messenger<N> {
         gid: &[u8; 16],
         roles: &songbird_groups::roles::Roles,
     ) -> Result<()> {
+        // A link's proof key or the policy in the roles: a settings change in the log.
+        self.commit_roles_logged(gid, roles, super::client::LogLine::settings())
+            .await
+    }
+
+    async fn commit_roles_logged(
+        &mut self,
+        gid: &[u8; 16],
+        roles: &songbird_groups::roles::Roles,
+        line: super::client::LogLine,
+    ) -> Result<()> {
         let ds = self
             .store
             .secret("ds_key")?
             .and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok())
             .ok_or(Error::NoSession)?;
         let exts = super::client::context_extensions(roles, &ds)?;
-        // A link's proof key in the roles: a settings change in the log.
-        let line = super::client::LogLine::settings();
         self.commit_with(gid, Vec::new(), Vec::new(), Some(exts), Some(line))
             .await
     }

@@ -91,6 +91,8 @@ fn camera_components_linux(components: &nsh_platform_linux::Components) {
 /// or the app, and the layers over everything (calls, toasts).
 #[component]
 pub fn App() -> impl IntoElement {
+    // The app's log for support requests (phones have no `main` to install it; D-0184).
+    backend::applog::init();
     // A panic leaves a scrubbed report on this device (sent only if allowed; D-0170).
     backend::crash::install();
     let s = Store::new();

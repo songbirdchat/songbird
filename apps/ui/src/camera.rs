@@ -3,9 +3,9 @@
 //! running).
 //!
 //! The platform camera is `songbird_camera::platform()`. Tests install a
-//! [`songbird_camera::fake::FakeCamera`]. Where a platform has no camera module yet, a preview
-//! build installs a demo fake that "sees" a code after a moment (`// mock:`), and a release
-//! build says there is no camera.
+//! [`songbird_camera::fake::FakeCamera`]. Where a platform has no camera module yet, the demo
+//! fixtures (`store::demo()`) install a fake that "sees" a code after a moment; everyone else,
+//! a real account on a preview build included, is told there is no camera.
 
 use std::{
     cell::RefCell,
@@ -53,13 +53,14 @@ pub fn install(backend: Option<Arc<dyn Backend>>, native_preview: bool) {
 pub fn install_for_app() {
     match songbird_camera::platform() {
         Some(b) => install(Some(b), true),
-        None if crate::PREVIEW_BUILD => install(Some(Arc::new(demo())), false),
+        // The demo fixtures only: a real account never gets a camera that makes codes up.
+        None if crate::store::demo() => install(Some(Arc::new(demo())), false),
         None => install(None, false),
     }
 }
 
-/// mock: where a platform has no camera module yet, preview builds show a scanner that reads a
-/// code after a moment, as the mocked flows did before the camera existed.
+/// The demo fixtures' camera (`store::demo()`), where a platform has no camera module yet: a
+/// scanner that reads a code after a moment. A real account sees "no camera" instead (D-0184).
 fn demo() -> songbird_camera::fake::FakeCamera {
     let fake = songbird_camera::fake::FakeCamera::new();
     fake.photo_gives(Ok(Still {
@@ -76,8 +77,8 @@ thread_local! {
     static DEMO: RefCell<Option<songbird_camera::fake::FakeCamera>> = const { RefCell::new(None) };
 }
 
-/// mock: in a preview build without a platform camera, the demo camera "sees" `text` after a
-/// moment (the code the scanning screen's mock expects). Does nothing elsewhere.
+/// The demo fixtures' camera (installed only for `store::demo()` without a platform camera)
+/// "sees" `text` after a moment. Does nothing elsewhere.
 pub fn demo_shows(text: String) {
     if let Some(fake) = DEMO.with(|d| d.borrow().clone()) {
         set_timeout(Duration::from_millis(2200), move || fake.show_code(&text));

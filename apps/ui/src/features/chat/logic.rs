@@ -310,10 +310,15 @@ pub fn can_forward_to_more(chosen: usize) -> bool {
     chosen < FORWARD_LIMIT
 }
 
-/// Whether the user can edit `m` (their own text; the 15-minute window is
-/// app-core's, the mock always allows it).
+/// How long after sending the user may edit a message, in minutes.
+pub const EDIT_WINDOW: i64 = 15;
+
+/// Whether the user can edit `m`: their own text, sent within the last
+/// [`EDIT_WINDOW`] minutes.
 pub fn editable(m: &Message) -> bool {
-    m.mine() && matches!(m.body, Body::Text(_) | Body::Link { .. })
+    m.mine()
+        && matches!(m.body, Body::Text(_) | Body::Link { .. })
+        && crate::store::now() - m.at <= EDIT_WINDOW
 }
 
 /// The text Copy puts on the clipboard.
@@ -549,6 +554,9 @@ mod tests {
     fn only_own_text_is_editable() {
         assert!(editable(&text(1, None, 0)));
         assert!(!editable(&text(1, Some(3), 0)));
+        // Within the window, not after it.
+        assert!(editable(&text(1, None, -EDIT_WINDOW)));
+        assert!(!editable(&text(1, None, -EDIT_WINDOW - 1)));
         assert!(!editable(&msg(
             1,
             None,

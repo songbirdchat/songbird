@@ -192,6 +192,14 @@ pub enum Received {
     },
     /// A contact nudged this account (only from the attention class, [`Messenger::receive_attention`]).
     Nudge { account: [u8; 16] },
+    /// Another of this account's devices answered a message request from `account`: accepted
+    /// it, or deleted the chat (gone from this device's store too).
+    RequestAnswered {
+        /// The requester.
+        account: [u8; 16],
+        /// Accepted (else deleted).
+        accepted: bool,
+    },
     /// A system notice was handled (prekeys refilled, the device list refreshed).
     System,
     /// Nothing to show (a duplicate, a dropped or unreadable envelope).
@@ -475,7 +483,14 @@ impl<N: Net> Messenger<N> {
 
     /// Accepts a message request: shares this account's profile key with the requester, who
     /// then sends as a contact (PROTOCOL §5.10). Replying to a request accepts it too.
+    ///
+    /// Accepted here at once (the requester is told best effort: a failure leaves them sending
+    /// as a request until this account writes, which shares the key too); this account's other
+    /// devices are told, so the request is answered everywhere.
     pub async fn accept_request(&mut self, from: &[u8; 16]) -> Result<()> {
+        self.store.set_accepted(from)?;
+        self.sync_request_answer(from, schema::request_response::Action::Accept)
+            .await;
         let rr = schema::RequestResponse {
             action: schema::request_response::Action::Accept.into(),
             chat: Some(ChatRef {
@@ -486,6 +501,57 @@ impl<N: Net> Messenger<N> {
         let devices = self.devices_of(from, false).await?;
         self.send_silent_with(from, &devices, Body::RequestResponse(rr), true)
             .await
+    }
+
+    /// Deletes a message request: the chat goes from this device and this account's other
+    /// devices; nothing reaches the requester (PROTOCOL §5.10).
+    pub async fn delete_request(&mut self, from: &[u8; 16]) -> Result<()> {
+        self.store.delete_chat(from)?;
+        self.sync_request_answer(from, schema::request_response::Action::Delete)
+            .await;
+        Ok(())
+    }
+
+    /// Whether `account`'s 1:1 chat is a message request: someone this account never wrote to
+    /// and whose request it has not accepted (PROTOCOL §5.10). Never this account itself.
+    pub fn is_request(&self, account: &[u8; 16]) -> Result<bool> {
+        Ok(*account != self.local.account
+            && !self.store.is_accepted(account)?
+            && !self.store.is_blocked(account)?)
+    }
+
+    /// Deletes one message from this device only (a failed send before it is sent again, or
+    /// "delete for me"); nobody else is told.
+    pub fn delete_for_me(&mut self, author: &[u8; 16], id: &[u8; 16]) -> Result<()> {
+        self.store.delete_message(author, id)
+    }
+
+    /// Clears a chat on this device only: its messages go, the chat stays.
+    pub fn clear_chat(&mut self, chat: &[u8; 16]) -> Result<()> {
+        self.store.clear_chat(chat)
+    }
+
+    /// Deletes a chat from this device only (its messages, files and everything kept of them).
+    pub fn delete_chat(&mut self, chat: &[u8; 16]) -> Result<()> {
+        self.store.delete_chat(chat)
+    }
+
+    /// Tells this account's other devices how a request was answered (best effort).
+    async fn sync_request_answer(
+        &mut self,
+        from: &[u8; 16],
+        action: schema::request_response::Action,
+    ) {
+        let sync = SyncMessage {
+            kind: Some(sync_message::Kind::RequestResponse(schema::RequestResponse {
+                action: action.into(),
+                chat: Some(ChatRef {
+                    account: from.to_vec(),
+                    group_id: Vec::new(),
+                }),
+            })),
+        };
+        let _ = self.send_own(Body::Sync(sync)).await;
     }
 
     /// Signs and uploads this account's device list from the server's view (the primary, with
@@ -975,8 +1041,28 @@ impl<N: Net> Messenger<N> {
     /// Reports the newest `n` messages from `author` (PROTOCOL §5.14), each with its proof: the
     /// server learns those messages and who sent them, nothing else. Answers how many it took.
     pub async fn report(&mut self, author: &[u8; 16], reason: u8, n: u32) -> Result<usize> {
+        let franks = self.store.franks(author, n)?;
+        self.send_reports(franks.into_iter().map(|f| (*author, f)), reason)
+            .await
+    }
+
+    /// Reports a group or channel: the newest `n` franked messages other members sent in it,
+    /// each against its own sender (PROTOCOL §5.14: a group's shared body may be reported by any
+    /// member). Answers how many were accepted.
+    pub async fn report_group(&mut self, gid: &[u8; 16], reason: u8, n: u32) -> Result<usize> {
+        let me = self.local.account;
+        let franks = self.store.franks_in(gid, &me, n)?;
+        self.send_reports(franks, reason).await
+    }
+
+    async fn send_reports(
+        &mut self,
+        franks: impl IntoIterator<Item = ([u8; 16], crate::store::Frank)>,
+        reason: u8,
+    ) -> Result<usize> {
         let mut sent = 0;
-        for (stamp, fk, content) in self.store.franks(author, n)? {
+        for (author, (stamp, fk, content)) in franks {
+            let author = &author;
             let mut body = vec![1, reason];
             body.extend_from_slice(&stamp);
             body.extend_from_slice(author);
@@ -1106,7 +1192,10 @@ impl<N: Net> Messenger<N> {
     ) -> Result<()> {
         let franking = *random::<32>()?;
         // Writing to someone shares this account's profile key with them (a request is an
-        // invitation to talk; a reply accepts theirs).
+        // invitation to talk; a reply accepts theirs): their messages are no longer a request.
+        if *to != self.local.account {
+            self.store.set_accepted(to)?;
+        }
         let profile_key = Some(*self.profile_key()?);
         let (padded, commitment) =
             songbird_content::seal_with_profile_key(content, Some(franking), profile_key)
@@ -1942,13 +2031,13 @@ impl<N: Net> Messenger<N> {
                 }
                 // What reporting it needs, exactly as received (§5.14).
                 if let (Some(st), Some(fk)) = (stamp, opened.franking_key) {
-                    let mut b = Vec::with_capacity(80);
-                    b.extend_from_slice(&st.key_id);
-                    b.extend_from_slice(&st.commitment);
-                    b.extend_from_slice(&st.stamped_at_ms.to_be_bytes());
-                    b.extend_from_slice(&st.tag);
-                    self.store
-                        .put_frank(&account, &row.id, &b, &fk, &opened.content_bytes)?;
+                    self.store.put_frank(
+                        &account,
+                        &row.id,
+                        &stamp_bytes(&st),
+                        &fk,
+                        &opened.content_bytes,
+                    )?;
                 }
                 let _ = self
                     .send_receipt(&account, &[row.id], receipt_message::Kind::Delivered)
@@ -2041,11 +2130,45 @@ impl<N: Net> Messenger<N> {
                 else {
                     return Ok(Received::Nothing);
                 };
+                // Another of this account's devices wrote to them: accepted here too.
+                if chat != self.local.account {
+                    self.store.set_accepted(&chat)?;
+                }
                 let row = data_row(&c, data, chat, account, Status::Sent)?;
                 if self.store.insert_message(&row, false)? {
                     Ok(Received::Message(row))
                 } else {
                     Ok(Received::Nothing)
+                }
+            }
+            Some(Body::Sync(SyncMessage {
+                kind: Some(sync_message::Kind::RequestResponse(rr)),
+            })) if account == self.local.account && dec.device != self.local.device => {
+                let Some(from) = rr
+                    .chat
+                    .as_ref()
+                    .and_then(|c| <[u8; 16]>::try_from(c.account.as_slice()).ok())
+                    .filter(|a| *a != self.local.account)
+                else {
+                    return Ok(Received::Nothing);
+                };
+                match schema::request_response::Action::try_from(rr.action) {
+                    Ok(schema::request_response::Action::Accept) => {
+                        self.store.set_accepted(&from)?;
+                        Ok(Received::RequestAnswered {
+                            account: from,
+                            accepted: true,
+                        })
+                    }
+                    Ok(schema::request_response::Action::Delete) => {
+                        self.store.delete_chat(&from)?;
+                        Ok(Received::RequestAnswered {
+                            account: from,
+                            accepted: false,
+                        })
+                    }
+                    // Blocks arrive as the block list; a report changes nothing here.
+                    _ => Ok(Received::Nothing),
                 }
             }
             _ => Ok(Received::Nothing),
@@ -2084,6 +2207,16 @@ impl<N: Net> Messenger<N> {
         }
         Ok(Received::System)
     }
+}
+
+/// A franking stamp as a report carries it: key ID, commitment, time, tag (§5.14).
+pub(crate) fn stamp_bytes(st: &Stamp) -> Vec<u8> {
+    let mut b = Vec::with_capacity(80);
+    b.extend_from_slice(&st.key_id);
+    b.extend_from_slice(&st.commitment);
+    b.extend_from_slice(&st.stamped_at_ms.to_be_bytes());
+    b.extend_from_slice(&st.tag);
+    b
 }
 
 /// The attachment pointers of a stored message's content.

@@ -416,6 +416,25 @@ pub struct DroppedFile {
 /// The file name of a `file:` URL, percent-decoded.
 pub fn file_name(uri: &str) -> String {
     let last = uri.trim_end_matches('/').rsplit('/').next().unwrap_or(uri);
+    percent_decoded(last)
+}
+
+/// The local path of a `file:` URL (`file:///Users/a/b%20c.pdf`), percent-decoded; `None`
+/// for any other URL.
+pub fn file_path(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri
+        .strip_prefix("file://localhost")
+        .or_else(|| uri.strip_prefix("file://"))?;
+    let path = percent_decoded(rest);
+    // `file:///C:/x` on Windows: the drive letter follows the slash.
+    let path = match path.as_bytes() {
+        [b'/', d, b':', ..] if d.is_ascii_alphabetic() && cfg!(windows) => path[1..].to_string(),
+        _ => path,
+    };
+    (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+}
+
+fn percent_decoded(last: &str) -> String {
     let bytes = last.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -535,7 +554,16 @@ pub fn desktop_settings() {
 
 #[cfg(test)]
 mod tests {
-    use super::file_name;
+    use super::{file_name, file_path};
+
+    #[test]
+    fn file_paths_are_decoded() {
+        assert_eq!(
+            file_path("file:///Users/ana/Floor%20plan%20v3.pdf"),
+            Some(std::path::PathBuf::from("/Users/ana/Floor plan v3.pdf"))
+        );
+        assert_eq!(file_path("https://songbird.chat/x"), None);
+    }
 
     #[test]
     fn file_names_are_decoded() {

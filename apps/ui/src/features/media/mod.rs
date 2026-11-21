@@ -8,7 +8,7 @@ mod viewer;
 
 pub use packs::packs;
 pub use storage::{manage_storage, storage_and_data};
-pub use upload::{Upload, ring_markup, simulate_upload, upload_progress};
+pub use upload::{Upload, ring_markup, upload_progress};
 pub use viewer::{fit, media_ids, save_blocked, step};
 
 use crate::{

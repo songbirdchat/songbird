@@ -13,7 +13,7 @@
 
 mod capsule;
 mod model;
-mod new_chat;
+pub(crate) mod new_chat;
 mod pages;
 mod pinned;
 mod row;

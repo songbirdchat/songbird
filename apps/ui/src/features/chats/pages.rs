@@ -176,8 +176,11 @@ fn request_card(s: Store, req: Memo<Option<model::RequestRow>>) -> impl IntoElem
                 "Report and block",
                 move || {
                     animate_change();
+                    // A real report says how it went once the server answers.
+                    if !crate::backend::chat::owns(id) {
+                        toast("Reported and blocked");
+                    }
                     s.report_request(id);
-                    toast("Reported and blocked");
                 },
             );
         }

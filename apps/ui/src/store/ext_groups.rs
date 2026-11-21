@@ -2,9 +2,9 @@
 //! member change log, leaving, communities, following channels, packs and
 //! the media the user keeps.
 //!
-//! **Mock.** The state the store has no field for lives in one global
-//! beside it ([`GroupsState`]); app-core (A2) will own it. Every intent is
-//! the call app-core will take over, marked `// mock:` where it differs.
+//! The state the store has no field for lives in one global beside it
+//! ([`GroupsState`]). A real group's intents reach app-core (roles, policy,
+//! info, links: D-0148, D-0184); the demo's stay here.
 
 use std::{collections::HashSet, time::Duration};
 
@@ -127,12 +127,37 @@ impl InviteUses {
 pub struct InviteSettings {
     pub expiry: InviteExpiry,
     pub uses: InviteUses,
-    /// People who joined with the current link.
+    /// People who joined with the current link (the demo's count; the server keeps a real
+    /// link's and doesn't tell).
     pub used: u32,
+    /// A real group's link: the server enforces these limits (D-0184).
+    pub limits_real: bool,
+    /// When a real link stops working (unix ms; 0: never).
+    pub expires_ms: u64,
 }
 
 /// One line under the link: "Never expires · No limit".
 pub fn invite_summary(s: &InviteSettings) -> String {
+    if s.limits_real {
+        // What the server enforces, without a count it doesn't share.
+        let expiry = match s.expires_ms {
+            0 => "Never expires".to_string(),
+            ms => {
+                let left = ms.saturating_sub(crate::store::now_ms()) / 3_600_000;
+                match left {
+                    0 => "Expires within the hour".to_string(),
+                    1..=47 => format!("Expires in {left} h"),
+                    h => format!("Expires in {} days", h / 24),
+                }
+            }
+        };
+        let uses = match s.uses.limit() {
+            None => "No limit on joins".to_string(),
+            Some(1) => "1 person can join with it".to_string(),
+            Some(n) => format!("Up to {n} people can join with it"),
+        };
+        return format!("{expiry} · {uses}");
+    }
     let expiry = match s.expiry {
         InviteExpiry::Never => "Never expires".to_string(),
         e => format!("Expires in {}", e.label()),
@@ -175,9 +200,8 @@ pub struct DirectoryChannel {
     pub followers: u32,
 }
 
-/// Mock: the directory app-core will fetch. Public channels are an owner
-/// decision after legal review (DECISIONS.md, D-0065 §4), so these are
-/// sample entries.
+/// The demo's channel directory. Public channels are an owner decision after legal review
+/// (DECISIONS.md, D-0065 §4), so there is no directory: a real account gets none.
 pub fn directory() -> Vec<DirectoryChannel> {
     // There is no public channel directory (public channels await the owner's legal review,
     // D-0065 §4): real accounts find channels by their invite links. The list is the demo's.
@@ -555,8 +579,12 @@ impl Store {
         groups_state().update(|g| g.history.push((chat, MemberChange { at: now(), text })));
     }
 
-    /// Makes `contact` an admin or a member again, with a system line.
+    /// Makes `contact` an admin or a member again, with a system line. A real group's change
+    /// is a commit every member checks against its roles (D-0184).
     pub fn change_role(&self, chat: ChatId, contact: ContactId, role: Role) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::set_group_role(chat, contact, role);
+        }
         self.set_role(chat, contact, role);
         let name = self.contact_name(Some(contact));
         let line = match role {
@@ -704,6 +732,55 @@ impl Store {
         });
     }
 
+    /// Changes a link's limits. A real group's link is made again with them, the server
+    /// enforcing its expiry and number of joins; the old link stops working.
+    pub fn change_invite_limits(&self, chat: ChatId, f: impl FnOnce(&mut InviteSettings)) {
+        self.set_invite_settings(chat, f);
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::ensure_link(*self, chat, true);
+        }
+    }
+
+    /// Changes a group's permissions (and whether only admins send). A real group's are its
+    /// policy: a commit only admins may make, checked by every member (D-0184).
+    pub fn set_group_permissions(
+        &self,
+        chat: ChatId,
+        f: impl FnOnce(&mut super::GroupPermissions, &mut bool),
+    ) {
+        let Some(c) = self.chat(chat) else { return };
+        let (mut perms, mut announcement) = (c.permissions, c.announcement_only);
+        let approval_before = perms.approve_joins;
+        f(&mut perms, &mut announcement);
+        self.update_chat(chat, |c| {
+            c.permissions = perms;
+            c.announcement_only = announcement;
+        });
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::set_group_policy(chat, perms);
+            // Approval is also the link's, registered with it: a new link carries the change.
+            if perms.approve_joins != approval_before && !c.invite_link.is_empty() {
+                crate::backend::chat::ensure_link(*self, chat, true);
+            }
+        }
+    }
+
+    /// Renames a group or changes its description (a real group's members are told).
+    pub fn set_group_info(&self, chat: ChatId, title: String, about: String) {
+        let Some(c) = self.chat(chat) else { return };
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::set_group_info(
+                chat,
+                (c.title != title).then(|| title.clone()),
+                (c.about != about).then(|| about.clone()),
+            );
+        }
+        self.update_chat(chat, |c| {
+            c.title = title;
+            c.about = about;
+        });
+    }
+
     /// A new link; the old one stops working at once.
     pub fn reset_invite(&self, chat: ChatId) {
         self.reset_invite_link(chat);
@@ -812,7 +889,11 @@ impl Store {
         })
     }
 
+    /// Unfollows a channel: a real one is left (the server stops sending it), then deleted here.
     pub fn unfollow(&self, chat: ChatId) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::leave_group(chat);
+        }
         self.delete_chat(chat);
     }
 
@@ -853,6 +934,10 @@ impl Store {
         if crate::backend::packs::live() {
             crate::backend::packs::install(link);
             return Ok(());
+        }
+        // Only the demo walks a made-up install; a real account not registered yet can't fetch.
+        if !super::demo() {
+            return Err("Finish creating your account first.");
         }
         let state = groups_state();
         state.update(|g| {
@@ -989,8 +1074,19 @@ mod tests {
             expiry: InviteExpiry::Week,
             uses: InviteUses::Ten,
             used: 9,
+            ..InviteSettings::default()
         };
         assert_eq!(invite_summary(&s), "Expires in 7 days · 1 join left");
+        // A real link: the server's limits, never a made-up count of joins.
+        let real = InviteSettings {
+            uses: InviteUses::Ten,
+            limits_real: true,
+            ..InviteSettings::default()
+        };
+        assert_eq!(
+            invite_summary(&real),
+            "Never expires · Up to 10 people can join with it"
+        );
     }
 
     #[test]

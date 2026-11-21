@@ -469,8 +469,8 @@ pub fn parental() {
                 section(
                     "Supervising",
                     vec![
-                        Row::new(ext.with_untracked(|x| x.parental.child_name.clone()))
-                            .leading(avatar(ext.with_untracked(|x| x.parental.child_name.clone()), 7, 36.0))
+                        Row::new(child_name(ext))
+                            .leading(avatar(child_name(ext), 7, 36.0))
                             .subtitle("Linked in person · rules on")
                             .chevron()
                             .on_press(rules)
@@ -615,8 +615,16 @@ pub fn ask_approval() {
 /// both screens then show the same six digits, which parent and child
 /// compare. The child's age (entered on the child's phone) and the
 /// country's age of digital consent set the day supervision ends.
+/// The supervised child's name as this device knows it ("Your child" when it doesn't).
+fn child_name(ext: Signal<crate::store::SettingsExt>) -> String {
+    let n = ext.with_untracked(|x| x.parental.child_name.clone());
+    if n.is_empty() { "Your child".into() } else { n }
+}
+
 fn link_child() {
-    if crate::backend::is_live() && crate::backend::registered() {
+    // A real account always links two phones through the camera; only the demo fixtures
+    // play both sides on one device.
+    if !crate::store::demo() || crate::backend::is_live() && crate::backend::registered() {
         return link_child_live();
     }
     // The preview: both sides on this device (no server, no second phone).
@@ -1129,7 +1137,7 @@ fn rules() {
         let ext = s.ext();
         let p =
             move |f: fn(&crate::store::ParentalRules) -> bool| move || ext.with(|x| f(&x.parental));
-        let name = ext.with_untracked(|x| x.parental.child_name.clone());
+        let name = child_name(ext);
         view()
             .child(view().px_4().pt_4().child(banner(
                 Tone::Secure,

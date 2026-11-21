@@ -180,7 +180,7 @@ fn start_real(call: &ActiveCall) {
     }
 }
 
-/// Mock: makes `chat` call the user, as a push would (the Calls tab's
+/// The demo's ring: makes `chat` call the user, as a push would (the Calls tab's
 /// demo rows use it). The real ring comes from app-core's push handler.
 pub fn simulate_incoming(chat: ChatId, video: bool) {
     let s = store();

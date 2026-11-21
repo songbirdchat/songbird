@@ -599,6 +599,15 @@ impl<N: Net> Messenger<N> {
             .unwrap_or_default())
     }
 
+    /// The description this device knows for a group (empty: none).
+    pub fn group_about(&self, gid: &[u8; 16]) -> Result<String> {
+        Ok(self
+            .store
+            .secret(&format!("group_about.{}", hex(gid)))?
+            .map(|t| String::from_utf8_lossy(&t).into_owned())
+            .unwrap_or_default())
+    }
+
     /// Sends a text to a group.
     pub async fn send_group_text(&mut self, gid: &[u8; 16], text: &str) -> Result<[u8; 16]> {
         let message = songbird_content::schema::Message {
@@ -1284,6 +1293,28 @@ impl<N: Net> Messenger<N> {
                             title: String::new(),
                         });
                     }
+                    let kind = group_update::Kind::try_from(u.kind)
+                        .unwrap_or(group_update::Kind::Unspecified);
+                    // A new name or description only from those the roles let edit the group's
+                    // info ("only admins can edit group info", §6.6).
+                    if matches!(
+                        kind,
+                        group_update::Kind::TitleChanged | group_update::Kind::DescriptionChanged
+                    ) && songbird_groups::ds::roles_in(group.extensions())
+                        .is_ok_and(|r| !r.may_edit_info(&AccountId::from_bytes(*account)))
+                    {
+                        return Ok(Received::Nothing);
+                    }
+                    if kind == group_update::Kind::DescriptionChanged {
+                        self.store.put_secret(
+                            &format!("group_about.{}", hex(&gid)),
+                            u.value.as_bytes(),
+                        )?;
+                        return Ok(Received::GroupUpdated {
+                            group: gid,
+                            title: String::new(),
+                        });
+                    }
                     if !u.value.is_empty() {
                         self.store.put_secret(
                             &format!("group_title.{}", hex(&gid)),
@@ -1297,6 +1328,17 @@ impl<N: Net> Messenger<N> {
                 }
                 let row = data_row(&content, data, gid, *account, Status::Delivered)?;
                 if self.store.insert_message(&row, true)? {
+                    // What reporting it needs, exactly as received: a group's shared body may be
+                    // reported by any member (§5.14).
+                    if let (Some(st), Some(fk)) = (stamp, opened.franking_key) {
+                        self.store.put_frank(
+                            account,
+                            &row.id,
+                            &crate::messenger::stamp_bytes(&st),
+                            &fk,
+                            &opened.content_bytes,
+                        )?;
+                    }
                     Ok(Received::Message(row))
                 } else {
                     Ok(Received::Nothing)
@@ -1323,6 +1365,10 @@ pub(crate) struct LogLine {
 impl LogLine {
     pub(crate) fn settings() -> Self {
         Self::new(group_update::Kind::SettingsChanged, &[])
+    }
+
+    pub(crate) fn of(kind: group_update::Kind, subjects: &[[u8; 16]]) -> Self {
+        Self::new(kind, subjects)
     }
 
     fn new(kind: group_update::Kind, subjects: &[[u8; 16]]) -> Self {

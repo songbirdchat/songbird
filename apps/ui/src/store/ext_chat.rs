@@ -2,7 +2,8 @@
 //! one row, never cloning the whole chat) and the few intents the
 //! conversation needs beyond the shared store.
 //!
-//! **Mock.** As the rest of the store: app-core (A2) will own these.
+//! A real chat's intents reach app-core (`crate::backend::chat`); the demo's
+//! stay in memory.
 
 use super::*;
 
@@ -143,10 +144,9 @@ impl Store {
 
     // ------------------------------------------------------------ intents
 
-    /// Gives the conversation another theme (its canvas and the user's
-    /// bubbles). Only this device's view of the chat changes.
-    // mock: app-core syncs it to the user's other devices as an encrypted
-    // chat setting; the other people in the chat never see it.
+    /// Gives the conversation another theme (its canvas and the user's bubbles). A real chat's
+    /// follows the user to their other devices in its encrypted state record
+    /// (`backend::chat_state`); the other people in the chat never see it.
     pub fn set_chat_theme(&self, chat: ChatId, theme: ChatTheme) {
         if self.chat(chat).is_some_and(|c| c.theme != theme) {
             self.edit_chat(chat, |c| c.theme = theme);
@@ -162,10 +162,14 @@ impl Store {
                 }
             }
         });
+        crate::backend::chat::save_stars(*self, chat);
     }
 
     /// Deletes several messages from this device (multi-select).
     pub fn delete_messages_for_me(&self, chat: ChatId, ids: &[MsgId]) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::delete_for_me(ids);
+        }
         self.messages.update(|m| {
             if let Some(v) = m.get_mut(&chat) {
                 v.retain(|x| !ids.contains(&x.id));
@@ -182,9 +186,12 @@ impl Store {
         }
     }
 
-    /// Edits the user's text, keeping a link's preview when it has one.
-    // mock: app-core sends the edit as a new encrypted revision.
+    /// Edits the user's text, keeping a link's preview when it has one. A real chat's edit is
+    /// sent as a new encrypted revision (app-core `edit`).
     pub fn edit_message_text(&self, chat: ChatId, id: MsgId, text: String) {
+        if crate::backend::chat::owns(chat) && self.message(chat, id).is_some_and(|m| m.mine()) {
+            crate::backend::chat::edit(chat, id, text.clone());
+        }
         self.edit_message(chat, id, |m| {
             if !m.mine() {
                 return;
