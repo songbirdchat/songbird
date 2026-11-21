@@ -84,18 +84,22 @@ pub fn roles_page(chat: ChatId) {
                     .unwrap_or_default()
             })
         };
+        // A real group's pinning and deleting others' messages are fixed by the protocol
+        // (moderators and admins), not by its policy: shown, not switchable (D-0184).
+        let real = crate::backend::chat::owns(chat);
         let row = move |p: &'static Permission| {
+            let fixed = real && matches!(p.title, "Pin messages" | "Admins can delete others' messages");
             switch_row(
                 p.title,
-                p.explain,
+                if fixed { "Set by Songbird for every group: admins pin and delete others' messages." } else { p.explain },
                 move || ch.with(|c| c.as_ref().is_some_and(|c| (p.get)(&c.permissions))),
-                manage,
+                move || manage() && !fixed,
                 move |v| {
-                    s.update_chat(chat, |c| {
-                        (p.set)(&mut c.permissions, v);
+                    s.set_group_permissions(chat, |perms, announcement| {
+                        (p.set)(perms, v);
                         // "Send messages" and the announcement group are one setting.
                         if p.title == "Send messages" {
-                            c.announcement_only = !v;
+                            *announcement = !v;
                         }
                     })
                 },
@@ -123,9 +127,9 @@ pub fn roles_page(chat: ChatId) {
                         move || ch.with(|c| c.as_ref().is_some_and(|c| c.announcement_only)),
                         manage,
                         move |v| {
-                            s.update_chat(chat, |c| {
-                                c.announcement_only = v;
-                                c.permissions.members_send = !v;
+                            s.set_group_permissions(chat, |perms, announcement| {
+                                *announcement = v;
+                                perms.members_send = !v;
                             })
                         },
                     )]))
@@ -245,7 +249,7 @@ pub fn invite_link_page(chat: ChatId) {
                                     move || settings().expiry,
                                     move |v| {
                                         if manage() {
-                                            s.set_invite_settings(chat, |x| x.expiry = v)
+                                            s.change_invite_limits(chat, |x| x.expiry = v)
                                         }
                                     },
                                 ),
@@ -263,7 +267,7 @@ pub fn invite_link_page(chat: ChatId) {
                                     move || settings().uses,
                                     move |v| {
                                         if manage() {
-                                            s.set_invite_settings(chat, |x| x.uses = v)
+                                            s.change_invite_limits(chat, |x| x.uses = v)
                                         }
                                     },
                                 ),
@@ -275,7 +279,7 @@ pub fn invite_link_page(chat: ChatId) {
                         "An admin approves each person who uses the link.",
                         move || ch.with(|c| c.as_ref().is_some_and(|c| c.permissions.approve_joins)),
                         manage,
-                        move |v| s.update_chat(chat, |c| c.permissions.approve_joins = v),
+                        move |v| s.set_group_permissions(chat, |p, _| p.approve_joins = v),
                     )]))
                     .child(footnote(
                         "Anyone with the link sees the group's name and photo and can ask to join. The link itself never shows the group's messages.",

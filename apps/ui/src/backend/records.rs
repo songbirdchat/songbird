@@ -26,7 +26,7 @@ use songbird_proto::storage::{self as wire, Head, ID_LEN, Ids, Record, Write};
 use songbird_sync::{Remote, Replica, StorageKey, SyncError, WriteOutcome};
 
 use crate::store::{
-    Audience, Disappear, LockAfter, MESSAGE_TONES, RINGTONES, Settings, SettingsExt, Store,
+    Audience, Broadcast, Disappear, LockAfter, MESSAGE_TONES, RINGTONES, Settings, SettingsExt, Store,
     ThemeChoice,
 };
 
@@ -258,7 +258,38 @@ pub const SYNCED: &[(&str, Get, Set)] = &[
     field!("s/auto_docs", s.auto_docs, pair, p_pair),
     flag!("s/hd_uploads", s.hd_uploads),
     field!("s/lists", x.lists, |v: Vec<String>| list(&v), p_list),
+    // The profile's links and the broadcast lists follow the account (D-0184).
+    field!("s/links", x.links, |v: Vec<String>| list(&v), p_list),
+    field!("s/broadcasts", x.broadcasts, |v: Vec<Broadcast>| broadcasts(&v), p_broadcasts),
 ];
+
+/// Broadcast lists as a record: id, name and members (contacts are named by account-derived
+/// IDs, the same on every device).
+fn broadcasts(v: &[Broadcast]) -> String {
+    serde_json::Value::Array(
+        v.iter()
+            .map(|b| serde_json::json!({ "id": b.id, "name": b.name, "members": b.members }))
+            .collect(),
+    )
+    .to_string()
+}
+
+fn p_broadcasts(v: &str) -> Option<Vec<Broadcast>> {
+    let all: Vec<serde_json::Value> = serde_json::from_str(v).ok()?;
+    all.into_iter()
+        .map(|b| {
+            Some(Broadcast {
+                id: b["id"].as_u64()?,
+                name: b["name"].as_str()?.to_owned(),
+                members: b["members"]
+                    .as_array()?
+                    .iter()
+                    .map(serde_json::Value::as_u64)
+                    .collect::<Option<Vec<_>>>()?,
+            })
+        })
+        .collect()
+}
 
 /// Every device-only setting.
 pub const DEVICE: &[(&str, Get, Set)] = &[

@@ -23,6 +23,7 @@
 //!   devices and seals for them.
 
 pub mod account;
+pub mod applog;
 pub mod avatar;
 pub mod backup;
 pub mod biometric;
@@ -133,9 +134,8 @@ pub fn live() -> Signal<Live> {
     global::<Live>()
 }
 
-// mock: the keys belong in the Secure Enclave / Android Keystore through
-// app-core (A0 "On-device security"); NSH's app storage stands in so the
-// account survives a restart during development.
+// The device's keys and seeds are sealed under the platform's secure store by the vault
+// (`vault::Storage`, D-0172).
 const K_ENABLED: &str = "sb.live";
 const K_ENDPOINT: &str = "sb.endpoint";
 const K_IDENTITY: &str = "sb.identity_seed";
@@ -191,6 +191,10 @@ pub fn registered() -> bool {
 }
 
 pub fn set_enabled(on: bool) {
+    // A real account never runs on the sample data (D-0184): only the demo fixtures turn it off.
+    if !on && !crate::store::demo() {
+        return;
+    }
     if on {
         put(K_ENABLED, "1");
     } else {

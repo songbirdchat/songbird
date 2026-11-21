@@ -11,7 +11,7 @@ pub mod links;
 mod rejoin;
 
 /// A member's role in a group (§6.6).
-pub use songbird_groups::roles::Role;
+pub use songbird_groups::roles::{FLAG_APPROVAL, Policy, Role, Roles};
 
 use openmls_memory_storage::MemoryStorage;
 use openmls_traits::OpenMlsProvider;

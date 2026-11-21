@@ -454,7 +454,7 @@ fn link_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
                         }
                     },
                 );
-                // mock: the demo camera of a preview build shows a new device's code.
+                // The demo fixtures' camera shows a new device's code (nothing elsewhere).
                 crate::camera::demo_shows(codes::link_code(&[0x5B; 16], &[0xC3; 32]));
                 let pin_note = move || {
                     when(

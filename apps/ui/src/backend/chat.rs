@@ -19,9 +19,9 @@
 //! - **Time.** The UI's clock is minutes from its mock "now" (0); real
 //!   messages are placed by their minutes before or after the real now.
 //!
-//! mock: the store key and the device identity seed live in NSH app storage
-//! like the backend's other keys, until the platform keystore modules exist
-//! (A0 "On-device security"); the SQLCipher file itself is encrypted.
+//! The store key and the device identity seed are sealed under the platform's
+//! secure store by the vault (`vault::Storage`, D-0172); the SQLCipher file
+//! itself is encrypted.
 
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
@@ -220,9 +220,14 @@ where
                     pause(wait).await;
                     wait *= 2;
                 }
-                Err(_) => return Err(super::problem(failed)),
+                Err(_) => {
+                    // Said where the user is, not only on the Server screen.
+                    crate::ui::toast(failed);
+                    return Err(super::problem(failed));
+                }
             }
         }
+        crate::ui::toast(failed);
         Err(super::problem(failed))
     });
 }
@@ -266,6 +271,14 @@ pub fn remove_from_group(chat: ChatId, contact: ContactId) {
 pub fn ensure_link(s: Store, chat: ChatId, fresh: bool) {
     let Some(gid) = group_of(chat) else { return };
     let approval = s.chat(chat).is_some_and(|c| c.permissions.approve_joins);
+    // The limits the server enforces on a new link (§6.8).
+    let limits = s.invite_settings(chat);
+    let ttl_s = match limits.expiry {
+        crate::store::ext_groups::InviteExpiry::Never => 0,
+        crate::store::ext_groups::InviteExpiry::Day => 86_400,
+        crate::store::ext_groups::InviteExpiry::Week => 7 * 86_400,
+    };
+    let max_uses = limits.uses.limit().unwrap_or(0);
     super::run(async move {
         let lock = core();
         let mut guard = lock.lock().await;
@@ -279,15 +292,162 @@ pub fn ensure_link(s: Store, chat: ChatId, fresh: bool) {
                 if let Some(old) = old {
                     let _ = m.revoke_link(&gid, &old).await;
                 }
-                m.create_link(&gid, approval).await.map_err(|_| {
-                    super::problem("The link couldn't be made. Only admins can manage it.")
-                })?
+                m.create_link_with(&gid, approval, ttl_s, max_uses)
+                    .await
+                    .map_err(|_| {
+                        crate::ui::toast("The link couldn't be made. Only admins can manage it.");
+                        super::problem("The link couldn't be made. Only admins can manage it.")
+                    })?
             }
         };
+        let expires_ms = m
+            .group_link_limits(&gid)
+            .ok()
+            .flatten()
+            .map_or(0, |l| l.0);
         drop(guard);
         s.edit_chat(chat, |c| c.invite_link = url);
+        s.set_invite_settings(chat, |x| {
+            x.limits_real = true;
+            x.expires_ms = expires_ms;
+        });
         Ok(())
     });
+}
+
+/// The UI's role for a group role.
+fn ui_role(r: songbird_app_core::mls::Role) -> crate::store::Role {
+    use songbird_app_core::mls::Role as R;
+    match r {
+        R::Owner => crate::store::Role::Owner,
+        R::Admin | R::Moderator => crate::store::Role::Admin,
+        _ => crate::store::Role::Member,
+    }
+}
+
+/// A real group's settings as its roles hold them (D-0184): who may send, add, edit the info
+/// and call; approval; the user's role and the roles of the members shown; its description;
+/// and the limits of this device's link. Called at start and whenever the group changes.
+fn load_group_admin(s: Store, m: &Core, chat: ChatId, gid: &[u8; 16]) {
+    use songbird_app_core::mls::Role as R;
+    let Ok(roles) = m.group_roles(gid) else {
+        return;
+    };
+    let p = roles.policy;
+    let me = m.local().account;
+    let mine = ui_role(roles.role(&songbird_types::AccountId::from_bytes(me)));
+    let about = m.group_about(gid).unwrap_or_default();
+    let limits = m.group_link_limits(gid).ok().flatten();
+    s.edit_chat(chat, |c| {
+        c.permissions.members_send = p.send <= R::Member;
+        c.permissions.members_add = p.add <= R::Member;
+        c.permissions.members_edit_info = p.edit_info <= R::Member;
+        c.permissions.members_call = p.call <= R::Member;
+        c.permissions.approve_joins = p.flags & songbird_app_core::mls::FLAG_APPROVAL != 0;
+        // Fixed by the protocol: moderators and above pin and delete others' messages.
+        c.permissions.members_pin = false;
+        c.permissions.admins_delete_any = true;
+        if !matches!(c.kind, ChatKind::Channel { .. }) && c.community.is_none() {
+            c.announcement_only = p.send > R::Member;
+        }
+        if !about.is_empty() {
+            c.about = about.clone();
+        }
+        for member in &mut c.members {
+            let account = match member.contact {
+                None => Some(me),
+                Some(contact) => account_of(contact),
+            };
+            if let Some(a) = account {
+                member.role = if a == me {
+                    mine
+                } else {
+                    ui_role(roles.role(&songbird_types::AccountId::from_bytes(a)))
+                };
+            }
+        }
+    });
+    if let Some((expires_ms, max_uses, _)) = limits {
+        use crate::store::ext_groups::{InviteExpiry, InviteUses};
+        let left_ms = expires_ms.saturating_sub(crate::store::now_ms());
+        s.set_invite_settings(chat, |x| {
+            x.expiry = match expires_ms {
+                0 => InviteExpiry::Never,
+                _ if left_ms <= 86_400_000 => InviteExpiry::Day,
+                _ => InviteExpiry::Week,
+            };
+            x.uses = match max_uses {
+                0 => InviteUses::Unlimited,
+                1 => InviteUses::One,
+                2..=10 => InviteUses::Ten,
+                _ => InviteUses::Hundred,
+            };
+            x.limits_real = true;
+            x.expires_ms = expires_ms;
+        });
+    }
+}
+
+/// Changes a real group's policy to match `perms` (a commit only admins may make, checked by
+/// every member). Pinning and deleting others' messages are the protocol's, not the policy's.
+pub fn set_group_policy(chat: ChatId, perms: crate::store::GroupPermissions) {
+    use songbird_app_core::mls::Role as R;
+    let least = |members: bool| if members { R::Member } else { R::Admin };
+    group_op(
+        chat,
+        "The group's settings couldn't be changed. Only admins can change them.",
+        move |m, gid| {
+            Box::pin(async move {
+                m.set_policy(&gid, |p| {
+                    if !p.is_channel() {
+                        p.send = least(perms.members_send);
+                    }
+                    p.add = least(perms.members_add);
+                    p.edit_info = least(perms.members_edit_info);
+                    p.call = least(perms.members_call);
+                    if perms.approve_joins {
+                        p.flags |= songbird_app_core::mls::FLAG_APPROVAL;
+                    } else {
+                        p.flags &= !songbird_app_core::mls::FLAG_APPROVAL;
+                    }
+                })
+                .await
+            })
+        },
+    );
+}
+
+/// Makes a member of a real group an admin, or a member again (or hands over ownership).
+pub fn set_group_role(chat: ChatId, contact: ContactId, role: crate::store::Role) {
+    use songbird_app_core::mls::Role as R;
+    let Some(account) = account_of(contact) else {
+        return;
+    };
+    let role = match role {
+        crate::store::Role::Owner => R::Owner,
+        crate::store::Role::Admin => R::Admin,
+        crate::store::Role::Member => R::Member,
+    };
+    group_op(
+        chat,
+        "The role couldn't be changed. Only admins who outrank them can.",
+        move |m, gid| Box::pin(async move { m.set_role(&gid, &account, role).await }),
+    );
+}
+
+/// Renames a real group or changes its description: every member is told.
+pub fn set_group_info(chat: ChatId, title: Option<String>, about: Option<String>) {
+    group_op(
+        chat,
+        "The group's info couldn't be changed. Only those allowed to edit it can.",
+        move |m, gid| {
+            let (title, about) = (title.clone(), about.clone());
+            Box::pin(async move {
+                m.set_group_info(&gid, title.as_deref(), about.as_deref())
+                    .await
+            })
+        },
+    );
 }
 
 /// Loads a real group's pending join requests into its chat (admins).
@@ -921,7 +1081,10 @@ fn ensure_chat(s: Store, account: [u8; 16], name: Option<&str>) -> ChatId {
                 key_changed: false,
                 safety_number: String::new(),
                 blocked: false,
-                nudges_off: false,
+                // A choice another of the user's devices made (D-0184).
+                nudges_off: super::records::under(&crate::store::chat_key(id, "nudges"))
+                    .iter()
+                    .any(|(_, v)| v == "off"),
             });
         });
     }
@@ -1524,6 +1687,7 @@ fn show_all(s: Store, m: &Core) {
             let title = m.group_title(&c.id).unwrap_or_default();
             let chat = ensure_group(s, c.id, &title);
             apply_kind(s, chat, c.id, &title, m.group_kind(&c.id).ok(), None);
+            load_group_admin(s, m, chat, &c.id);
             chat
         } else {
             ensure_chat(s, c.id, None)
@@ -1548,11 +1712,14 @@ fn show_all(s: Store, m: &Core) {
             }
         }
         let timer = timer_choice(m.timer(&c.id).unwrap_or(0));
+        let request = !c.group && m.is_request(&c.id).unwrap_or(false);
         s.edit_chat(chat, |x| {
             x.unread = c.unread;
             x.disappearing = timer;
+            x.request = request;
         });
     }
+    apply_stars(s);
 }
 
 /// Handles one delivered envelope: decrypt, store, show. Answers whether the
@@ -1578,6 +1745,7 @@ pub async fn receive(envelope: &[u8]) -> bool {
                     });
             if let Some(s) = crate::store::try_store() {
                 show(s, &me, &row, row.author != me);
+                mark_request(s, m, &row.chat);
                 if poll_in(&row.content).is_some() {
                     show_tally(s, m, &row.author, &row.id);
                 }
@@ -1671,6 +1839,8 @@ pub async fn receive(envelope: &[u8]) -> bool {
             let devices = m.group_devices(&group).map(|d| d.len()).unwrap_or(0);
             if let Some(s) = crate::store::try_store() {
                 let chat = ensure_group(s, group, &title);
+                // Roles, policy and description may have changed with it.
+                load_group_admin(s, m, chat, &group);
                 if let Some(ChatKind::Channel { admin, .. }) = s.chat(chat).map(|c| c.kind) {
                     let followers = u32::try_from(devices).unwrap_or(u32::MAX);
                     s.edit_chat(chat, |c| c.kind = ChatKind::Channel { followers, admin });
@@ -1753,10 +1923,140 @@ pub async fn receive(envelope: &[u8]) -> bool {
             super::calls::signal(m, account, group, call, signal).await;
             true
         }
+        Ok(Received::RequestAnswered { account, accepted }) => {
+            // Another of the user's devices answered a message request.
+            if let Some(s) = crate::store::try_store() {
+                let chat = ui_id(&account);
+                if accepted {
+                    s.edit_chat(chat, |c| c.request = false);
+                } else {
+                    s.chats.update(|cs| cs.retain(|c| c.id != chat));
+                    s.messages.update(|x| {
+                        x.remove(&chat);
+                    });
+                }
+            }
+            true
+        }
         Ok(_) => true,
         // A store failure: leave it on the server, it comes again.
         Err(_) => false,
     }
+}
+
+/// Shows a real 1:1 chat as a message request while the user hasn't written to its account or
+/// accepted it (app-core decides, PROTOCOL §5.10). Groups are never requests.
+fn mark_request(s: Store, m: &Core, account: &[u8; 16]) {
+    if GROUPS.with_borrow(|g| g.values().any(|x| x == account)) {
+        return;
+    }
+    let request = m.is_request(account).unwrap_or(false);
+    let chat = ui_id(account);
+    if s.chat(chat).is_some_and(|c| c.request != request) {
+        s.edit_chat(chat, |c| c.request = request);
+    }
+}
+
+/// Whether a real chat is a message request: it gets no read receipts until it is accepted.
+fn is_request(chat: ChatId) -> bool {
+    crate::store::try_store()
+        .and_then(|s| s.chat(chat))
+        .is_some_and(|c| c.request)
+}
+
+/// Accepts a real message request: the requester gets the user's profile key and may write as
+/// a contact; the user's other devices are told; what was read is now said to be read.
+pub fn accept_request(chat: ChatId) {
+    let Some(account) = account_of(chat) else {
+        return;
+    };
+    super::run(async move {
+        {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let m = guard
+                .as_mut()
+                .ok_or_else(|| super::problem("Not connected yet."))?;
+            m.accept_request(&account).await.map_err(|_| {
+                super::problem("The request was accepted here, but they couldn't be told yet.")
+            })?;
+        }
+        mark_read(chat);
+        Ok(())
+    });
+}
+
+/// Deletes a real chat from this device's store too, so it doesn't come back at the next start.
+/// A message request's deletion reaches the user's other devices (PROTOCOL §5.10); nothing
+/// reaches the other person.
+pub fn delete_chat(chat: ChatId, request: bool) {
+    let Some(id) = core_chat(chat) else {
+        return;
+    };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        let done = if request {
+            m.delete_request(&id).await
+        } else {
+            m.delete_chat(&id)
+        };
+        done.map_err(|_| super::problem("The chat couldn't be deleted from this device."))
+    });
+}
+
+/// Clears a real chat's messages from this device's store too (the chat stays).
+pub fn clear_chat(chat: ChatId) {
+    let Some(id) = core_chat(chat) else {
+        return;
+    };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        m.clear_chat(&id)
+            .map_err(|_| super::problem("The chat couldn't be cleared on this device."))
+    });
+}
+
+/// Reports a real message request, then blocks its sender and deletes it, in that order (the
+/// report needs the messages the deletion removes).
+pub fn report_request(s: Store, chat: ChatId) {
+    let Some(account) = account_of(chat) else {
+        return;
+    };
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        let reported = m.report(&account, 5, 5).await;
+        let key = super::profile::rotate();
+        let blocked = m.block(&account, &key).await;
+        if blocked.is_ok() {
+            let _ = m.delete_request(&account).await;
+        }
+        drop(guard);
+        if blocked.is_ok() {
+            super::profile::publish(s);
+        }
+        let said = match (reported, blocked) {
+            (Ok(0), Ok(())) => Ok("Blocked. There was nothing from them to report."),
+            (Ok(_), Ok(())) => Ok("Reported and blocked"),
+            (Err(_), _) => Err("The report couldn't be sent. Try again."),
+            (_, Err(_)) => Err("The block couldn't be saved. Try again."),
+        };
+        crate::ui::toast(match said {
+            Ok(t) | Err(t) => t,
+        });
+        said.map(drop).map_err(super::problem)
+    });
 }
 
 fn set_status(s: Store, core_id: &[u8; 16], status: Status) {
@@ -1940,10 +2240,109 @@ pub fn send(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
     });
 }
 
+/// Sends a failed message again: the failed copy app-core kept (if any) goes, and the same
+/// bubble is sent anew, its ticks following the new send.
+pub fn retry(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
+    let old = OUTGOING.with_borrow_mut(|o| o.remove(&ui_msg));
+    IDS.with_borrow_mut(|x| x.remove(&ui_msg));
+    if let Some(id) = old {
+        super::run(async move {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            if let Some(m) = guard.as_mut() {
+                let me = m.local().account;
+                let _ = m.delete_for_me(&me, &id);
+            }
+            Ok(())
+        });
+    }
+    send(s, chat, ui_msg, body);
+}
+
+/// Deletes messages of a real chat from this device's store too, so they don't come back at
+/// the next start. Nobody else is told.
+pub fn delete_for_me(ids: &[MsgId]) {
+    let keys: Vec<([u8; 16], [u8; 16])> = IDS.with_borrow(|x| {
+        ids.iter()
+            .filter_map(|id| x.get(id).copied())
+            .collect()
+    });
+    if keys.is_empty() {
+        return;
+    }
+    super::run(async move {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        for (author, id) in keys {
+            m.delete_for_me(&author, &id)
+                .map_err(|_| super::problem("A message couldn't be deleted from this device."))?;
+        }
+        Ok(())
+    });
+}
+
 pub(super) fn me_account() -> [u8; 16] {
     live()
         .with_untracked(|l| l.account.as_deref().and_then(hex16))
         .unwrap_or([0; 16])
+}
+
+/// Keeps a real chat's starred messages in its encrypted record `c/<chat>/stars` (D-0184), so
+/// stars survive a restart and follow the user to their other devices.
+pub fn save_stars(s: Store, chat: ChatId) {
+    if !owns(chat) {
+        return;
+    }
+    let starred: Vec<MsgId> = s.messages.with_untracked(|m| {
+        m.get(&chat)
+            .map(|v| v.iter().filter(|x| x.starred).map(|x| x.id).collect())
+            .unwrap_or_default()
+    });
+    let mut keys: Vec<String> = IDS.with_borrow(|x| {
+        starred
+            .iter()
+            .filter_map(|id| x.get(id))
+            .map(|(a, i)| format!("{}:{}", wire::hex(a), wire::hex(i)))
+            .collect()
+    });
+    keys.sort();
+    let value = (!keys.is_empty()).then(|| serde_json::to_string(&keys).unwrap_or_default());
+    super::records::put(s, &crate::store::chat_key(chat, "stars"), value);
+}
+
+/// Marks the starred messages the records name (at start, and after a sync).
+pub fn apply_stars(s: Store) {
+    let starred: Vec<MsgId> = super::records::under("c/")
+        .into_iter()
+        .filter(|(k, _)| k.ends_with("/stars"))
+        .flat_map(|(_, v)| serde_json::from_str::<Vec<String>>(&v).unwrap_or_default())
+        .filter_map(|k| {
+            let (a, i) = k.split_once(':')?;
+            ui_of(&hex16(a)?, &hex16(i)?)
+        })
+        .collect();
+    let differs = s.messages.with_untracked(|m| {
+        m.iter()
+            .filter(|(chat, _)| owns(**chat))
+            .flat_map(|(_, v)| v.iter())
+            .any(|x| x.starred != starred.contains(&x.id))
+    });
+    if !differs {
+        return;
+    }
+    // What the records say, for every real chat (a star taken off elsewhere goes here too).
+    s.messages.update(|m| {
+        for (chat, v) in m.iter_mut() {
+            if owns(*chat) {
+                for x in v.iter_mut() {
+                    x.starred = starred.contains(&x.id);
+                }
+            }
+        }
+    });
 }
 
 /// The UI message for (author, app-core ID), if shown.
@@ -1961,8 +2360,9 @@ pub fn mark_read(chat: ChatId) {
     let Some(account) = account_of(chat) else {
         return;
     };
-    let send =
-        crate::store::try_store().is_none_or(|s| s.settings.with_untracked(|x| x.read_receipts));
+    // A message request is never told it was read until it is accepted (PROTOCOL §5.10).
+    let send = !is_request(chat)
+        && crate::store::try_store().is_none_or(|s| s.settings.with_untracked(|x| x.read_receipts));
     super::run(async move {
         let lock = core();
         let mut guard = lock.lock().await;
@@ -2011,22 +2411,30 @@ pub fn block(s: Store, contact: ContactId, blocked: bool) {
     });
 }
 
-/// Reports a real chat: its newest five messages, each with the proof the
-/// server checks (PROTOCOL §5.14). Nothing else about the chat leaves.
+/// Reports a real chat: its newest five messages from others, each with the proof the
+/// server checks (PROTOCOL §5.14). Nothing else about the chat leaves. Says how it went.
 pub fn report(chat: ChatId) {
-    let Some(account) = account_of(chat) else {
+    let (account, group) = (account_of(chat), group_of(chat));
+    if account.is_none() && group.is_none() {
         return;
-    };
+    }
     super::run(async move {
         let lock = core();
         let mut guard = lock.lock().await;
         let m = guard
             .as_mut()
             .ok_or_else(|| super::problem("Not connected yet."))?;
-        let n = m
-            .report(&account, 5, 5)
-            .await
-            .map_err(|_| super::problem("The report couldn't be sent. Try again."))?;
+        // A group's or channel's: the newest five other members' messages, each against its
+        // own sender (§5.14).
+        let sent = match (account, group) {
+            (Some(a), _) => m.report(&a, 5, 5).await,
+            (None, Some(g)) => m.report_group(&g, 5, 5).await,
+            (None, None) => Ok(0),
+        };
+        let n = sent.map_err(|_| {
+            crate::ui::toast("The report couldn't be sent. Try again.");
+            super::problem("The report couldn't be sent. Try again.")
+        })?;
         drop(guard);
         crate::ui::toast(if n == 0 {
             "There's nothing from them to report yet.".to_string()
@@ -2589,6 +2997,34 @@ pub fn send_sticker(
             }
         }
     });
+}
+
+/// One recipient's receipts for a real message, as Message info shows them: who, and when it
+/// was delivered, read and played (UI minutes). `Some(None)`: reached, at a time this device
+/// didn't keep (receipts from before it kept each time).
+pub type ReceiptTimes = (ContactId, Option<Option<i64>>, Option<Option<i64>>, Option<Option<i64>>);
+
+/// The receipts app-core keeps for one of the user's real messages (D-0184); `None` for a
+/// message that isn't real or while app-core is busy.
+pub fn receipt_times(msg: MsgId) -> Option<Vec<ReceiptTimes>> {
+    let (author, id) = IDS.with_borrow(|x| x.get(&msg).copied())?;
+    let lock = core();
+    let guard = lock.try_lock().ok()?;
+    let m = guard.as_ref()?;
+    let rows = m.store.receipt_times(&author, &id).ok()?;
+    let at = |reached: bool, ms: Option<u64>| reached.then(|| ms.map(minutes));
+    Some(
+        rows.into_iter()
+            .map(|r| {
+                (
+                    ui_id(&r.account),
+                    at(r.level >= Status::Delivered, r.delivered_ms),
+                    at(r.level >= Status::Read, r.read_ms),
+                    at(r.level >= Status::Played, r.played_ms),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// Whether a real contact saved the user (shared their profile key): only they get broadcasts.

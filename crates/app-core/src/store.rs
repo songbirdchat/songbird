@@ -62,7 +62,7 @@ fn viewed_key(author: &[u8; 16], id: &[u8; 16]) -> String {
 }
 
 /// The schema version this code writes.
-pub const SCHEMA: i64 = 7;
+pub const SCHEMA: i64 = 8;
 
 /// Outgoing message status, as the UI shows it (`crates/content`'s levels, plus the local ones).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -111,6 +111,21 @@ impl Status {
     pub fn may_become(self, next: Self) -> bool {
         next > self || (self == Self::Failed && next == Self::Sending)
     }
+}
+
+/// One recipient's receipts for a message this account sent (Message info).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptTimes {
+    /// Who the receipts came from.
+    pub account: [u8; 16],
+    /// The highest level they reached.
+    pub level: Status,
+    /// When it was first delivered to one of their devices (ms), when known.
+    pub delivered_ms: Option<u64>,
+    /// When they read it, when known.
+    pub read_ms: Option<u64>,
+    /// When they played it (voice notes), when known.
+    pub played_ms: Option<u64>,
 }
 
 /// A chat as the list shows it.
@@ -311,7 +326,7 @@ impl Store {
         self.migrate_later(v)
     }
 
-    /// Schema steps 5 and later (call links, chat state, packs).
+    /// Schema steps 5 and later (call links, chat state, packs, requests and receipt times).
     fn migrate_later(&mut self, v: i64) -> Result<()> {
         if v < 5 {
             // Call links this device made (PROTOCOL §8.4, §8.7): the root (the link itself) and
@@ -353,6 +368,25 @@ impl Store {
                  CREATE TABLE pack_items (id BLOB NOT NULL, object INTEGER NOT NULL, bytes BLOB NOT NULL,
                      PRIMARY KEY (id, object));
                  PRAGMA user_version = 7;",
+            ))?;
+            db(tx.commit())?;
+        }
+        if v < 8 {
+            // Message requests (PROTOCOL §5.10, D-0184): whether this account accepted talking
+            // with another (wrote to it, accepted its request, or another of its devices did).
+            // Every account known before this step was treated as accepted, so it stays so.
+            // And each receipt level's own time, for Message info (only the newest was kept).
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "ALTER TABLE accounts ADD COLUMN accepted INTEGER NOT NULL DEFAULT 0;
+                 UPDATE accounts SET accepted = 1;
+                 ALTER TABLE receipts ADD COLUMN delivered_ms INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE receipts ADD COLUMN read_ms INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE receipts ADD COLUMN played_ms INTEGER NOT NULL DEFAULT 0;
+                 UPDATE receipts SET delivered_ms = ms WHERE level = 2;
+                 UPDATE receipts SET read_ms = ms WHERE level = 3;
+                 UPDATE receipts SET played_ms = ms WHERE level = 4;
+                 PRAGMA user_version = 8;",
             ))?;
             db(tx.commit())?;
         }
@@ -734,6 +768,118 @@ impl Store {
         .map(|_| ())
     }
 
+    /// Marks `account` as accepted: this account wrote to it, accepted its message request, or
+    /// another of this account's devices did (PROTOCOL §5.10). Its messages are no longer a
+    /// request.
+    pub fn set_accepted(&self, account: &[u8; 16]) -> Result<()> {
+        db(self.db.execute(
+            "INSERT INTO accounts (account, identity_key, accepted) VALUES (?1, x'', 1)
+             ON CONFLICT (account) DO UPDATE SET accepted = 1",
+            [&account[..]],
+        ))
+        .map(|_| ())
+    }
+
+    /// Whether this account accepted talking with `account` (see [`Self::set_accepted`]).
+    pub fn is_accepted(&self, account: &[u8; 16]) -> Result<bool> {
+        let v: Option<i64> = db(self
+            .db
+            .query_row(
+                "SELECT accepted FROM accounts WHERE account = ?1",
+                [&account[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(v == Some(1))
+    }
+
+    /// Deletes a chat from this device: its messages with their files, reactions, receipts,
+    /// report proofs, pins, polls and timer, and anything of it still waiting to be sent. The
+    /// other people in it are not told; a new message starts it again.
+    pub fn delete_chat(&mut self, chat: &[u8; 16]) -> Result<()> {
+        self.empty_chat(chat, false)
+    }
+
+    /// Clears a chat on this device: everything [`Self::delete_chat`] removes, but the chat
+    /// stays in the list, empty.
+    pub fn clear_chat(&mut self, chat: &[u8; 16]) -> Result<()> {
+        self.empty_chat(chat, true)
+    }
+
+    fn empty_chat(&mut self, chat: &[u8; 16], keep: bool) -> Result<()> {
+        let tx = db(self.db.transaction())?;
+        for table in [
+            "files",
+            "reactions",
+            "receipts",
+            "franks",
+            "poll_votes",
+            "poll_closes",
+        ] {
+            db(tx.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE (author, id) IN (SELECT author, id FROM messages WHERE chat = ?1)"
+                ),
+                [&chat[..]],
+            ))?;
+        }
+        for table in ["messages", "pins", "outbox"] {
+            db(tx.execute(
+                &format!("DELETE FROM {table} WHERE chat = ?1"),
+                [&chat[..]],
+            ))?;
+        }
+        if keep {
+            db(tx.execute(
+                "UPDATE chats SET preview = '', unread = 0 WHERE id = ?1",
+                [&chat[..]],
+            ))?;
+        } else {
+            db(tx.execute("DELETE FROM chat_timers WHERE chat = ?1", [&chat[..]]))?;
+            db(tx.execute("DELETE FROM chats WHERE id = ?1", [&chat[..]]))?;
+        }
+        db(tx.commit())
+    }
+
+    /// Deletes a message here (delete for everyone, disappearing, or delete for me) with what is
+    /// kept of it (files, reactions, receipts, its report proof, poll votes, a pin), and from the
+    /// outbox if still waiting.
+    pub fn delete_message(&mut self, author: &[u8; 16], id: &[u8; 16]) -> Result<()> {
+        let tx = db(self.db.transaction())?;
+        let chat: Option<Vec<u8>> = db(tx
+            .query_row(
+                "SELECT chat FROM messages WHERE author = ?1 AND id = ?2",
+                params![&author[..], &id[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        for table in [
+            "files",
+            "reactions",
+            "receipts",
+            "franks",
+            "poll_votes",
+            "poll_closes",
+            "pins",
+            "messages",
+        ] {
+            db(tx.execute(
+                &format!("DELETE FROM {table} WHERE author = ?1 AND id = ?2"),
+                params![&author[..], &id[..]],
+            ))?;
+        }
+        db(tx.execute("DELETE FROM outbox WHERE message = ?1", [&id[..]]))?;
+        // The list's preview never keeps a deleted message's text.
+        if let Some(chat) = chat {
+            db(tx.execute(
+                "UPDATE chats SET preview = COALESCE((SELECT text FROM messages WHERE chat = ?1
+                     ORDER BY sent_ms DESC, rowid DESC LIMIT 1), '') WHERE id = ?1",
+                [&chat],
+            ))?;
+        }
+        db(tx.commit())
+    }
+
     /// Whether this account blocked `account`.
     pub fn is_blocked(&self, account: &[u8; 16]) -> Result<bool> {
         let v: Option<i64> = db(self
@@ -786,6 +932,34 @@ impl Store {
             ))
         }))?;
         rows.map(db).collect()
+    }
+
+    /// The report proofs of the newest `n` messages in `chat` not sent by `me`, with their
+    /// senders (a group's reports, §5.14).
+    pub fn franks_in(
+        &self,
+        chat: &[u8; 16],
+        me: &[u8; 16],
+        n: u32,
+    ) -> Result<Vec<([u8; 16], Frank)>> {
+        let mut st = db(self.db.prepare(
+            "SELECT f.author, f.stamp, f.franking_key, f.content FROM franks f
+             JOIN messages m ON m.author = f.author AND m.id = f.id
+             WHERE m.chat = ?1 AND f.author != ?2 ORDER BY f.rowid DESC LIMIT ?3",
+        ))?;
+        let rows = db(st.query_map(params![&chat[..], &me[..], i64::from(n)], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+            ))
+        }))?;
+        rows.map(|r| {
+            let (a, stamp, fk, content) = db(r)?;
+            Ok((arr16(&a)?, (stamp, fk, content)))
+        })
+        .collect()
     }
 
     /// Records `reactor`'s reaction to a message (empty `emoji`: removed), if `counter` is newer
@@ -1300,6 +1474,35 @@ impl Store {
         Ok(true)
     }
 
+    /// The receipts for one of this account's messages, per recipient, with each level's time.
+    pub fn receipt_times(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<Vec<ReceiptTimes>> {
+        let mut st = db(self.db.prepare(
+            "SELECT account, level, delivered_ms, read_ms, played_ms FROM receipts
+             WHERE author = ?1 AND id = ?2 ORDER BY level DESC, ms",
+        ))?;
+        let rows = db(st.query_map(params![&author[..], &id[..]], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        }))?;
+        let known = |v: i64| (v > 0).then(|| ms(v));
+        rows.map(|r| {
+            let (account, level, d, rd, p) = db(r)?;
+            Ok(ReceiptTimes {
+                account: arr16(&account)?,
+                level: Status::from_i64(level),
+                delivered_ms: known(d),
+                read_ms: known(rd),
+                played_ms: known(p),
+            })
+        })
+        .collect()
+    }
+
     /// Records a receipt from `account` for one of our messages. The message's status becomes the
     /// lowest level every one of the `audience` recipient accounts has reached; one that has not
     /// answered counts as `Sent` (1:1: an audience of one).
@@ -1313,8 +1516,16 @@ impl Store {
         audience: usize,
     ) -> Result<()> {
         db(self.db.execute(
-            "INSERT INTO receipts (author, id, account, level, ms) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT (author, id, account) DO UPDATE SET level = max(level, ?4), ms = CASE WHEN ?4 > level THEN ?5 ELSE ms END",
+            "INSERT INTO receipts (author, id, account, level, ms, delivered_ms, read_ms, played_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5,
+                     CASE WHEN ?4 >= 2 THEN ?5 ELSE 0 END,
+                     CASE WHEN ?4 >= 3 THEN ?5 ELSE 0 END,
+                     CASE WHEN ?4 >= 4 THEN ?5 ELSE 0 END)
+             ON CONFLICT (author, id, account) DO UPDATE SET level = max(level, ?4),
+                 ms = CASE WHEN ?4 > level THEN ?5 ELSE ms END,
+                 delivered_ms = CASE WHEN ?4 >= 2 AND delivered_ms = 0 THEN ?5 ELSE delivered_ms END,
+                 read_ms = CASE WHEN ?4 >= 3 AND read_ms = 0 THEN ?5 ELSE read_ms END,
+                 played_ms = CASE WHEN ?4 >= 4 AND played_ms = 0 THEN ?5 ELSE played_ms END",
             params![&author[..], &id[..], &account[..], level.as_i64(), sql_ms(at_ms)],
         ))?;
         let (n, min): (i64, Option<i64>) = db(self.db.query_row(
@@ -1335,15 +1546,6 @@ impl Store {
         db(self.db.execute(
             "UPDATE messages SET text = ?3 WHERE author = ?1 AND id = ?2",
             params![&author[..], &id[..], text],
-        ))
-        .map(|_| ())
-    }
-
-    /// Deletes a message here (delete for everyone, disappearing, or delete for me).
-    pub fn delete_message(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<()> {
-        db(self.db.execute(
-            "DELETE FROM messages WHERE author = ?1 AND id = ?2",
-            params![&author[..], &id[..]],
         ))
         .map(|_| ())
     }
@@ -1564,6 +1766,99 @@ mod tests {
         assert_eq!(s.search("findable", 10).unwrap().len(), 1);
         drop(s);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn requests_are_accepted_once_written_to_and_old_accounts_stay_accepted() {
+        let mut s = Store::memory(&[1; 32]).unwrap();
+        let (stranger, friend) = ([5; 16], [6; 16]);
+        assert!(!s.is_accepted(&stranger).unwrap());
+        // A key pinned on first sight does not accept anyone.
+        s.pin_account(&stranger, &[9; 32]).unwrap();
+        assert!(!s.is_accepted(&stranger).unwrap());
+        s.set_accepted(&stranger).unwrap();
+        assert!(s.is_accepted(&stranger).unwrap());
+        // ...and keeps the pinned key.
+        assert!(s.pin_account(&stranger, &[9; 32]).unwrap());
+        // A store from before schema 8: every account it knew counts as accepted.
+        s.pin_account(&friend, &[8; 32]).unwrap();
+        s.db.execute_batch(
+            "UPDATE accounts SET accepted = 0;
+             ALTER TABLE accounts DROP COLUMN accepted;
+             ALTER TABLE receipts DROP COLUMN delivered_ms;
+             ALTER TABLE receipts DROP COLUMN read_ms;
+             ALTER TABLE receipts DROP COLUMN played_ms;
+             INSERT INTO receipts (author, id, account, level, ms) VALUES (x'01', x'02', x'03', 3, 77);
+             PRAGMA user_version = 7;",
+        )
+        .unwrap();
+        s.migrate().unwrap();
+        assert!(s.is_accepted(&friend).unwrap() && s.is_accepted(&stranger).unwrap());
+        let n: i64 = s
+            .db
+            .query_row("SELECT read_ms FROM receipts WHERE ms = 77", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 77);
+    }
+
+    #[test]
+    fn receipt_times_keep_each_level() {
+        let mut s = Store::memory(&[1; 32]).unwrap();
+        let m = msg(1, 2, 3, 10, "hello");
+        s.insert_message(&m, false).unwrap();
+        let bob = [4; 16];
+        s.receipt(&m.author, &m.id, &bob, Status::Delivered, 100, 1)
+            .unwrap();
+        s.receipt(&m.author, &m.id, &bob, Status::Read, 200, 1)
+            .unwrap();
+        // A late, lower receipt changes nothing.
+        s.receipt(&m.author, &m.id, &bob, Status::Delivered, 300, 1)
+            .unwrap();
+        let t = s.receipt_times(&m.author, &m.id).unwrap();
+        assert_eq!(
+            t,
+            vec![ReceiptTimes {
+                account: bob,
+                level: Status::Read,
+                delivered_ms: Some(100),
+                read_ms: Some(200),
+                played_ms: None,
+            }]
+        );
+        // Read first (its delivery never told): delivered then too.
+        let carol = [5; 16];
+        s.receipt(&m.author, &m.id, &carol, Status::Read, 400, 2)
+            .unwrap();
+        let c = s
+            .receipt_times(&m.author, &m.id)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.account == carol)
+            .unwrap();
+        assert_eq!((c.delivered_ms, c.read_ms), (Some(400), Some(400)));
+    }
+
+    #[test]
+    fn deleting_a_chat_leaves_the_others() {
+        let mut s = Store::memory(&[1; 32]).unwrap();
+        let gone = msg(1, 9, 1, 10, "from a stranger");
+        let kept = msg(2, 8, 2, 11, "from a friend");
+        s.insert_message(&gone, true).unwrap();
+        s.insert_message(&kept, true).unwrap();
+        s.receipt(&gone.author, &gone.id, &[3; 16], Status::Read, 5, 1)
+            .unwrap();
+        s.clear_chat(&[1; 16]).unwrap();
+        assert_eq!(s.chats().unwrap().len(), 2);
+        assert!(s.message(&gone.author, &gone.id).unwrap().is_none());
+        s.delete_chat(&[1; 16]).unwrap();
+        let chats = s.chats().unwrap();
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].id, [2; 16]);
+        assert!(s.message(&gone.author, &gone.id).unwrap().is_none());
+        assert!(s.message(&kept.author, &kept.id).unwrap().is_some());
+        assert_eq!(s.receipt_times(&gone.author, &gone.id).unwrap(), Vec::new());
+        s.delete_message(&kept.author, &kept.id).unwrap();
+        assert!(s.message(&kept.author, &kept.id).unwrap().is_none());
     }
 
     #[test]

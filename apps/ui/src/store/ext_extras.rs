@@ -3,8 +3,9 @@
 //! in one surface global (`Extras`) and is changed only through the
 //! `impl Store` intents below.
 //!
-//! **Mock.** Purchases, invites, support requests and WhatsApp linking
-//! are app-core calls that do not exist yet; each intent says which.
+//! A real account's purchases, invites and support requests reach billing and
+//! the server (`crate::backend::plans`); WhatsApp linking waits for its bridge
+//! (Prompt 14) and says so. Only the demo fixtures simulate them (D-0184).
 
 use std::time::Duration;
 
@@ -74,7 +75,7 @@ pub struct Extras {
     pub family: Vec<FamilySeat>,
     /// The tray / menu bar icon is hidden by the user.
     pub tray_hidden: bool,
-    /// Support requests sent this session (mock).
+    /// Support requests the server accepted this session.
     pub support_sent: u32,
     /// Purchase in progress (the store sheet is busy).
     pub purchasing: bool,
@@ -134,13 +135,17 @@ impl Store {
 
     /// The user's invite codes, used ones first. The counts come from the
     /// session (`invites_used`, `invites_left`).
-    /// mock: app-core `invites.list()`.
+    /// A real account's, as the server lists them; the demo's, made from its seed.
     pub fn invite_codes(&self) -> Vec<InviteCode> {
         if let Some(live) = extras().with(|e| e.invites_live.clone()) {
-            // Used ones first, as the mock shows them.
+            // Used ones first.
             let mut v = live;
             v.sort_by_key(|c| !c.used);
             return v;
+        }
+        // A real account's codes come only from the server (`refresh_invites`).
+        if !super::demo() {
+            return Vec::new();
         }
         let (used, left) = self.session.with(|s| (s.invites_used, s.invites_left));
         let seed = self.me.with(|m| m.seed);
@@ -245,6 +250,13 @@ impl Store {
                 s.await_payment(0, Box::new(done));
                 Ok(())
             });
+            return;
+        }
+        // Only the demo grants a plan without a store or a payment provider. A real account
+        // that isn't registered yet has nothing to buy it for.
+        if !super::demo() {
+            extras().update(|e| e.purchasing = false);
+            crate::ui::toast("Finish creating your account first.");
             return;
         }
         set_timeout(Duration::from_millis(900), move || {
@@ -419,9 +431,7 @@ impl Store {
         });
     }
 
-    /// Turns off renewal: the plan stays until the end of the period.
-    /// mock: on iOS and Android this happens in the store's own page;
-    /// app-core `billing.cancel()` for the EU provider.
+    /// Turns off renewal: the plan stays until the end of the period (billing's `cancel`).
     pub fn cancel_renewal(&self) {
         if live_ready() {
             crate::backend::run(async move {
@@ -431,7 +441,9 @@ impl Store {
             });
             return;
         }
-        extras().update(|e| e.cancels_at_period_end = true);
+        if super::demo() {
+            extras().update(|e| e.cancels_at_period_end = true);
+        }
     }
 
     /// Turns renewal back on while the paid period lasts (D-0169): billing starts a new
@@ -448,11 +460,13 @@ impl Store {
             });
             return;
         }
-        extras().update(|e| e.cancels_at_period_end = false);
+        if super::demo() {
+            extras().update(|e| e.cancels_at_period_end = false);
+        }
     }
 
-    /// Invites someone to the Family plan (up to six people in all).
-    /// mock: app-core `billing.family_invite()` returns a link.
+    /// Invites someone to the Family plan (up to six people in all): billing makes the seat
+    /// and its link to share. The demo adds a pending seat.
     pub fn family_invite(&self, name: String) {
         if live_ready() {
             let s = *self;
@@ -461,6 +475,9 @@ impl Store {
                 s.refresh_plan();
                 Ok(())
             });
+            return;
+        }
+        if !super::demo() {
             return;
         }
         let id = nsh_core::time::unix_ms() as u64;
@@ -492,24 +509,31 @@ impl Store {
             });
             return;
         }
-        extras().update(|e| e.family.retain(|m| m.id != id));
+        if super::demo() {
+            extras().update(|e| e.family.retain(|m| m.id != id));
+        }
     }
 
     // ------------------------------------------------------------ support
 
-    /// Sends a support request. Logs are attached only when the user said
-    /// so, and only the scrubbed form they previewed.
-    /// mock: app-core `support.send(topic, message, logs)`; nothing leaves
-    /// the device here.
+    /// Sends a support request, sealed to the support team (`backend::plans::open_ticket`).
+    /// Logs are attached only when the user said so, and only the scrubbed form they
+    /// previewed. `done` hears whether the server has it; nothing is said sent before.
     pub fn send_support(
         &self,
         topic: &str,
         message: &str,
         logs: Option<String>,
         attach_account: bool,
+        done: impl FnOnce(bool) + 'static,
     ) {
-        extras().update(|e| e.support_sent += 1);
         if !live_ready() {
+            // The demo pretends; a real account not registered yet has no one to send to.
+            let demo = super::demo();
+            if demo {
+                extras().update(|e| e.support_sent += 1);
+            }
+            done(demo);
             return;
         }
         let kind = if topic == "Billing" {
@@ -519,24 +543,36 @@ impl Store {
         };
         let text = format!("[{topic}] {message}");
         crate::backend::run(async move {
-            crate::backend::plans::open_ticket(kind, &text, logs.as_deref(), attach_account)
-                .await
-                .map(drop)
+            let r = crate::backend::plans::open_ticket(kind, &text, logs.as_deref(), attach_account)
+                .await;
+            if r.is_ok() {
+                extras().update(|e| e.support_sent += 1);
+            }
+            done(r.is_ok());
+            r.map(drop)
         });
     }
 
     /// Appeals a limit or suspension: a ticket of kind `appeal`, signed (it names the account,
     /// which the appeal is about).
-    pub fn appeal(&self, message: &str) {
-        extras().update(|e| e.support_sent += 1);
+    /// `done` hears whether the server has it.
+    pub fn appeal(&self, message: &str, done: impl FnOnce(bool) + 'static) {
         if !live_ready() {
+            let demo = super::demo();
+            if demo {
+                extras().update(|e| e.support_sent += 1);
+            }
+            done(demo);
             return;
         }
         let text = message.to_owned();
         crate::backend::run(async move {
-            crate::backend::plans::open_ticket("appeal", &text, None, true)
-                .await
-                .map(drop)
+            let r = crate::backend::plans::open_ticket("appeal", &text, None, true).await;
+            if r.is_ok() {
+                extras().update(|e| e.support_sent += 1);
+            }
+            done(r.is_ok());
+            r.map(drop)
         });
     }
 
@@ -559,10 +595,13 @@ impl Store {
         self.settings.with(|s| s.whatsapp_linked)
     }
 
-    /// Starts linking: a pairing code and QR show until the phone accepts.
-    /// mock: app-core `bridge.whatsapp.begin_link()`; the phone "accepts"
-    /// after a few seconds.
+    /// The demo's linking: a pairing code and QR show until the "phone" accepts after a few
+    /// seconds. There is no WhatsApp bridge yet (Prompt 14), so a real account never links
+    /// (its WhatsApp page says so, D-0184).
     pub fn begin_whatsapp_link(&self, done: impl FnOnce() + 'static) {
+        if !super::demo() {
+            return;
+        }
         let s = *self;
         extras().update(|e| e.whatsapp_link = WhatsAppLink::Pairing);
         set_timeout(Duration::from_millis(3500), move || {
@@ -578,9 +617,7 @@ impl Store {
         extras().update(|e| e.whatsapp_link = WhatsAppLink::Idle);
     }
 
-    /// Unlinks at once: the bridge session is deleted and WhatsApp chats
-    /// stop syncing.
-    /// mock: app-core `bridge.whatsapp.unlink()`.
+    /// Unlinks the demo's WhatsApp at once (a real account has nothing linked).
     pub fn unlink_whatsapp(&self) {
         self.settings_update(|x| x.whatsapp_linked = false);
     }

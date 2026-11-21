@@ -437,7 +437,6 @@ fn contact_info(chat: ChatId) -> AnyElement {
                     "Report",
                     move || {
                         s.report(chat);
-                        toast("Reported. Thank you.");
                     },
                 )
             })

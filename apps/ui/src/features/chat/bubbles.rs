@@ -2054,7 +2054,7 @@ fn view_once_body(cv: Conv, item: ItemMemo) -> AnyElement {
                 return;
             }
             cv.s.open_view_once(cv.chat, id.get_untracked());
-            // mock: the viewer shows it once, then app-core deletes it.
+            // The viewer shows it once; a real one's file is then gone from app-core's store.
             toast(if photo {
                 "View once photo opened"
             } else {

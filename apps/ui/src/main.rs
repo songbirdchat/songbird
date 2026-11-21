@@ -11,7 +11,8 @@ use nsh_platform_windows as platform;
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn main() -> impl std::process::Termination {
-    env_logger::init();
+    // The developer's console log, and the app's own for support requests (D-0184).
+    nsh_app_songbird::backend::applog::init();
     platform::run_app(
         platform::AppSource::Rust(platform::Root::of::<nsh_app_songbird::App>()),
         platform::AppOptions {

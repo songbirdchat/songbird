@@ -1,10 +1,10 @@
 //! The UI's view of app-core: a `Copy` store of signals, made once at the
 //! root and provided as context, and the intents that change it.
 //!
-//! **Mock.** app-core (A2) is not built yet, so this store keeps seed data
-//! in memory and simulates the network: statuses advance on timers,
-//! contacts "type" and reply. Every intent here is a call the real
-//! app-core will take over; screens never write signals directly.
+//! A real account starts empty and its intents reach app-core and the
+//! server (`crate::backend`). Only the demo fixtures (`demo()`) keep seed
+//! data and simulate the network: statuses advance on timers, contacts
+//! "type" and reply (D-0184). Screens never write signals directly.
 
 mod ext_chat;
 mod ext_chats;
@@ -469,18 +469,39 @@ impl Store {
             self.edit_chat(id, |c| c.draft = draft);
         }
     }
+    /// Clears a chat's messages from this device (a real one's from app-core's store too).
     pub fn clear_chat(&self, id: ChatId) {
+        if crate::backend::chat::owns(id) {
+            crate::backend::chat::clear_chat(id);
+        }
         self.messages.update(|m| {
             m.insert(id, Vec::new());
         });
     }
+    /// Deletes a chat from this device (a real one from app-core's store too, so it stays
+    /// gone after a restart; a message request's deletion reaches the user's other devices).
     pub fn delete_chat(&self, id: ChatId) {
+        if crate::backend::chat::owns(id) {
+            let request = self.chat(id).is_some_and(|c| c.request);
+            crate::backend::chat::delete_chat(id, request);
+        }
+        self.forget_chat(id);
+    }
+
+    /// Takes a chat off the screens only (what the network or app-core already removed).
+    pub(crate) fn forget_chat(&self, id: ChatId) {
         self.chats.update(|cs| cs.retain(|c| c.id != id));
         self.messages.update(|m| {
             m.remove(&id);
         });
     }
+
+    /// Accepts a message request: a real one shares the user's profile key with the requester
+    /// and tells the user's other devices (app-core `accept_request`).
     pub fn accept_request(&self, id: ChatId) {
+        if crate::backend::chat::owns(id) && self.chat(id).is_some_and(|c| c.request) {
+            crate::backend::chat::accept_request(id);
+        }
         self.edit_chat(id, |c| c.request = false);
     }
     pub fn block(&self, contact: ContactId, blocked: bool) {
@@ -495,9 +516,12 @@ impl Store {
     }
     /// Reports to Songbird: the chat's newest five messages from the other
     /// person, each with its franking proof (PROTOCOL §5.14).
+    /// A real report says how it went once the server answers (never a thank-you before).
     pub fn report(&self, chat: ChatId) {
         if crate::backend::chat::owns(chat) {
             crate::backend::chat::report(chat);
+        } else {
+            crate::ui::toast("Reported. Thank you.");
         }
     }
     pub fn verify(&self, contact: ContactId, verified: bool) {
@@ -644,7 +668,13 @@ impl Store {
         self.edit_message(chat, id, |m| m.status = Tick::Failed);
     }
 
+    /// The demo's delivery: ticks on a timer and the contact's canned answer. Only the demo
+    /// fixtures have chats no server carries; anywhere else such a message honestly fails.
     fn simulate_delivery(&self, chat: ChatId, id: MsgId) {
+        if !demo() {
+            self.fail(chat, id);
+            return;
+        }
         let store = *self;
         let offline = self.session.with_untracked(|s| s.offline);
         if offline {
@@ -685,8 +715,15 @@ impl Store {
         });
     }
 
+    /// Sends a failed message again (a real chat's through app-core).
     pub fn retry(&self, chat: ChatId, id: MsgId) {
         self.edit_message(chat, id, |m| m.status = Tick::Sending);
+        if crate::backend::chat::owns(chat) {
+            if let Some(body) = self.message(chat, id).map(|m| m.body) {
+                crate::backend::chat::retry(*self, chat, id, &body);
+            }
+            return;
+        }
         self.simulate_delivery(chat, id);
     }
 
@@ -745,7 +782,11 @@ impl Store {
         });
     }
 
+    /// Deletes a message from this device (a real one from app-core's store too).
     pub fn delete_for_me(&self, chat: ChatId, id: MsgId) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::delete_for_me(&[id]);
+        }
         self.messages.update(|m| {
             if let Some(v) = m.get_mut(&chat) {
                 v.retain(|x| x.id != id);
@@ -753,8 +794,10 @@ impl Store {
         });
     }
 
+    /// Stars or unstars a message (a real chat's stars are kept in its synced record).
     pub fn toggle_star(&self, chat: ChatId, id: MsgId) {
         self.edit_message(chat, id, |m| m.starred = !m.starred);
+        crate::backend::chat::save_stars(*self, chat);
     }
 
     pub fn toggle_pin_message(&self, chat: ChatId, id: MsgId) {
@@ -912,8 +955,10 @@ impl Store {
 
     /// Creates a group the user owns and returns it.
     pub fn create_group(&self, title: String, members: Vec<ContactId>) -> ChatId {
-        // Real contacts: a real MLS group (D-0146).
-        if crate::backend::chat::all_real(&members) {
+        // Real contacts, or a real account's group of one (people join by its link): a real
+        // MLS group (D-0146). Only the demo makes groups no server knows.
+        let real_account = !demo() && crate::backend::registered();
+        if crate::backend::chat::all_real(&members) || real_account {
             let id = crate::backend::chat::create_group(*self, title.clone(), members);
             self.push_message(
                 id,
@@ -1078,8 +1123,13 @@ impl Store {
         self.session.update(|s| s.offline = offline);
     }
 
-    /// Mock: the username check app-core will ask the server for.
+    /// Whether `name` may be offered as a username. Only claiming it on the server
+    /// (`backend::claim_username`) says whether it's free, so a real account checks its form
+    /// only (the server answers the claim); the demo has a list of taken names.
     pub fn username_available(&self, name: &str) -> bool {
+        if !demo() {
+            return ext_onboarding::username_format(name).is_none();
+        }
         let taken = ["ana", "mihai", "admin", "songbird", "support"];
         name.len() >= 3 && !taken.contains(&name.to_lowercase().as_str())
     }

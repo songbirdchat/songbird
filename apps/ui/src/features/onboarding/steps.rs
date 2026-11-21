@@ -432,7 +432,8 @@ pub(super) fn creating(s: Store, f: Flow) -> View {
             }
         });
     } else {
-        // mock: registration with an invisible Argon2id proof of work (D-0048),
+        // The demo fixtures only (a real account is always live): registration with an
+        // invisible Argon2id proof of work (D-0048),
         // about 1.5 s, then claiming the username.
         set_timeout(Duration::from_millis(1500), move || {
             if !f
@@ -769,8 +770,8 @@ pub(super) fn connect(s: Store, f: Flow) -> View {
             Some(w)
         });
         found.set(false);
-        if w == Way::Scan {
-            // mock: the camera finds a friend's code (app-core resolves the username link).
+        // The demo's camera "finds" a friend after a moment; a real account scans for real.
+        if w == Way::Scan && crate::store::demo() {
             set_timeout(Duration::from_millis(2600), move || {
                 if way.try_get() == Some(Some(Way::Scan)) {
                     let _ = found.try_set(true);
@@ -803,6 +804,16 @@ pub(super) fn connect(s: Store, f: Flow) -> View {
             return;
         }
         let id = s.create_group(title.clone(), Vec::new());
+        if crate::backend::chat::owns(id) {
+            // A real group's link is made on the server once the group exists (D-0148).
+            crate::backend::chat::ensure_link(s, id, false);
+            finish(
+                s,
+                id,
+                format!("\"{title}\" is ready. Share its invite link from the group's info."),
+            );
+            return;
+        }
         if let Some(chat) = s.chat(id) {
             set_clipboard(chat.invite_link);
         }
@@ -895,7 +906,20 @@ pub(super) fn connect(s: Store, f: Flow) -> View {
                                         )
                                 },
                             )
-                            .otherwise(|| scanner(200.0, "Point your camera at your friend's code. They'll find it in You → Your code.")),
+                            .otherwise(move || {
+                                if crate::store::demo() {
+                                    scanner(200.0, "Point your camera at your friend's code. They'll find it in You → Your code.")
+                                } else {
+                                    // A real camera; the chat opens once their code is read.
+                                    view()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(crate::features::chats::new_chat::friend_scanner(200.0, move |chat| {
+                                            finish(s, chat, welcome())
+                                        }))
+                                        .child(muted("They'll find their code in You → Your code.").text_center())
+                                }
+                            }),
                         ),
                         Some(Way::Group) => card()
                             .gap_3()

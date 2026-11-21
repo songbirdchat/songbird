@@ -218,8 +218,19 @@ pub fn contact() {
     nav::push("help-contact", contact_page);
 }
 
+/// The log a request attaches, scrubbed on this device: this run's own events (the demo shows
+/// a sample).
+fn attached_log() -> String {
+    if crate::store::demo() {
+        scrub(SAMPLE_LOG)
+    } else {
+        crate::backend::applog::scrubbed()
+    }
+}
+
 fn contact_page() -> Screen {
     let s = store();
+    let sending = signal(false);
     let topic = signal(None::<&'static str>);
     let message = signal(String::new());
     let logs = signal(false);
@@ -265,7 +276,7 @@ fn contact_page() -> Screen {
         .child(group([
             toggle_row(
                 "Include redacted logs",
-                Some("Technical events from the last 24 hours. Never message content."),
+                Some("Technical events since Songbird opened, up to the last 24 hours. Never message content."),
                 move || logs.get(),
                 move |v| logs.set(v),
             ),
@@ -297,12 +308,23 @@ fn contact_page() -> Screen {
                         return;
                     }
                     // Exactly the scrubbed text the preview shows, and only with consent.
-                    let log = logs.get_untracked().then(|| scrub(SAMPLE_LOG));
-                    s.send_support(t, &message.get_untracked(), log, attach.get_untracked());
-                    nav::pop();
-                    toast("Sent. We'll get back to you soon.");
+                    let log = logs.get_untracked().then(attached_log);
+                    if sending.get_untracked() {
+                        return;
+                    }
+                    sending.set(true);
+                    // Said only once the server has the request (D-0184).
+                    s.send_support(t, &message.get_untracked(), log, attach.get_untracked(), move |sent| {
+                        let _ = sending.try_set(false);
+                        if sent {
+                            nav::pop();
+                            toast("Sent. We'll get back to you soon.");
+                        } else {
+                            toast("Your request couldn't be sent. Check your connection and try again.");
+                        }
+                    });
                 })
-                .disabled(move || !ready()),
+                .disabled(move || !ready() || sending.get()),
             ),
         );
     page("Contact us", page_scroll(body))
@@ -310,7 +332,12 @@ fn contact_page() -> Screen {
 
 /// Exactly what a support request attaches: the scrubbed log.
 fn logs_page() -> Screen {
-    let scrubbed = scrub(SAMPLE_LOG);
+    let scrubbed = attached_log();
+    let scrubbed = if scrubbed.is_empty() {
+        "Nothing logged yet in this session.".to_string()
+    } else {
+        scrubbed
+    };
     let body = view()
         .w_full()
         .max_w(px(760.0))

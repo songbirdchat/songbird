@@ -204,7 +204,6 @@ fn request_bar(cv: Conv) -> AnyElement {
                 })))
                 .child(view().flex_1().child(btn("Report", Variant::Outline, BtnSize::Md, move || {
                     s.report(chat);
-                    toast("Reported. Thank you.");
                 })))
                 .child(view().flex_1().child(btn("Accept", Variant::Primary, BtnSize::Md, move || {
                     s.accept_request(chat);

@@ -652,10 +652,7 @@ fn edit_sheet(s: Store, chat: ChatId, open: Signal<bool>) -> View {
                     return;
                 }
                 let desc = about.get_untracked().trim().to_string();
-                s.update_chat(chat, |c| {
-                    c.title = title;
-                    c.about = desc;
-                });
+                s.set_group_info(chat, title, desc);
                 s.push_message(
                     chat,
                     None,
@@ -820,7 +817,6 @@ fn report(s: Store, chat: ChatId) {
         "Report",
         move || {
             s.report(chat);
-            toast("Reported. Thank you.");
         },
     );
 }

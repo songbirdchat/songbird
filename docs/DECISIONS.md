@@ -199,6 +199,97 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0184 — No mock a real account can reach
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Context: the real-device pass (D-0183) found demo behaviour reachable by real accounts: a
+  WhatsApp link that "linked" nothing, support requests that sent nothing, made-up receipt
+  times, message requests never shown. An audit of every `mock` path in `apps/ui` (and every
+  store intent, for real chats and accounts) followed.
+- Rule: **only the demo fixtures (`store::demo()`) simulate**. A real account's intent reaches
+  app-core or the server, or, where the service doesn't exist yet, the entry point says so
+  plainly. Nothing says "sent", "linked" or "reported" before the server has answered.
+- Decision:
+  - **The server switch**: "Connect to Songbird's server" showed for real accounts and, off,
+    sent every screen down its sample-data branch. It shows only for the demo fixtures, and
+    `set_enabled(false)` is refused otherwise. The demo camera (a scanner that "sees" a code)
+    and the demo arrivals (`SONGBIRD_DEMO_ARRIVALS`) are the demo fixtures' only, not every
+    preview build's.
+  - **Message requests** (PROTOCOL §5.10): app-core's store (schema 8) marks each account the
+    user *accepted*: wrote to (every 1:1 send), accepted the request of, or whose chat another
+    of the user's devices wrote to (sent transcripts). Accounts known before schema 8 count as
+    accepted. A 1:1 chat with anyone else is a request (`Messenger::is_request`), shown under
+    Message requests; it gets no read receipts until accepted. Accept, delete and block are
+    real (`accept_request`, `delete_request`, the block), and accept and delete reach the
+    user's other devices as `SyncMessage.request_response`. Report-and-block reports, blocks,
+    then deletes, in that order in one task (the report needs the messages).
+  - **Deleting**: chats, cleared chats and "delete for me" were removed from the screen only,
+    and came back at the next start. app-core deletes them (`delete_chat`, `clear_chat`,
+    `delete_message` with their files, reactions, receipts, report proofs, pins and polls; the
+    list's preview never keeps a deleted message's text).
+  - **Sending**: an edit from the composer never reached the network (it called the local
+    edit); it is sent as a revision now, within a 15-minute window the UI enforces. "Retry" on a
+    failed real message faked Sent, Delivered and Read and then a canned reply from the real
+    contact; it deletes app-core's failed copy and sends again. A chat no server carries fails
+    its messages instead of simulating them. Files dropped on a desktop chat and photos from
+    the in-chat camera are sent as encrypted attachments (they were bodies with no bytes).
+  - **Reports**: every Report said "Reported. Thank you." at once; the result is said when the
+    server answers. Groups and channels are reportable for real: app-core keeps each group
+    message's franking proof too, and `report_group` reports the newest five from others,
+    each against its own sender (the server accepts a group's shared body, §5.14).
+  - **Group admin** (§6.6, §6.8): roles ("make admin"), permissions (who sends, adds, edits the
+    info, calls; approval), and the group's name and description changed this device only.
+    Roles and policy are commits of the roles extension, which every member checks
+    (`roles::authorize`); name and description are `GroupUpdate`s each receiver accepts only
+    from those the roles let edit the info (a description no longer overwrites the title).
+    Pinning and deleting others' messages are the protocol's (moderators and above), so for a
+    real group those two switches show as fixed. A link's expiry and number of joins are
+    registered with the server (`ttl`, `max_uses`, already in §6.8), so changing them makes a
+    new link; the screen says "Up to 10 people can join with it", not a count of joins the
+    server doesn't share. Unfollowing a channel leaves it. A real account's group of one (the
+    first run's "Create a group") is a real group, its link made on the server.
+  - **Message info**: delivered and read times were the send time plus one and two minutes.
+    app-core keeps each level's own time per recipient (schema 8); receipts from before show
+    "Earlier".
+  - **Support**: a ticket attached a hard-coded sample log (an example email, phone number and
+    IP) and the screen said "Sent" before anything left. The app keeps its own log of this run
+    (`backend::applog`: info and above, in memory only, at most 24 hours and 2,000 lines,
+    scrubbed by `crash::scrub` before the user previews it); the screen waits for the server.
+    Appeals likewise.
+  - **Accounts**: the account page showed a made-up username link and a "Switch accounts" whose
+    other account ("Radu (Work)") would have replaced the published profile. The link is the
+    server's (`username::make_link` at sign-up); one device holds one real account, said
+    plainly, until app-core keeps a store per account. A failed account report is said.
+  - **Things real accounts kept in memory only**: chat themes ride in each chat's state record
+    (`t=`); stars in `c/<chat>/stars`; "mute nudges" in `c/<contact>/nudges`; broadcast lists
+    and profile links as synced settings (`s/broadcasts`, `s/links`). The demo's broadcast
+    list, profile link and child's name ("Maria") are no longer a real account's defaults.
+  - **Scanning**: New chat's "Scan QR code" and the first run's "Scan a friend's code" were a
+    frame and a timer that "found" Ana; both use the camera now and open the scanned username
+    or group link. The page shows the user's real username link.
+  - **Hidden with an explanation**: WhatsApp chats need the bridge Prompt 14 builds after a
+    legal review: a real account's WhatsApp page says so, and nothing links. A second account
+    on one device: "isn't available yet".
+  - **Smaller**: the backups "Sign in again" opens the destination chooser instead of toasting
+    "Signed in"; a real video keeps only its player's controls (not the demo's scrubber); the
+    returning-device step refuses on a device that already has an account; username
+    suggestions check only the form (the claim asks the server); invite codes come from the
+    server only; plan and pack fallbacks are the demo's only; group create's Share opens the
+    share sheet.
+- Evidence: `apps/ui` `cargo test --lib` (226, new: link limits' summary, the edit window,
+  dropped files' paths, the app log); `songbird-app-core` (48, new: accepted marks and the
+  schema-8 migration, receipt times, deleting and clearing chats).
+- Consequences: app-core schema 8 (two migrations' worth of columns, forward only). Not done
+  here, for later: the attachment sheet still offers Event and Contact cards in real chats,
+  which fail honestly ("can't be sent in this chat yet") until app-core carries them; group
+  member lists for groups joined by Welcome still come only from what the device saw; a chat
+  scene is the user's own view (members aren't told). Comments that still called the device's
+  keys a stand-in were stale (the vault seals them under the platform's secure store, D-0172)
+  and say so now. Needs the end-to-end check on two phones:
+  requests, group roles and policy, link limits, and group reports against a server.
+
 ## D-0183 — What the first real-device call found
 
 - Date: 2026-11-20

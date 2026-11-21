@@ -45,8 +45,8 @@ const K_SEEN: &str = "sb.backup_seen";
 
 // ---------------------------------------------------------------- the recovery key
 
-/// This device's recovery key, made the first time it is asked for. mock: the device's
-/// keychain through app-core (A0) will hold it; NSH's app storage stands in.
+/// This device's recovery key, made the first time it is asked for; sealed under the
+/// platform's secure store by the vault (`vault::Storage`, D-0172).
 pub fn recovery_key() -> RecoveryKey {
     if let Some(k) = Storage::get_item(K_RECOVERY)
         .and_then(|h| wire::unhex(&h))

@@ -4,9 +4,8 @@
 //! intents that change it. Plain Rust and one global signal, so the merge
 //! into `model.rs` later is a move, not a rewrite.
 //!
-//! **Mock.** Each of these is an encrypted settings record in app-core
-//! (Prompt 9: one record per setting, last-writer-wins on a hybrid logical
-//! clock); here it lives in memory.
+//! Synced ones are encrypted settings records (Prompt 9: one record per
+//! setting, last-writer-wins on a hybrid logical clock; `backend::records`).
 
 use std::time::Duration;
 
@@ -131,7 +130,13 @@ pub struct ParentalRules {
 impl Default for ParentalRules {
     fn default() -> Self {
         Self {
-            child_name: "Maria".into(),
+            // A real parent's device knows no child's name (nothing passes between the two
+            // accounts but the signed policy): the screens say "Your child".
+            child_name: if super::demo() {
+                "Maria".into()
+            } else {
+                String::new()
+            },
             who_can_message: ChildContact::ApprovedOnly,
             groups_need_approval: true,
             block_unknown_calls: true,
@@ -173,7 +178,7 @@ pub struct SettingsExt {
     pub lists: Vec<String>,
     pub broadcasts: Vec<Broadcast>,
     pub parental: ParentalRules,
-    /// Mock: show the child's side of parental controls.
+    /// Show the child's side of parental controls (a preview of the rules as the child sees them).
     pub child_view: bool,
     pub links: Vec<String>,
     pub account_report: Option<String>,
@@ -197,14 +202,23 @@ impl Default for SettingsExt {
             protect_ip_in_calls: false,
             app_icon: 0,
             lists: vec!["Family".into(), "Work".into(), "Friends".into()],
-            broadcasts: vec![Broadcast {
-                id: 1,
-                name: "Family news".into(),
-                members: vec![5, 12, 3],
-            }],
+            // The demo's samples; a real account starts with none (D-0184).
+            broadcasts: if super::demo() {
+                vec![Broadcast {
+                    id: 1,
+                    name: "Family news".into(),
+                    members: vec![5, 12, 3],
+                }]
+            } else {
+                Vec::new()
+            },
             parental: ParentalRules::default(),
             child_view: false,
-            links: vec!["songbird.chat".into()],
+            links: if super::demo() {
+                vec!["songbird.chat".into()]
+            } else {
+                Vec::new()
+            },
             account_report: None,
             supervised: false,
         }
@@ -430,9 +444,16 @@ impl Store {
         self.profile_update(|p| p.presence = presence);
     }
 
-    /// Turns nudges off (or back on) from one person. mock: an encrypted
-    /// contact record in app-core.
+    /// Turns nudges off (or back on) from one person. A real contact's choice is an encrypted
+    /// record (`c/<contact>/nudges`) that follows the user to their other devices (D-0184).
     pub fn set_nudges_off(&self, contact: ContactId, off: bool) {
+        if crate::backend::chat::owns(contact) {
+            crate::backend::records::put(
+                *self,
+                &super::ext_contacts::chat_key(contact, "nudges"),
+                off.then(|| "off".to_string()),
+            );
+        }
         self.contacts.update(|cs| {
             if let Some(c) = cs.iter_mut().find(|c| c.id == contact) {
                 c.nudges_off = off;
@@ -446,10 +467,9 @@ impl Store {
     /// policy key and link secret, kept on this device, and the date
     /// supervision ends from the child's age and country. Returns the link.
     ///
-    /// mock: the child's account ID comes from scanning the code on the
-    /// child's phone (a camera, with the host projects); a random stand-in
-    /// until then. The child's side (age, scanned key and secret) is kept
-    /// here too, as the child's device would, for the child's view.
+    /// The demo's in-person link (both sides on one device, no server): the child's side
+    /// (age, scanned key and secret) is kept here too, for the child's view. A real account
+    /// links with the camera on two phones (`link_child_live`, D-0107).
     pub fn start_parental_link(&self, age: u8, country: &str) -> sup::ParentLink {
         let now = nsh_core::time::unix_ms().max(0.0) as u64;
         let (year, month) = sup::born(age, now);
@@ -571,7 +591,7 @@ impl Store {
 
     // ------------------------------------------------------------ chats in bulk
 
-    /// Archives every chat. mock: an encrypted chat-state record each.
+    /// Archives every chat (each real chat's state record follows, `backend::chat_state`).
     pub fn archive_all(&self) {
         let ids: Vec<ChatId> = self
             .chats

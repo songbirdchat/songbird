@@ -97,12 +97,16 @@ fn body() -> impl IntoElement {
                 crate::features::settings::privacy_centre,
             )))
             .child(section_title("Connection"))
-            .child(group_plain([toggle_row(
-                "Connect to Songbird's server",
-                Some("When it's off, Songbird runs on this device with sample chats."),
-                on,
-                backend::set_enabled,
-            )]))
+            // Only the demo fixtures can run without the server: for a real account it is always
+            // on, so no screen of it falls back to the sample data (D-0184).
+            .child(crate::store::demo().then(|| {
+                group_plain([toggle_row(
+                    "Connect to Songbird's server",
+                    Some("When it's off, Songbird runs on this device with sample chats."),
+                    on,
+                    backend::set_enabled,
+                )])
+            }))
             .child(view().px_4().pt_3().child(dynamic(move || {
                 let (tone, glyph, words) = link_label(state.with(|l| l.link));
                 banner(tone, glyph, words).into_element()

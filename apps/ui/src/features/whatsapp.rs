@@ -31,7 +31,7 @@ pub fn unsupported() -> impl Iterator<Item = &'static str> {
     FEATURES.iter().filter(|(_, ok)| !ok).map(|(f, _)| *f)
 }
 
-/// The link's pairing code. mock: app-core returns the code WhatsApp
+/// The demo's pairing code (real accounts can't link yet, D-0184): the bridge would return the code WhatsApp
 /// issues for "Link with phone number instead".
 const PAIRING_CODE: &str = "K7Q2-9XMB";
 
@@ -282,6 +282,12 @@ pub fn whatsapp_settings() {
 }
 
 fn whatsapp_settings_page() -> Screen {
+    // Linking needs Songbird's WhatsApp bridge, which waits for the interoperability rules and
+    // a legal review (Prompt 14): a real account is told so, never shown a link that isn't
+    // there (D-0184). The demo fixtures keep the designed flow.
+    if !crate::store::demo() {
+        return page("WhatsApp chats", page_scroll(unavailable_body()));
+    }
     let s = store();
     let linked = move || s.whatsapp_linked();
     let me = s.me.get_untracked();
@@ -294,7 +300,7 @@ fn whatsapp_settings_page() -> Screen {
                 .child(section_title("Status"))
                 .child(group([Row::new("Linked")
                     .icon(Icon::Check)
-                    // mock: the linked account comes from the bridge session.
+                    // The demo's linked account (only the demo reaches this page linked).
                     // The number keeps its country code, first digit and
                     // last three; the rest are dots, in its own groups.
                     .subtitle(format!("{} · +40\u{00A0}7••\u{00A0}•••\u{00A0}123 · synced just now", me.name))
@@ -346,6 +352,40 @@ fn whatsapp_settings_page() -> Screen {
         })
         .otherwise(|| opt_in_screen(false));
     page("WhatsApp chats", view().flex_1().child(body))
+}
+
+/// What a real account sees: WhatsApp chats aren't available yet, and why.
+fn unavailable_body() -> View {
+    view()
+        .w_full()
+        .max_w(px(760.0))
+        .self_center()
+        .px_4()
+        .pt_6()
+        .gap_4()
+        .child(
+            view()
+                .size(px(56.0))
+                .rounded(move || radius::lg())
+                .bg(move || c::accent())
+                .border(hairline())
+                .border_color(move || c::border())
+                .items_center()
+                .justify_center()
+                .text_color(move || c::primary())
+                .accessibility_elements_hidden(true)
+                .child(icon(Icon::Chats, 28.0)),
+        )
+        .child(flow_title("WhatsApp chats aren't available yet"))
+        .child(flow_lead(
+            "Talking to WhatsApp from Songbird needs a bridge between the two services. We're building it to the EU's interoperability rules, and it opens only once a legal review is done.",
+        ))
+        .child(
+            card()
+                .gap_3()
+                .child(bullet(Icon::Shield, c::primary, "Nothing is linked: Songbird has no access to your WhatsApp account."))
+                .child(bullet(Icon::Info, c::muted_fg, "When it's ready, it will be off until you turn it on here.")),
+        )
 }
 
 /// The availability table: each feature with a mark that differs in shape

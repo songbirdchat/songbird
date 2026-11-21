@@ -610,6 +610,9 @@ async fn two_app_cores_exchange_messages_and_receipts_end_to_end() {
     assert_eq!(m.text, "Hello Bob, this is end-to-end");
     assert_eq!((m.chat, m.author, m.id), (alice.account, alice.account, id));
     assert_eq!(bob.core.store.chats().unwrap()[0].unread, 1);
+    // A stranger's first message is a request on Bob's side; Alice wrote, so not on hers (D-0184).
+    assert!(bob.core.is_request(&alice.account).unwrap());
+    assert!(!alice.core.is_request(&bob.account).unwrap());
 
     // Alice gets the receipt: two ticks.
     assert_eq!(
@@ -676,6 +679,8 @@ async fn two_app_cores_exchange_messages_and_receipts_end_to_end() {
             }
         ));
     }
+    // Replying accepted Alice's request.
+    assert!(!bob.core.is_request(&alice.account).unwrap());
     // Search runs over the encrypted store.
     assert_eq!(bob.core.store.search("end-to-end", 10).unwrap().len(), 1);
     assert_eq!(
@@ -687,6 +692,35 @@ async fn two_app_cores_exchange_messages_and_receipts_end_to_end() {
             .len(),
         7
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_is_accepted_or_deleted_without_a_reply() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    alice
+        .core
+        .send_text(&bob.account, "Hi, we met at the conference")
+        .await
+        .unwrap();
+    assert!(matches!(pump(&mut bob).await, Received::Message(_)));
+    assert!(matches!(
+        pump(&mut alice).await,
+        Received::Status {
+            status: Status::Delivered,
+            ..
+        }
+    ));
+    assert!(bob.core.is_request(&alice.account).unwrap());
+    // Accepting tells Alice (her app gets Bob's profile key) and ends the request at once.
+    bob.core.accept_request(&alice.account).await.unwrap();
+    assert!(!bob.core.is_request(&alice.account).unwrap());
+    assert_eq!(pump(&mut alice).await, Received::Nothing);
+    assert!(alice.core.store.profile_key(&bob.account).unwrap().is_some());
+    // Deleting a chat removes it and its messages from Bob's store; Alice is not told.
+    bob.core.delete_chat(&alice.account).unwrap();
+    assert_eq!(bob.core.store.chats().unwrap(), Vec::new());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

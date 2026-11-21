@@ -77,20 +77,31 @@ fn body(chat: ChatId, id: MsgId) -> AnyElement {
             .build()
     };
 
-    let receipts = if cv.is_group() && !m.receipts.is_empty() {
-        let read: Vec<_> = m
-            .receipts
+    // A real message's receipts as app-core keeps them, each level's own time (D-0184).
+    let real = crate::backend::chat::receipt_times(id);
+    let when = |t: Option<Option<Minutes>>| match t {
+        Some(Some(t)) => Some(at(t)),
+        Some(None) => Some("Earlier".to_string()),
+        None => None,
+    };
+    let group_receipts: Vec<(u64, Option<Minutes>, Option<Minutes>)> = match &real {
+        Some(r) if cv.is_group() => r
+            .iter()
+            .map(|(who, d, rd, _)| (*who, d.map(|t| t.unwrap_or(m.at)), rd.map(|t| t.unwrap_or(m.at))))
+            .collect(),
+        _ => m.receipts.clone(),
+    };
+    let receipts = if cv.is_group() && !group_receipts.is_empty() {
+        let read: Vec<_> = group_receipts
             .iter()
             .filter_map(|(who, _, r)| r.map(|r| (*who, r)))
             .collect();
-        let delivered: Vec<_> = m
-            .receipts
+        let delivered: Vec<_> = group_receipts
             .iter()
             .filter(|(_, _, r)| r.is_none())
             .filter_map(|(who, d, _)| d.map(|d| (*who, d)))
             .collect();
-        let waiting: Vec<_> = m
-            .receipts
+        let waiting: Vec<_> = group_receipts
             .iter()
             .filter(|(_, d, r)| d.is_none() && r.is_none())
             .map(|(w, _, _)| *w)
@@ -127,11 +138,19 @@ fn body(chat: ChatId, id: MsgId) -> AnyElement {
             }))
             .into_element()
     } else {
-        // mock: app-core keeps the times its receipts arrived at.
         let status = m.status;
-        let delivered = (status >= Tick::Delivered && status != Tick::Failed).then(|| at(m.at + 1));
-        let read = (status >= Tick::Read && status != Tick::Failed).then(|| at(m.at + 2));
-        let played = (status == Tick::Played).then(|| at(m.at + 3));
+        let (delivered, read, played) = match real.as_ref().and_then(|r| r.first()) {
+            // A real chat: the times its receipts arrived.
+            Some((_, d, rd, p)) => (when(*d), when(*rd), when(*p)),
+            // A real message nobody answered yet.
+            None if real.is_some() => (None, None, None),
+            // The demo's: made from the tick, a minute apart.
+            None => (
+                (status >= Tick::Delivered && status != Tick::Failed).then(|| at(m.at + 1)),
+                (status >= Tick::Read && status != Tick::Failed).then(|| at(m.at + 2)),
+                (status == Tick::Played).then(|| at(m.at + 3)),
+            ),
+        };
         let row = move |label: &'static str, tick: Tick, when: Option<String>| {
             Row::new(label)
                 .leading(mark(tick))

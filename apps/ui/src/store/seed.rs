@@ -174,8 +174,23 @@ pub fn empty() -> Seed {
         calls: Vec::new(),
         call_links: Vec::new(),
         devices: Vec::new(),
-        settings: base.settings,
-        session: base.session,
+        // The demo's choices, minus what only the server or the user can say (D-0183: a real
+        // account showed the demo's PIN as on, WhatsApp as linked and invites it never had).
+        settings: Settings {
+            two_step_pin: false,
+            passkey: false,
+            whatsapp_linked: false,
+            backup_on: false,
+            backup_last: None,
+            backup_size: String::new(),
+            ..base.settings
+        },
+        session: Session {
+            recovery_key: String::new(),
+            invites_left: 0,
+            invites_used: 0,
+            ..base.session
+        },
     }
 }
 

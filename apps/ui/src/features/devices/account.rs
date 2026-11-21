@@ -191,12 +191,21 @@ fn body() -> AnyElement {
                     .subtitle(format!("@{} · Using now", me.username))
                     .trailing(icon(Icon::Check, 18.0).text_color(move || c::primary()))
                     .build(),
-                Row::new("Switch accounts")
-                    .icon(Icon::Users)
-                    .subtitle("Up to 3 accounts on this device")
-                    .chevron()
-                    .on_press(move || switcher_open.set(true))
-                    .build(),
+                // One real account per device for now (app-core keeps one store): said plainly
+                // instead of a switcher with nothing real behind it (D-0184).
+                if crate::store::demo() {
+                    Row::new("Switch accounts")
+                        .icon(Icon::Users)
+                        .subtitle("Up to 3 accounts on this device")
+                        .chevron()
+                        .on_press(move || switcher_open.set(true))
+                        .build()
+                } else {
+                    Row::new("One account on this device")
+                        .icon(Icon::Users)
+                        .subtitle("Using a second account on the same device isn't available yet.")
+                        .build()
+                },
             ])
             .into_element()
         })
@@ -310,16 +319,8 @@ pub fn account_switcher(open: Signal<bool>) -> AnyElement {
                             .build(),
                     );
                 }
-                rows.push(
-                    Row::new("Add account")
-                        .icon(Icon::UserPlus)
-                        .on_press(move || {
-                            open.set(false);
-                            // mock: a second account starts its own onboarding (app-core keeps one store per account).
-                            toast("Adding accounts comes with multi-account support in app-core");
-                        })
-                        .build(),
-                );
+                // Only the demo lists other accounts; adding one needs a store per account,
+                // which app-core doesn't keep yet, so no row offers it (D-0184).
                 group(rows).into_element()
             })
         })),
