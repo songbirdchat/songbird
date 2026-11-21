@@ -717,7 +717,14 @@ async fn a_request_is_accepted_or_deleted_without_a_reply() {
     bob.core.accept_request(&alice.account).await.unwrap();
     assert!(!bob.core.is_request(&alice.account).unwrap());
     assert_eq!(pump(&mut alice).await, Received::Nothing);
-    assert!(alice.core.store.profile_key(&bob.account).unwrap().is_some());
+    assert!(
+        alice
+            .core
+            .store
+            .profile_key(&bob.account)
+            .unwrap()
+            .is_some()
+    );
     // Deleting a chat removes it and its messages from Bob's store; Alice is not told.
     bob.core.delete_chat(&alice.account).unwrap();
     assert_eq!(bob.core.store.chats().unwrap(), Vec::new());

@@ -5021,6 +5021,7 @@ dependencies = [
  "songbird-keys",
  "songbird-proto",
  "songbird-types",
+ "tempfile",
  "thiserror 2.0.21",
  "tls_codec",
  "zeroize",

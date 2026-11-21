@@ -417,6 +417,7 @@ pub extern "system" fn Java_chat_songbird_camera_CameraBridge_nativeFrame(
         return;
     };
     // SAFETY: CameraX's planes, direct buffers Java keeps open until this call returns.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let Some(y) = (unsafe { direct(&env, &y) }) else {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         return;
@@ -452,6 +453,7 @@ pub extern "system" fn Java_chat_songbird_camera_CameraBridge_nativeFrame(
         return;
     }
     // SAFETY: as above.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let (Some(u), Some(v)) = (unsafe { direct(&env, &u) }, unsafe { direct(&env, &v) }) else {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         return;
@@ -510,6 +512,7 @@ pub(crate) fn video_frame(feed: u64, width: u32, height: u32, rgba: &[u8]) {
     call_void("videoFrame", "(JIILjava/nio/ByteBuffer;)V", |env| {
         // SAFETY: the buffer views `rgba`, which outlives this call; Java only reads it, and
         // copies it into a bitmap before returning.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let buf = unsafe { env.new_direct_byte_buffer(ptr, len) }.ok()?;
         Some(vec![
             JValueOwned::Long(feed),

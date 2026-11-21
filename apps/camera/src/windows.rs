@@ -59,6 +59,7 @@ fn consent(root: HKEY, key: &str) -> Option<String> {
     let mut len = u32::try_from(std::mem::size_of_val(&buf)).ok()?;
     // SAFETY: a registry read into a buffer whose size in bytes we pass; Windows writes at most
     // that many and NUL-terminates.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let status = unsafe {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         RegGetValueW(
@@ -86,6 +87,7 @@ fn consent(root: HKEY, key: &str) -> Option<String> {
 /// once; both are reference counted, so repeating them is harmless.
 fn mf() -> windows::core::Result<()> {
     // SAFETY: COM and Media Foundation start-up, as documented, with no arguments we own.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -98,6 +100,7 @@ fn devices() -> windows::core::Result<Vec<IMFActivate>> {
     mf()?;
     // SAFETY: Media Foundation calls with attributes made here; the array it allocates is read
     // within its count, each element's reference taken over once, then the array freed.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let mut attrs: Option<IMFAttributes> = None;
@@ -128,6 +131,7 @@ fn string(device: &IMFActivate, key: &windows::core::GUID) -> Option<String> {
     let mut value = PWSTR::null();
     let mut len = 0u32;
     // SAFETY: Media Foundation allocates the string; we copy it and free it.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         device
@@ -231,6 +235,7 @@ fn read_inner(lens: &str, pump: &mut Pump) -> windows::core::Result<()> {
     // SAFETY: Media Foundation's documented sequence: activate the source, make a reader with
     // video processing (so it converts to NV12), choose NV12, read samples; every object is
     // made here and released when dropped.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let (reader, width, height, stride) = unsafe {
         // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let source: IMFMediaSource = device.ActivateObject()?;
@@ -262,6 +267,7 @@ fn read_inner(lens: &str, pump: &mut Pump) -> windows::core::Result<()> {
         let mut timestamp = 0i64;
         let mut sample: Option<IMFSample> = None;
         // SAFETY: a synchronous read into out-parameters made here.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             reader.ReadSample(
@@ -283,6 +289,7 @@ fn read_inner(lens: &str, pump: &mut Pump) -> windows::core::Result<()> {
         let Some(sample) = sample else { continue };
         pump.running(lens);
         // SAFETY: the buffer is locked while we copy at most its current length from it.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let bytes = unsafe {
             // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let buffer = sample.ConvertToContiguousBuffer()?;
@@ -383,6 +390,7 @@ mod preview {
             };
             // SAFETY: Direct2D calls on the context NSH draws with; the pixels outlive the call
             // that copies them into the bitmap.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 if let Ok(bitmap) = dc.CreateBitmap(

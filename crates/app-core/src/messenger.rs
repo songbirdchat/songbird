@@ -258,12 +258,7 @@ pub(crate) fn unhex<const N: usize>(s: &str) -> Result<[u8; N]> {
     if s.len() != N * 2 {
         return Err(Error::Malformed);
     }
-    let mut out = [0u8; N];
-    for (o, i) in out.iter_mut().zip((0..s.len()).step_by(2)) {
-        *o = u8::from_str_radix(s.get(i..i + 2).ok_or(Error::Malformed)?, 16)
-            .map_err(|_| Error::Malformed)?;
-    }
-    Ok(out)
+    unhex_vec(s)?.try_into().map_err(|_| Error::Malformed)
 }
 
 pub(crate) fn json(body: &[u8]) -> Result<serde_json::Value> {
@@ -543,13 +538,15 @@ impl<N: Net> Messenger<N> {
         action: schema::request_response::Action,
     ) {
         let sync = SyncMessage {
-            kind: Some(sync_message::Kind::RequestResponse(schema::RequestResponse {
-                action: action.into(),
-                chat: Some(ChatRef {
-                    account: from.to_vec(),
-                    group_id: Vec::new(),
-                }),
-            })),
+            kind: Some(sync_message::Kind::RequestResponse(
+                schema::RequestResponse {
+                    action: action.into(),
+                    chat: Some(ChatRef {
+                        account: from.to_vec(),
+                        group_id: Vec::new(),
+                    }),
+                },
+            )),
         };
         let _ = self.send_own(Body::Sync(sync)).await;
     }

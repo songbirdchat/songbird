@@ -59,24 +59,9 @@ jobs:
           path: sarif-results
           if-no-files-found: error
           retention-days: 30
+      # Waivers (D-0015: tests/ only; D-0185: reviewed lines, owner-approved) live in
+      # scripts/codeql-gate.py and .github/codeql-waivers.json. Every other finding fails the job.
       - name: Fail on findings
         env:
           LANGUAGE: ${{ matrix.language }}
-        run: |
-          set -euo pipefail
-          sarif="sarif-results/${LANGUAGE}.sarif"
-          # Owner-approved waiver (D-0015 amendment): published test vectors use fixed nonces by
-          # design, so rust/hard-coded-cryptographic-value is skipped for files under a tests/
-          # directory only. Every other rule, and this rule everywhere else, still fails the job.
-          waived='(.ruleId == "rust/hard-coded-cryptographic-value" and ((.locations[0].physicalLocation.artifactLocation.uri // "") | test("(^|/)tests/")))'
-          results=".runs[].results[]? | select($waived | not)"
-          jq -r ".runs[].results[]? | select($waived)"' |
-            "::notice file=\(.locations[0].physicalLocation.artifactLocation.uri // "?"),line=\(.locations[0].physicalLocation.region.startLine // 1)::waived (D-0015, tests/ only): \(.ruleId): \(.message.text)"' "$sarif"
-          count=$(jq "[$results] | length" "$sarif")
-          if [ "$count" -ne 0 ]; then
-            jq -r "$results"' |
-              "::error file=\(.locations[0].physicalLocation.artifactLocation.uri // "?"),line=\(.locations[0].physicalLocation.region.startLine // 1)::\(.ruleId): \(.message.text)"' "$sarif"
-            echo "CodeQL reported $count finding(s) for $LANGUAGE." >&2
-            exit 1
-          fi
-          echo "CodeQL: no findings for $LANGUAGE."
+        run: python3 -I scripts/codeql-gate.py "sarif-results/${LANGUAGE}.sarif" .

@@ -142,8 +142,10 @@ impl<N: Net> Messenger<N> {
         } else {
             roles.explicit.insert(who, role);
         }
-        let line =
-            super::client::LogLine::of(songbird_content::schema::group_update::Kind::RoleChanged, &[*account]);
+        let line = super::client::LogLine::of(
+            songbird_content::schema::group_update::Kind::RoleChanged,
+            &[*account],
+        );
         self.commit_roles_logged(gid, &roles, line).await
     }
 

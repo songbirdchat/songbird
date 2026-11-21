@@ -1,0 +1,71 @@
+{
+  "_": "CodeQL findings waived one source line at a time (D-0185). A waiver matches the rule, the file and the exact text of the flagged line (trimmed), so a new or edited line fails again until it is reviewed and listed here. Read by scripts/codeql-gate.py.",
+  "waivers": [
+    {
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/app-core/src/crypto/pqxdh.rs",
+      "line": "hkdf(&[0u8; 32], &ikm, &[INFO], sk.as_mut())?;",
+      "reason": "PQXDH's KDF: the HKDF salt is a zero-filled hash-length byte sequence by specification (Signal PQXDH §2.5)."
+    },
+    {
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/app-core/src/crypto/ratchet.rs",
+      "line": "hkdf(&[0u8; 32], mk, &[INFO_MK], out.as_mut())?;",
+      "reason": "The Double Ratchet's message-key expansion: a zero salt by specification (Signal Double Ratchet §5.2); the input is a single-use message key."
+    },
+    {
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/app-core/src/mls/crypto.rs",
+      "line": "let psk_id_hash = labeled_extract(b\"\", b\"psk_id_hash\", b\"\");",
+      "reason": "HPKE's base-mode key schedule: the empty salt is mandated by RFC 9180 §5.1."
+    },
+    {
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/app-core/src/mls/crypto.rs",
+      "line": "let info_hash = labeled_extract(b\"\", b\"info_hash\", info);",
+      "reason": "HPKE's base-mode key schedule: the empty salt is mandated by RFC 9180 §5.1."
+    },
+    {
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/app-core/src/crypto/envelope.rs",
+      "line": "const SALT: &[u8] = b\"songbird.v1/envelope\";",
+      "reason": "A public domain-separation label used as the HKDF salt (RFC 5869 §3.1 allows a non-secret salt); the secret is the ephemeral X25519 output."
+    },
+    {
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/app-core/src/crypto/envelope.rs",
+      "line": "out.extend_from_slice(&seal(&k, &[0; 12], &aad, &pt)?);",
+      "reason": "The envelope key is derived from a fresh ephemeral X25519 key for every envelope and seals exactly one message, so a fixed nonce never repeats under a key (as HPKE's single-shot mode)."
+    },
+    {
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/app-core/src/crypto/envelope.rs",
+      "line": "let pt = zeroize::Zeroizing::new(open(&k, &[0; 12], &aad, r.rest())?);",
+      "reason": "Opening the single-use envelope key's one message (see the seal side)."
+    },
+    {
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/app-core/src/mls/links.rs",
+      "line": "hkdf(b\"songbird.v1/group-link\", secret, &[info], out.as_mut())?;",
+      "reason": "A public domain-separation label used as the HKDF salt; the secret is the link's random 32-byte secret."
+    },
+    {
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/app-core/src/blob.rs",
+      "line": "pub const AVATAR: &[u8] = b\"songbird.v1/avatar\";",
+      "reason": "A context label (HKDF salt and AEAD associated data); the key is the caller's random profile or link key and the nonce is random."
+    },
+    {
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/app-core/src/blob.rs",
+      "line": "assert!(open_blob(b\"other\", &[1; 32], &b).is_err());",
+      "reason": "A unit test that a different context label cannot open the blob."
+    },
+    {
+      "rule": "rust/hard-coded-cryptographic-value",
+      "path": "crates/app-core/src/username_link.rs",
+      "line": "const CONTEXT: &[u8] = b\"songbird.v1/username-link\";",
+      "reason": "A context label for blob sealing; the key is a fresh random link key."
+    }
+  ]
+}

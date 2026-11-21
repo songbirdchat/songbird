@@ -67,11 +67,14 @@ pub(crate) fn vault_key() -> Result<Zeroizing<[u8; 32]>, Error> {
 
 pub(crate) fn biometrics() -> Option<Kind> {
     // SAFETY: a fresh context, used on this thread only; `canEvaluatePolicy` has no side effect.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let ctx = unsafe { LAContext::new() };
     // SAFETY: as above.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { ctx.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthenticationWithBiometrics) }
         .ok()?;
     // SAFETY: as above; read after `canEvaluatePolicy`, as the documentation asks.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     match unsafe { ctx.biometryType() } {
         LABiometryType::FaceID => Some(Kind::FaceId),
         LABiometryType::TouchID => Some(Kind::TouchId),
@@ -82,10 +85,12 @@ pub(crate) fn biometrics() -> Option<Kind> {
 
 pub(crate) fn authenticate(reason: &str, done: Done) {
     // SAFETY: a fresh context.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let ctx = unsafe { LAContext::new() };
     // The system offers its own "Enter passcode" fallback otherwise; the app's passcode is the
     // fallback here, so the button is hidden (an empty title).
     // SAFETY: setting a property on our own context.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe { ctx.setLocalizedFallbackTitle(Some(&NSString::from_str(""))) };
     // The reply holds the context: it must live until the reply, and the framework holds the
     // reply until then.
@@ -97,6 +102,7 @@ pub(crate) fn authenticate(reason: &str, done: Done) {
             Ok(())
         } else {
             // SAFETY: the framework passes a valid error or null, alive for this call.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let code = unsafe { err.as_ref() }.map_or(0, NSError::code);
             Err(match code {
                 -1 => Failure::NotRecognised,
@@ -116,6 +122,7 @@ pub(crate) fn authenticate(reason: &str, done: Done) {
     // SAFETY: the reply keeps the context alive until it runs; the reason is non-empty, as
     // the method requires; the block is `Send`-safe (it only touches a Mutex and a `Send`
     // callback).
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         ctx.evaluatePolicy_localizedReason_reply(
             LAPolicy::DeviceOwnerAuthenticationWithBiometrics,
@@ -246,16 +253,19 @@ mod locate {
                 requested: RefCell::new(false),
             });
             // SAFETY: NSObject's designated initializer.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { msg_send![super(this), init] }
         }
 
         /// Acts on the permission as it stands: ask, refuse, or take a fix.
         fn follow(&self, manager: &CLLocationManager) {
             // SAFETY: a property of the manager this delegate serves, on its thread.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let status = unsafe { manager.authorizationStatus() };
             match status {
                 CLAuthorizationStatus::NotDetermined => {
                     // SAFETY: as above; the answer comes back through `did_change`.
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     unsafe { manager.requestWhenInUseAuthorization() };
                 }
                 CLAuthorizationStatus::Denied | CLAuthorizationStatus::Restricted => {
@@ -264,6 +274,7 @@ mod locate {
                 _ => {
                     if !self.ivars().requested.replace(true) {
                         // SAFETY: as above; one fix, delivered to `did_update` or `did_fail`.
+                        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                         unsafe { manager.requestLocation() };
                     }
                 }
@@ -276,6 +287,7 @@ mod locate {
             }
             if let Some(m) = self.ivars().manager.borrow_mut().take() {
                 // SAFETY: detaching ourselves from the manager we made.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 unsafe { m.setDelegate(None) };
             }
             // Released at the next request, not here: this method runs on it.
@@ -295,7 +307,9 @@ mod locate {
         let delegate = Delegate::new(mtm, done);
         // SAFETY: a fresh manager on the main thread, configured before use; the delegate
         // outlives it (kept in LIVE until it finishes).
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let manager = unsafe { CLLocationManager::new() };
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             manager.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
             manager.setDesiredAccuracy(kCLLocationAccuracyHundredMeters);
@@ -331,6 +345,8 @@ pub(crate) fn save_media(
 
     use crate::photos::{Failure, Kind};
 
+    // iOS: the app's own sandboxed tmp (no other process can reach it); Photos moves the file out and it is removed after (D-0185).
+    // nosemgrep: rust.lang.security.temp-dir.temp-dir
     let file = std::env::temp_dir().join(format!(
         "songbird-save-{}-{}",
         std::process::id(),
@@ -360,9 +376,12 @@ pub(crate) fn save_media(
         };
         let change = RcBlock::new(move || {
             // SAFETY: inside the library's change block, as `creationRequestForAsset` requires.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let request = unsafe { PHAssetCreationRequest::creationRequestForAsset() };
             // SAFETY: a fresh options object; the file is moved into the library (none left).
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let options = unsafe { PHAssetResourceCreationOptions::new() };
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 options.setShouldMoveFile(true);
                 request.addResourceWithType_fileURL_options(resource, &url, Some(&options));
@@ -379,12 +398,14 @@ pub(crate) fn save_media(
             });
         });
         // SAFETY: the shared library; the blocks live until the library calls them.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             PHPhotoLibrary::sharedPhotoLibrary()
                 .performChanges_completionHandler(RcBlock::as_ptr(&change), Some(&completion));
         }
     });
     // SAFETY: a class method; the handler is called once, on a queue of the system's.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         PHPhotoLibrary::requestAuthorizationForAccessLevel_handler(
             PHAccessLevel::AddOnly,
@@ -407,6 +428,7 @@ unsafe extern "C-unwind" fn did_register(
     token: *mut objc2_foundation::NSData,
 ) {
     // SAFETY: UIKit passes the token, alive for this call.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let Some(token) = (unsafe { token.as_ref() }) else {
         return;
     };
@@ -442,17 +464,20 @@ fn register_on_main(mtm: objc2::MainThreadMarker) -> bool {
     use objc2_ui_kit::UIApplication;
     let app = UIApplication::sharedApplication(mtm);
     // SAFETY: reading the app's delegate property on the main thread.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let Some(delegate) = (unsafe { app.delegate() }) else {
         return false;
     };
     let obj: &objc2::runtime::AnyObject = delegate.as_ref();
     // SAFETY: the delegate is a live object; its class lives as long as the process.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let cls = unsafe { ffi::object_getClass(obj) }.cast_mut();
     if cls.is_null() {
         return false;
     }
     // SAFETY: adding (never replacing: `class_addMethod` refuses a selector the class already
     // has) two methods with the exact signatures UIKit calls them with: `v@:@@`.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     unsafe {
         let types = c"v@:@@".as_ptr();
         let _ = ffi::class_addMethod(
@@ -500,6 +525,7 @@ pub(crate) fn speaker(on: bool) {
         AVAudioSessionPortOverride::None
     };
     // SAFETY: the app's shared audio session; overriding the output port has no other effect.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let _ = unsafe { AVAudioSession::sharedInstance().overrideOutputAudioPort_error(port) };
 }
 
@@ -544,6 +570,7 @@ pub(crate) mod callkit {
     fn rtc_session() -> Option<Retained<AnyObject>> {
         let cls = AnyClass::get(c"RTCAudioSession")?;
         // SAFETY: a class method returning the shared instance.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let s: Option<Retained<AnyObject>> = unsafe { msg_send![cls, sharedInstance] };
         s
     }
@@ -552,6 +579,7 @@ pub(crate) mod callkit {
     fn manual_audio(on: bool) {
         if let Some(s) = rtc_session() {
             // SAFETY: documented RTCAudioSession properties.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 let _: () = msg_send![&*s, setUseManualAudio: on];
                 let _: () = msg_send![&*s, setIsAudioEnabled: !on];
@@ -651,6 +679,7 @@ pub(crate) mod callkit {
 
     fn call_update(caller: &str, video: bool) -> Retained<CXCallUpdate> {
         // SAFETY: fresh objects, configured before use.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             let u = CXCallUpdate::new();
             let handle = CXHandle::initWithType_value(
@@ -672,6 +701,7 @@ pub(crate) mod callkit {
         PROVIDER.with_borrow(|p| {
             if let Some(p) = p {
                 // SAFETY: our provider, on the main queue; the block lives for the call.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 unsafe {
                     p.reportNewIncomingCallWithUUID_update_completion(
                         &NSUUID::from_bytes(id),
@@ -694,10 +724,12 @@ pub(crate) mod callkit {
         let delegate: Retained<Delegate> = {
             let this = Delegate::alloc(mtm).set_ivars(Ivars { on });
             // SAFETY: NSObject's designated initializer.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { msg_send![super(this), init] }
         };
         // SAFETY: CallKit and PushKit set up on the main thread, their delegate kept for the
         // life of the app (KEEP), the main queue for both.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             let config = CXProviderConfiguration::new();
             config.setSupportsVideo(true);
@@ -733,6 +765,7 @@ pub(crate) mod callkit {
             PROVIDER.with_borrow(|p| {
                 if let Some(p) = p {
                     // SAFETY: our provider on the main thread.
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     unsafe { p.reportCallWithUUID_updated(&NSUUID::from_bytes(id), &u) };
                 }
             });
@@ -751,6 +784,7 @@ pub(crate) mod callkit {
             PROVIDER.with_borrow(|p| {
                 if let Some(p) = p {
                     // SAFETY: as above.
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     unsafe {
                         p.reportCallWithUUID_endedAtDate_reason(
                             &NSUUID::from_bytes(id),
@@ -798,6 +832,7 @@ pub(crate) mod passkeys {
 
     fn data(obj: &AnyObject, sel: objc2::runtime::Sel) -> Vec<u8> {
         // SAFETY: the credential's documented `NSData` properties, looked up by selector.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let d: Option<Retained<NSData>> = unsafe { msg_send![obj, performSelector: sel] };
         d.map(|d| d.to_vec()).unwrap_or_default()
     }
@@ -862,6 +897,7 @@ pub(crate) mod passkeys {
             let mtm = MainThreadMarker::new().expect("main thread");
             let app = objc2_ui_kit::UIApplication::sharedApplication(mtm);
             // SAFETY: the app's windows; the first is the one NSH shows.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let windows: Retained<NSArray<AnyObject>> = unsafe { msg_send![&*app, windows] };
             windows.firstObject().expect("a window")
         }
@@ -885,10 +921,12 @@ pub(crate) mod passkeys {
                 done: RefCell::new(Some(done)),
             });
             // SAFETY: NSObject's designated initializer.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { msg_send![super(this), init] }
         };
         // SAFETY: a controller for one request, its delegate and presentation provider ours,
         // both kept alive (LIVE) until the next request.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             let controller = ASAuthorizationController::initWithAuthorizationRequests(
                 ASAuthorizationController::alloc(),
@@ -906,6 +944,7 @@ pub(crate) mod passkeys {
 
     fn provider(rp_id: &str) -> Retained<ASAuthorizationPlatformPublicKeyCredentialProvider> {
         // SAFETY: a provider for the relying party.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             ASAuthorizationPlatformPublicKeyCredentialProvider::initWithRelyingPartyIdentifier(
                 ASAuthorizationPlatformPublicKeyCredentialProvider::alloc(),
@@ -929,6 +968,7 @@ pub(crate) mod passkeys {
         );
         super::on_main(move |mtm| {
             // SAFETY: a registration request from our provider.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let req = unsafe {
                 provider(&rp_id).createCredentialRegistrationRequestWithChallenge_name_userID(
                     &NSData::with_bytes(&challenge),
@@ -953,6 +993,7 @@ pub(crate) mod passkeys {
         done: AssertDone,
     ) {
         // SAFETY: an assertion request from our provider, its allowed credentials set before use.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let req = unsafe {
             let r = provider(rp_id)
                 .createCredentialAssertionRequestWithChallenge(&NSData::with_bytes(challenge));
@@ -1018,6 +1059,7 @@ pub(crate) mod store {
         let r = match code {
             0 if !jws.is_null() => {
                 // SAFETY: the Swift side passes a NUL-terminated string alive for this call.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 let s = unsafe { CStr::from_ptr(jws) }
                     .to_string_lossy()
                     .into_owned();
@@ -1038,12 +1080,14 @@ pub(crate) mod store {
         let id = park(done);
         // SAFETY: `p` outlives the call (the Swift side copies it at once); the callback is a
         // plain C function.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { sb_store_buy(p.as_ptr(), id, answered) };
     }
 
     pub(crate) fn current(done: Done) {
         let id = park(done);
         // SAFETY: as above.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { sb_store_current(id, answered) };
     }
 }
@@ -1109,6 +1153,7 @@ pub(crate) mod icon {
                 return done(false);
             };
             // SAFETY: the setter is unsafe only because it may take `None`; this passes an image.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
             done(true);
         });
@@ -1286,6 +1331,7 @@ pub(crate) mod share {
         };
         // SAFETY: ReplayKit's picker view, made and configured on the main thread; the
         // window is the app's own; the button is the picker's, pressed as a tap would.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             let picker: Retained<AnyObject> = msg_send![cls, new];
             let _: () = msg_send![&*picker, setPreferredExtension: &*NSString::from_str(EXTENSION)];
@@ -1314,6 +1360,7 @@ pub(crate) mod share {
     fn remove_picker() {
         if let Some(p) = PICKER.with_borrow_mut(Option::take) {
             // SAFETY: our picker view, on the main thread.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             let _: () = unsafe { msg_send![&*p, removeFromSuperview] };
         }
     }

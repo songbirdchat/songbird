@@ -7,6 +7,8 @@ use std::sync::mpsc;
 use songbird_device::passkeys;
 
 fn main() {
+    // A manual probe: the argument only names the relying party to try, never a security decision (D-0185).
+    // nosemgrep: rust.lang.security.args.args
     let rp = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "songbird.test".to_owned());

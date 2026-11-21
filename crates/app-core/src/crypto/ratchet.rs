@@ -163,8 +163,7 @@ fn message_key(mk: &[u8; 32]) -> Result<(Zeroizing<[u8; 32]>, [u8; 12])> {
     let (k, n) = out.split_at(32);
     let mut key = Zeroizing::new([0u8; 32]);
     key.copy_from_slice(k);
-    let mut nonce = [0u8; 12];
-    nonce.copy_from_slice(n);
+    let nonce: [u8; 12] = n.try_into().map_err(|_| Error::Malformed)?;
     Ok((key, nonce))
 }
 
@@ -486,7 +485,7 @@ mod tests {
     use super::*;
 
     fn pair() -> (State, State) {
-        let sk = [5u8; 32];
+        let sk = *super::super::random::<32>().unwrap();
         let spk = X25519Pair::generate().unwrap();
         let a = State::initiator(&sk, b"ad".to_vec(), spk.public()).unwrap();
         let b = State::responder(&sk, b"ad".to_vec(), spk).unwrap();

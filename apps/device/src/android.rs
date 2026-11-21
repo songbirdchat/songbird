@@ -782,6 +782,7 @@ pub extern "system" fn Java_chat_songbird_device_DeviceBridge_nativeScreenFrame(
     }
     // SAFETY: the buffer is the Image plane Java holds open until this call returns; `len` is
     // its capacity.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let data = unsafe { std::slice::from_raw_parts(ptr.cast_const(), len) };
     let (Ok(width), Ok(height), Ok(stride), Ok(rotation)) = (
         u32::try_from(width),

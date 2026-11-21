@@ -474,8 +474,9 @@ mod tests {
 
     #[test]
     fn aead_round_trips_and_refuses_tampering() {
-        let c = seal(&[1; 32], &[0; 12], b"ad", b"hello").unwrap();
-        assert_eq!(open(&[1; 32], &[0; 12], b"ad", &c).unwrap(), b"hello");
-        assert_eq!(open(&[1; 32], &[0; 12], b"ae", &c), Err(Error::Verify));
+        let (k, n) = (random::<32>().unwrap(), random::<12>().unwrap());
+        let c = seal(&k, &n, b"ad", b"hello").unwrap();
+        assert_eq!(open(&k, &n, b"ad", &c).unwrap(), b"hello");
+        assert_eq!(open(&k, &n, b"ae", &c), Err(Error::Verify));
     }
 }

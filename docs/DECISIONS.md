@@ -199,6 +199,51 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0185 — PR #72's checks: reviewed CodeQL lines, Semgrep markers, the SQLite advisory
+
+- Date: 2026-11-22
+- Status: accepted (the owner approved the three waivers, 2026-11-22)
+- Decided by: owner, on the agent's review
+- Context: PR #72 (A2) failed three checks. The quality bar stopped at `cargo fmt`; run locally
+  past it, the client-crypto manifest guard and `cargo deny` failed too. CodeQL (Rust,
+  `security-extended`) reported 20 `rust/hard-coded-cryptographic-value` findings outside
+  `tests/`; Semgrep reported 123 blocking findings in the new native code.
+- Decision:
+  1. **Fixed in code, not waived.** `cargo fmt`. CodeQL: buffers zero-filled then overwritten
+     (`unhex`, `pow::decode`, the ratchet's nonce split) now come from `try_into`; unit tests in
+     `src/` use random keys and nonces. Semgrep: app-core's store test uses `tempfile` (already
+     the workspace's test dependency). The manifest guard (`crates/groups/tests/
+     no_service_links_client_crypto.rs`) exempts the client core `crates/app-core` by name, which
+     keeps OpenMLS state on the device (D-0145), and now fails if any service or other crate
+     depends on it.
+  2. **CodeQL, 11 reviewed lines waived** in `.github/codeql-waivers.json`, read by
+     `scripts/codeql-gate.py` (which also keeps D-0015's `tests/` waiver). A waiver matches the
+     rule, the file and the exact trimmed source line, so an edited or new line fails again;
+     unused waivers are reported. The lines: PQXDH's and the Double Ratchet's zero HKDF salts
+     and HPKE's empty salts (required by their specifications); public domain labels used as
+     HKDF salts or blob contexts; the envelope's fixed nonce, under a key derived from a fresh
+     ephemeral X25519 exchange that seals exactly one message.
+  3. **Semgrep, as D-0118:** each of the 119 `unsafe` lines in `apps/camera`, `apps/device` and
+     `crates/aws-lc-ext` (recorded exceptions D-0110, D-0172 to D-0174, D-0145) checked for its
+     `SAFETY:` comment and marked `// nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage`;
+     the passkey probe's argument (`args`) and the iOS photo save's sandboxed temporary file
+     (`temp-dir`) marked with their reasons. No rule changed or disabled.
+  4. **RUSTSEC-2026-0459 ignored** in `deny.toml` (and `.cargo/audit.toml`'s reason corrected:
+     the crate is now built). SQLite before 3.54 can return stale memory for a crafted database
+     and `-wal` pair. Exposure needs a less trusted party to write both files; app-core opens
+     only its own sandboxed database and the maps tool only tiles our pipeline made. The fix
+     (rusqlite 0.41+, SQLCipher 4.20 with SQLite 3.54.1) does not resolve: OpenMLS 0.9.2, the
+     latest, pins its optional SQLite storage to rusqlite 0.37 and `links = "sqlite3"` allows one
+     copy.
+  5. **cargo-vet:** `flate2`, `miniz_oxide`, `crc32fast`, `adler2` and `simd-adler32` exempt
+     with notes: they reach only the operator-run maps import tool (D-0142, gzip of tiles).
+- Consequences: the iOS photo save could hand Photos the bytes instead of a file (no plaintext
+  copy on disk); not done until videos are checked on a device. Revisit the SQLite ignore with
+  the next OpenMLS release, by 2027-02-22.
+- Evidence (2026-11-22, local): Semgrep 1.185.0 with CI's configs, 0 findings; `cargo deny
+  check`, `cargo vet --locked` ok; `scripts/codeql-gate.py` on the PR's SARIF waives the 11 lines and fails only on
+  the 9 rewritten ones; `cargo xtask workflows` ok.
+
 ## D-0184 — No mock a real account can reach
 
 - Date: 2026-11-20

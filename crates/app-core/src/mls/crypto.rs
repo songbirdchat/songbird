@@ -656,11 +656,15 @@ mod tests {
             c.verify_signature(SignatureScheme::ED25519, b"n", &pk, &sig)
                 .is_err()
         );
+        let (k, n) = (
+            crate::crypto::random::<16>().unwrap(),
+            crate::crypto::random::<12>().unwrap(),
+        );
         let ct = c
-            .aead_encrypt(AeadType::Aes128Gcm, &[1; 16], b"x", &[0; 12], b"a")
+            .aead_encrypt(AeadType::Aes128Gcm, &*k, b"x", &*n, b"a")
             .unwrap();
         assert_eq!(
-            c.aead_decrypt(AeadType::Aes128Gcm, &[1; 16], &ct, &[0; 12], b"a")
+            c.aead_decrypt(AeadType::Aes128Gcm, &*k, &ct, &*n, b"a")
                 .unwrap(),
             b"x"
         );

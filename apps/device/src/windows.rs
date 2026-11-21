@@ -34,10 +34,12 @@ fn take(out: &CRYPT_INTEGER_BLOB) -> Zeroizing<Vec<u8>> {
         Vec::new()
     } else {
         // SAFETY: DPAPI filled `pbData` with `cbData` bytes, valid until freed below.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::slice::from_raw_parts(out.pbData, len) }.to_vec()
     };
     if !out.pbData.is_null() {
         // SAFETY: DPAPI allocated `pbData` with LocalAlloc; it is freed once, here.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             let _ = LocalFree(Some(HLOCAL(out.pbData.cast())));
         }
@@ -54,6 +56,7 @@ fn protect(data: &[u8], encrypt: bool) -> Option<Zeroizing<Vec<u8>>> {
     let mut out = CRYPT_INTEGER_BLOB::default();
     // SAFETY: `blob` points into `input`, alive for the call; `out` is written by DPAPI and
     // freed in `take`. This user's DPAPI key, no prompt.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let ok = unsafe {
         if encrypt {
             CryptProtectData(
@@ -132,10 +135,13 @@ pub(crate) fn protect_windows(on: bool) {
     unsafe extern "system" fn each(hwnd: HWND, list: LPARAM) -> windows::core::BOOL {
         let mut pid = 0u32;
         // SAFETY: `hwnd` is a live window EnumWindows hands over; `pid` is ours to write.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
         // SAFETY: as above.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if pid == unsafe { GetCurrentProcessId() } {
             // SAFETY: `list` is the `Vec` passed below, alive for the whole enumeration.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { &mut *(list.0 as *mut Vec<HWND>) }.push(hwnd);
         }
         true.into()
@@ -143,10 +149,12 @@ pub(crate) fn protect_windows(on: bool) {
     let mut windows: Vec<HWND> = Vec::new();
     // SAFETY: the callback only reads the window's process and pushes onto `windows`, which
     // outlives the call.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let _ = unsafe { EnumWindows(Some(each), LPARAM(&raw mut windows as isize)) };
     let affinity = if on { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
     for w in windows {
         // SAFETY: our own top-level windows, found above.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let _ = unsafe { SetWindowDisplayAffinity(w, affinity) };
     }
 }
@@ -197,10 +205,13 @@ pub(crate) fn set_icon(png: &[u8]) -> bool {
     unsafe extern "system" fn each(hwnd: HWND, list: LPARAM) -> windows::core::BOOL {
         let mut pid = 0u32;
         // SAFETY: `hwnd` is a live window EnumWindows hands over; `pid` is ours to write.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
         // SAFETY: as above.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if pid == unsafe { GetCurrentProcessId() } {
             // SAFETY: `list` is the `Vec` passed below, alive for the whole enumeration.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { &mut *(list.0 as *mut Vec<HWND>) }.push(hwnd);
         }
         true.into()
@@ -209,9 +220,11 @@ pub(crate) fn set_icon(png: &[u8]) -> bool {
     // a handful in a session.
     let make = |metric| {
         // SAFETY: a plain system metric.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let size = unsafe { GetSystemMetrics(metric) };
         // SAFETY: `png` is a whole PNG, which this call reads as an icon resource (version
         // 0x30000), scaled to `size`.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { CreateIconFromResourceEx(png, true, 0x0003_0000, size, size, LR_DEFAULTCOLOR) }
             .ok()
     };
@@ -221,9 +234,11 @@ pub(crate) fn set_icon(png: &[u8]) -> bool {
     let mut windows: Vec<HWND> = Vec::new();
     // SAFETY: the callback only reads the window's process and pushes onto `windows`, which
     // outlives the call.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let _ = unsafe { EnumWindows(Some(each), LPARAM(&raw mut windows as isize)) };
     for w in &windows {
         // SAFETY: our own windows, found above; the icons outlive them.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             SendMessageW(
                 *w,
@@ -288,6 +303,7 @@ pub(crate) mod passkeys {
 
     pub(crate) fn available() -> bool {
         // SAFETY: a plain query; webauthn.dll is part of Windows 10 1903 and later.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { WebAuthNGetApiVersionNumber() >= 1 }
     }
 
@@ -324,8 +340,10 @@ pub(crate) mod passkeys {
         unsafe extern "system" fn each(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
             let mut pid = 0u32;
             // SAFETY: `hwnd` is a live window EnumWindows hands over; `pid` is ours to write.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut pid)) };
             // SAFETY: plain queries; `found` is the HWND below, alive for the enumeration.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe {
                 if pid == GetCurrentProcessId() && IsWindowVisible(hwnd).as_bool() {
                     *(found.0 as *mut HWND) = hwnd;
@@ -335,6 +353,7 @@ pub(crate) mod passkeys {
             true.into()
         }
         // SAFETY: plain queries of windows.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             let front = GetForegroundWindow();
             let mut pid = 0u32;
@@ -365,6 +384,7 @@ pub(crate) mod passkeys {
             return Vec::new();
         }
         // SAFETY: webauthn.dll's answer holds `n` bytes at `p` until freed, after this copy.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe { std::slice::from_raw_parts(p, n as usize) }.to_vec()
     }
 
@@ -434,6 +454,7 @@ pub(crate) mod passkeys {
                 };
                 // SAFETY: every pointer is to a value above, alive until the call returns; the
                 // answer is copied out and freed with webauthn.dll's own function.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 let answer = unsafe {
                     WebAuthNAuthenticatorMakeCredential(
                         window(),
@@ -447,6 +468,7 @@ pub(crate) mod passkeys {
                 match answer {
                     Ok(a) if !a.is_null() => {
                         // SAFETY: a non-null attestation from webauthn.dll, freed below.
+                        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                         let created = unsafe {
                             let r = &*a;
                             let c = Created {
@@ -505,6 +527,7 @@ pub(crate) mod passkeys {
                 };
                 // SAFETY: as for making one: our values outlive the call; the answer is copied and
                 // freed with webauthn.dll's function.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 let answer = unsafe {
                     WebAuthNAuthenticatorGetAssertion(
                         window(),
@@ -516,6 +539,7 @@ pub(crate) mod passkeys {
                 match answer {
                     Ok(a) if !a.is_null() => {
                         // SAFETY: a non-null assertion from webauthn.dll, freed below.
+                        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                         let assertion = unsafe {
                             let r: &WEBAUTHN_ASSERTION = &*a;
                             let out = Assertion {

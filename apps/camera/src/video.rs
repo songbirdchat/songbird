@@ -187,11 +187,13 @@ mod ios {
     fn image(width: u32, height: u32, px: &[u8]) -> Option<CFRetained<CGImage>> {
         let (w, h) = (usize::try_from(width).ok()?, usize::try_from(height).ok()?);
         // SAFETY: `px` holds `px.len()` bytes; CFData copies them.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let data = unsafe { CFData::new(None, px.as_ptr(), isize::try_from(px.len()).ok()?) }?;
         let provider = CGDataProvider::with_cf_data(Some(&data))?;
         let space = CGColorSpace::new_device_rgb()?;
         // SAFETY: the layout matches `px`: 8 bits a component, 4 bytes a pixel (the fourth
         // unused), `w * 4` bytes a row, rows of `h`; no decode array.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             CGImage::new(
                 w,
@@ -235,6 +237,7 @@ mod ios {
             ty: 0.0,
         });
         // SAFETY: a CGImage is the object a layer's `contents` takes; set on the main thread.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         unsafe {
             let obj = image.map(|i| &*std::ptr::from_ref(i).cast::<AnyObject>());
             layer.setContents(obj);
@@ -312,11 +315,13 @@ mod ios {
                 let mtm = MainThreadMarker::new().expect("components are made on the main thread");
                 // SAFETY: UIView's designated initializer.
                 let view: Retained<UIView> =
+                    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                     unsafe { msg_send![UIView::alloc(mtm), initWithFrame: CGRect::ZERO] };
                 view.setClipsToBounds(true);
                 // The frames go on a layer of their own, turned for each frame's rotation.
                 let layer = CALayer::new();
                 // SAFETY: a constant CoreAnimation exports.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 layer.setContentsGravity(unsafe { kCAGravityResizeAspectFill });
                 view.layer().addSublayer(&layer);
                 Box::new(VideoView {

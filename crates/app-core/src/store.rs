@@ -824,10 +824,7 @@ impl Store {
             ))?;
         }
         for table in ["messages", "pins", "outbox"] {
-            db(tx.execute(
-                &format!("DELETE FROM {table} WHERE chat = ?1"),
-                [&chat[..]],
-            ))?;
+            db(tx.execute(&format!("DELETE FROM {table} WHERE chat = ?1"), [&chat[..]]))?;
         }
         if keep {
             db(tx.execute(
@@ -947,14 +944,16 @@ impl Store {
              JOIN messages m ON m.author = f.author AND m.id = f.id
              WHERE m.chat = ?1 AND f.author != ?2 ORDER BY f.rowid DESC LIMIT ?3",
         ))?;
-        let rows = db(st.query_map(params![&chat[..], &me[..], i64::from(n)], |r| {
-            Ok((
-                r.get::<_, Vec<u8>>(0)?,
-                r.get::<_, Vec<u8>>(1)?,
-                r.get::<_, Vec<u8>>(2)?,
-                r.get::<_, Vec<u8>>(3)?,
-            ))
-        }))?;
+        let rows = db(
+            st.query_map(params![&chat[..], &me[..], i64::from(n)], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            }),
+        )?;
         rows.map(|r| {
             let (a, stamp, fk, content) = db(r)?;
             Ok((arr16(&a)?, (stamp, fk, content)))
@@ -1747,12 +1746,8 @@ mod tests {
 
     #[test]
     fn the_file_is_encrypted_and_a_wrong_key_is_refused() {
-        let dir = std::env::temp_dir().join(format!(
-            "sb-store-{}",
-            hex(&*crate::crypto::random::<8>().unwrap())
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("db");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
         {
             let mut s = Store::open(&path, &[7; 32]).unwrap();
             s.insert_message(&msg(1, 2, 3, 10, "a very findable secret phrase"), true)
@@ -1765,7 +1760,6 @@ mod tests {
         let s = Store::open(&path, &[7; 32]).unwrap();
         assert_eq!(s.search("findable", 10).unwrap().len(), 1);
         drop(s);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1794,9 +1788,10 @@ mod tests {
         .unwrap();
         s.migrate().unwrap();
         assert!(s.is_accepted(&friend).unwrap() && s.is_accepted(&stranger).unwrap());
-        let n: i64 = s
-            .db
-            .query_row("SELECT read_ms FROM receipts WHERE ms = 77", [], |r| r.get(0))
+        let n: i64 =
+            s.db.query_row("SELECT read_ms FROM receipts WHERE ms = 77", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(n, 77);
     }

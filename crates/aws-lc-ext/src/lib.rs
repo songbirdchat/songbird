@@ -34,6 +34,7 @@ mod ffi {
     impl Drop for Ctx {
         fn drop(&mut self) {
             // SAFETY: the pointer came from EVP_PKEY_CTX_new_id and is freed once, here.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { sys::EVP_PKEY_CTX_free(self.0) }
         }
     }
@@ -43,6 +44,7 @@ mod ffi {
     impl Drop for Key {
         fn drop(&mut self) {
             // SAFETY: the pointer came from keygen (or is null, which EVP_PKEY_free accepts).
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { sys::EVP_PKEY_free(self.0) }
         }
     }
@@ -52,21 +54,25 @@ mod ffi {
     impl Drop for Md {
         fn drop(&mut self) {
             // SAFETY: the pointer came from EVP_MD_CTX_new and is freed once, here.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
             unsafe { sys::EVP_MD_CTX_free(self.0) }
         }
     }
 
     pub(super) fn ml_kem_768(seed: &[u8; 64]) -> Result<(Vec<u8>, Vec<u8>), Failed> {
         // SAFETY: plain constructor call; the result is checked for null.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let ctx = Ctx(unsafe { sys::EVP_PKEY_CTX_new_id(sys::EVP_PKEY_KEM, ptr::null_mut()) });
         if ctx.0.is_null() {
             return Err(Failed);
         }
         // SAFETY: ctx is a live KEM context.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { sys::EVP_PKEY_CTX_kem_set_params(ctx.0, sys::NID_MLKEM768) } != 1 {
             return Err(Failed);
         }
         // SAFETY: ctx is a live KEM context with its parameters set.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { sys::EVP_PKEY_keygen_init(ctx.0) } != 1 {
             return Err(Failed);
         }
@@ -74,6 +80,7 @@ mod ffi {
         let mut seed_len: usize = seed.len();
         // SAFETY: seed points to 64 readable bytes and seed_len says so; out_pkey is a valid
         // pointer to a null EVP_PKEY*, which aws-lc fills with a new key (freed by `Key`).
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe {
             sys::EVP_PKEY_keygen_deterministic(
                 ctx.0,
@@ -89,6 +96,7 @@ mod ffi {
         let mut sk = vec![0u8; ML_KEM_768_SK];
         let mut sk_len = sk.len();
         // SAFETY: sk has sk_len writable bytes; aws-lc writes at most that many and updates it.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { sys::EVP_PKEY_get_raw_private_key(key.0, sk.as_mut_ptr(), &raw mut sk_len) }
             != 1
             || sk_len != ML_KEM_768_SK
@@ -98,6 +106,7 @@ mod ffi {
         let mut pk = vec![0u8; ML_KEM_768_PK];
         let mut pk_len = pk.len();
         // SAFETY: pk has pk_len writable bytes; aws-lc writes at most that many and updates it.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { sys::EVP_PKEY_get_raw_public_key(key.0, pk.as_mut_ptr(), &raw mut pk_len) } != 1
             || pk_len != ML_KEM_768_PK
         {
@@ -108,19 +117,23 @@ mod ffi {
 
     pub(super) fn shake256(input: &[u8], out: &mut [u8]) -> Result<(), Failed> {
         // SAFETY: plain constructor call; checked for null.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         let md = Md(unsafe { sys::EVP_MD_CTX_new() });
         if md.0.is_null() {
             return Err(Failed);
         }
         // SAFETY: md is live; EVP_shake256 returns a static method table.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { sys::EVP_DigestInit_ex(md.0, sys::EVP_shake256(), ptr::null_mut()) } != 1 {
             return Err(Failed);
         }
         // SAFETY: input points to input.len() readable bytes.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { sys::EVP_DigestUpdate(md.0, input.as_ptr().cast(), input.len()) } != 1 {
             return Err(Failed);
         }
         // SAFETY: out points to out.len() writable bytes.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         if unsafe { sys::EVP_DigestFinalXOF(md.0, out.as_mut_ptr(), out.len()) } != 1 {
             return Err(Failed);
         }
