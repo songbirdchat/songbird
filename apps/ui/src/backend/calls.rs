@@ -53,9 +53,9 @@ const HAND_TOPIC: &str = "songbird.v1/call-hand";
 /// the name is in neither the URL nor the server, so without it everyone else saw "Call link".
 const LINK_NAME_TOPIC: &str = "songbird.v1/call-link-name";
 /// Remote video frames shown per second at most (the tiles are small; the encoder sends more).
-const VIDEO_FPS: u64 = 15;
+const VIDEO_FPS: u32 = 15;
 /// Frames a second drawn natively on phones (no engine hop, so smoother than [`VIDEO_FPS`]).
-const NATIVE_VIDEO_FPS: u64 = 24;
+const NATIVE_VIDEO_FPS: u32 = 24;
 /// The camera's capture size asked of the encoder (it scales what the camera gives).
 const CAMERA: (u32, u32) = (640, 480);
 
@@ -336,9 +336,9 @@ async fn join(
     };
     let call = Arc::new(call);
     if !is_live(ui_call) {
-        drop(background(async move {
+        off_engine(async move {
             let _ = call.close().await;
-        }));
+        });
         return;
     }
     with_live(|l| l.media = Some(call.clone()));
@@ -354,9 +354,9 @@ async fn join(
     call.set_microphone_muted(muted);
     if let Some(hello) = hello {
         let c = call.clone();
-        drop(background(async move {
+        off_engine(async move {
             let _ = c.send_data(HELLO_TOPIC, hello, None).await;
-        }));
+        });
     }
     if hand {
         set_hand(ui_call, true);
@@ -568,9 +568,23 @@ fn on_event(ui_call: u64, ev: Event) {
             }
         }
         Event::Left(identity) => {
+            let mut name = None;
             ui::live::update(ui_call, |c| {
+                name = c
+                    .participants
+                    .iter()
+                    .find(|p| p.identity == identity)
+                    .map(|p| p.name.clone());
                 c.participants.retain(|p| p.identity != identity);
             });
+            let direct_call = LIVE.with_borrow(|l| l.as_ref().is_some_and(|l| l.peer.is_some()));
+            if let Some(name) = name.filter(|n| !n.is_empty())
+                && !direct_call
+            {
+                let line = format!("{name} left the call");
+                announce_for_accessibility(line.clone());
+                toast(line);
+            }
             ui::live::frame(&identity, None);
             if in_link() {
                 link_left(ui_call, &identity);
@@ -705,9 +719,9 @@ fn joined(ui_call: u64, identity: String) {
             guard.as_ref().and_then(|m| m.call_hello(&call, &own).ok())
         };
         if let Some(hello) = hello {
-            drop(background(async move {
+            off_engine(async move {
                 let _ = media.send_data(HELLO_TOPIC, hello, Some(&identity)).await;
-            }));
+            });
         }
         Ok(())
     });
@@ -764,21 +778,15 @@ fn show_video(ui_call: u64, identity: String, video: songbird_calls_media::Remot
         return show_video_natively(ui_call, identity, video);
     }
     let (tx, mut rx) = tokio::sync::mpsc::channel::<songbird_calls_media::Rgba>(2);
-    drop(background(async move {
-        let mut frames = Box::pin(video.frames());
-        let mut last = std::time::Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .unwrap_or_else(std::time::Instant::now);
+    off_engine(async move {
+        // The newest frame only, converted only when shown (D-0183).
+        let mut frames = Box::pin(video.latest_frames(VIDEO_FPS));
         while let Some(f) = frames.next().await {
-            if last.elapsed() < Duration::from_millis(1000 / VIDEO_FPS) {
-                continue;
-            }
-            last = std::time::Instant::now();
             if tx.send(upright(f)).await.is_err() {
                 return;
             }
         }
-    }));
+    });
     spawn(async move {
         while let Some(f) = rx.recv().await {
             if !is_live(ui_call) {
@@ -802,23 +810,15 @@ fn show_video(ui_call: u64, identity: String, video: songbird_calls_media::Remot
 fn show_video_natively(ui_call: u64, identity: String, video: songbird_calls_media::RemoteVideo) {
     let feed = songbird_camera::video::feed_id(&identity);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(2);
-    drop(background(async move {
-        let mut frames = Box::pin(video.frames());
-        let gap = Duration::from_millis(1000 / NATIVE_VIDEO_FPS);
-        let mut last = std::time::Instant::now()
-            .checked_sub(gap)
-            .unwrap_or_else(std::time::Instant::now);
+    off_engine(async move {
+        // The newest frame only, converted only when shown, turned by the view (D-0183).
+        let mut frames = Box::pin(video.latest_frames(NATIVE_VIDEO_FPS));
         let mut started = false;
         while let Some(f) = frames.next().await {
-            if last.elapsed() < gap {
-                continue;
-            }
-            last = std::time::Instant::now();
-            let f = upright(f);
             if f.width == 0 || f.height == 0 {
                 continue;
             }
-            songbird_camera::video::show(feed, f.width, f.height, f.pixels);
+            songbird_camera::video::show(feed, f.width, f.height, f.rotation, f.pixels);
             if !started {
                 started = true;
                 if tx.send(true).await.is_err() {
@@ -828,7 +828,7 @@ fn show_video_natively(ui_call: u64, identity: String, video: songbird_calls_med
         }
         songbird_camera::video::clear(feed);
         let _ = tx.send(false).await;
-    }));
+    });
     spawn(async move {
         while let Some(on) = rx.recv().await {
             if !is_live(ui_call) {
@@ -842,31 +842,13 @@ fn show_video_natively(ui_call: u64, identity: String, video: songbird_calls_med
 
 /// A frame turned the way its sender's camera was held.
 fn upright(f: songbird_calls_media::Rgba) -> songbird_calls_media::Rgba {
-    let (w, h) = (f.width as usize, f.height as usize);
-    if f.rotation == 0 || f.pixels.len() != w * h * 4 {
-        return f;
-    }
-    let (nw, nh) = if f.rotation == 180 { (w, h) } else { (h, w) };
-    let mut out = vec![0u8; f.pixels.len()];
-    for y in 0..h {
-        for x in 0..w {
-            let (nx, ny) = match f.rotation {
-                90 => (h - 1 - y, x),
-                180 => (w - 1 - x, h - 1 - y),
-                _ => (y, w - 1 - x),
-            };
-            let (from, to) = ((y * w + x) * 4, (ny * nw + nx) * 4);
-            if let (Some(src), Some(dst)) = (f.pixels.get(from..from + 4), out.get_mut(to..to + 4))
-            {
-                dst.copy_from_slice(src);
-            }
-        }
-    }
+    let (width, height, pixels) =
+        songbird_camera::video::rotated(f.width, f.height, f.rotation, f.pixels);
     songbird_calls_media::Rgba {
-        width: u32::try_from(nw).unwrap_or(0),
-        height: u32::try_from(nh).unwrap_or(0),
+        width,
+        height,
         rotation: 0,
-        pixels: out,
+        pixels,
     }
 }
 
@@ -931,11 +913,11 @@ fn pump_camera() {
     .flatten() else {
         return;
     };
-    drop(background(async move {
+    off_engine(async move {
         while let Some(frame) = frames.recv().await {
             send_frame(&cam, &frame);
         }
-    }));
+    });
 }
 
 fn send_frame(cam: &VideoSender, frame: &songbird_camera::Frame) {
@@ -971,9 +953,9 @@ pub fn set_hand(ui_call: u64, raised: bool) {
         },
         None => vec![u8::from(raised)],
     };
-    drop(background(async move {
+    off_engine(async move {
         let _ = m.send_data(HAND_TOPIC, payload, None).await;
-    }));
+    });
 }
 
 /// Starts sharing the screen (or a window); `false` with a toast when it can't.
@@ -1049,7 +1031,7 @@ fn share_phone_screen(ui_call: u64, media: Arc<Call>) {
                         with_live(|l| (l.ui == ui_call).then(|| l.screen.take()).flatten())
                             .flatten()
                     {
-                        drop(background(async move { share.stop().await }));
+                        off_engine(async move { share.stop().await });
                     }
                     ui::live::update(ui_call, |c| c.sharing = None);
                     if matches!(step, Step::Ended) {
@@ -1070,7 +1052,7 @@ pub fn stop_sharing(ui_call: u64) {
     if let Some(share) =
         with_live(|l| (l.ui == ui_call).then(|| l.screen.take()).flatten()).flatten()
     {
-        drop(background(async move { share.stop().await }));
+        off_engine(async move { share.stop().await });
     }
 }
 
@@ -1392,9 +1374,9 @@ fn send_card(ui_call: u64, call: &Arc<Call>, to: Option<String>) {
                 .and_then(|m| m.link_card(&root, &own, &name).ok())
         };
         if let Some(card) = card {
-            drop(background(async move {
+            off_engine(async move {
                 let _ = call.send_data(CARD_TOPIC, card, to.as_deref()).await;
-            }));
+            });
         }
         Ok(())
     });
@@ -1428,9 +1410,9 @@ fn send_link_name(media: &Arc<Call>, identity: &str) {
         return;
     };
     let (media, to) = (Arc::clone(media), identity.to_owned());
-    drop(background(async move {
+    off_engine(async move {
         let _ = media.send_data(LINK_NAME_TOPIC, payload, Some(&to)).await;
-    }));
+    });
 }
 
 /// Someone left: those still present get a new key from this device (so the leaver cannot
@@ -1503,9 +1485,9 @@ fn send_key(ui_call: u64, identity: String, card: Card) {
                 .await
         };
         match envelope {
-            Ok(env) => drop(background(async move {
+            Ok(env) => off_engine(async move {
                 let _ = media.send_data(KEY_TOPIC, env, Some(&identity)).await;
-            })),
+            }),
             Err(_) => toast("Someone in the call couldn't be sent your key."),
         }
         Ok(())
@@ -1851,30 +1833,53 @@ pub fn closed(ui_call: u64, reason: EndReason, by_user: bool) {
             _ => {}
         }
     }
+    // Nothing more leaves this device from the moment the call ends, whatever the network does
+    // (D-0183): the microphone and camera go quiet before the room is left.
+    if let Some(m) = &live.media {
+        m.set_microphone_muted(true);
+    }
+    if let Some(cam) = &live.camera {
+        cam.set_muted(true);
+    }
     let (media, screen) = (live.media, live.screen);
     if screen.is_some() && songbird_device::share::supported() {
         songbird_device::share::stop();
     }
-    let leaving = background(async move {
-        if let Some(share) = screen {
-            share.stop().await;
-        }
-        let mut traffic = (0, 0);
-        if let Some(media) = media {
-            // What WebRTC counted for this call, for Network usage.
-            traffic = media.traffic().await;
-            let _ = media.close().await;
-        }
-        traffic
+    // A detached task: the call screen closing doesn't cancel the leave, and the task runs in
+    // the runtime's context (`closed` comes from a press, which has none, D-0183).
+    Owner::detached().run(|| {
+        spawn(async move {
+            let leaving = background(async move {
+                if let Some(share) = screen {
+                    share.stop().await;
+                }
+                let mut traffic = (0, 0);
+                if let Some(media) = media {
+                    // What WebRTC counted for this call, for Network usage.
+                    traffic = media.traffic().await;
+                    let _ = media.close().await;
+                }
+                traffic
+            });
+            if let Ok((sent, received)) = leaving.await {
+                super::usage::count(
+                    super::usage::Lane::Calls,
+                    usize::try_from(sent).unwrap_or(usize::MAX),
+                    usize::try_from(received).unwrap_or(usize::MAX),
+                );
+            }
+        });
     });
-    spawn(async move {
-        if let Ok((sent, received)) = leaving.await {
-            super::usage::count(
-                super::usage::Lane::Calls,
-                usize::try_from(sent).unwrap_or(usize::MAX),
-                usize::try_from(received).unwrap_or(usize::MAX),
-            );
-        }
+}
+
+/// Runs `Send` work on the runtime's threads, fire and forget, from anywhere: a press or an
+/// event as well as a task. NSH's `background` is `tokio::spawn`, which needs the runtime's
+/// context, and the engine thread has it only while it polls a task (D-0183).
+fn off_engine(work: impl std::future::Future<Output = ()> + Send + 'static) {
+    Owner::detached().run(|| {
+        spawn(async move {
+            let _ = background(work).await;
+        });
     });
 }
 

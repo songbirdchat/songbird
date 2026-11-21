@@ -391,14 +391,17 @@ fn call_row(s: Store, r: CallRecord) -> View {
                         ),
                 ),
         )
-        .child(icon_btn(
-            if r.video { Icon::Video } else { Icon::Phone },
-            format!(
-                "{} {title}",
-                if video { "Video call" } else { "Voice call" }
-            ),
-            move || start_call_in(&s, chat, video),
-        ))
+        // A link call has no chat to call back into: its link rejoins it.
+        .child((s.chat(chat).is_some()).then(|| {
+            icon_btn(
+                if r.video { Icon::Video } else { Icon::Phone },
+                format!(
+                    "{} {title}",
+                    if video { "Video call" } else { "Voice call" }
+                ),
+                move || start_call_in(&s, chat, video),
+            )
+        }))
 }
 
 /// A call's info: who, the calls with them that day, call back.

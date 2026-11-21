@@ -728,6 +728,37 @@ impl<N: Net> Messenger<N> {
         self.send_data(to, data, text).await
     }
 
+    /// Sends a text replying to a message, in a 1:1 chat or a group: the reply names the quoted
+    /// message (its author account and ID) and carries the quoted words, so the other side
+    /// shows the quote even when it no longer has the message (D-0183). Answers the message ID.
+    pub async fn send_reply(
+        &mut self,
+        chat: &[u8; 16],
+        text: &str,
+        quoted: ([u8; 16], [u8; 16]),
+        quoted_text: &str,
+    ) -> Result<[u8; 16]> {
+        let message = schema::Message {
+            text: Some(Text {
+                body: text.into(),
+                spans: Vec::new(),
+            }),
+            quote: Some(schema::Quote {
+                target: Some(schema::MessageRef {
+                    author: quoted.0.to_vec(),
+                    message_id: quoted.1.to_vec(),
+                }),
+                text: (!quoted_text.is_empty()).then(|| Text {
+                    body: quoted_text.into(),
+                    spans: Vec::new(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        self.send_message(chat, message, text).await
+    }
+
     /// Sends files (photos, documents, voice notes) to a 1:1 chat: each encrypted on this device,
     /// uploaded for every recipient device and this account's other devices, and named by
     /// pointers inside the encrypted message (D-0141). Answers the message ID.
@@ -2071,6 +2102,25 @@ pub fn attachments_of(content: &[u8]) -> Vec<schema::AttachmentPointer> {
             ..
         })) => m.attachments,
         _ => Vec::new(),
+    }
+}
+
+/// The message a stored message replies to, if any: the quoted message's author account and ID.
+#[must_use]
+pub fn quote_in(content: &[u8]) -> Option<([u8; 16], [u8; 16])> {
+    let c = Content::decode(content).ok()?;
+    match c.body {
+        Some(Body::Data(DataMessage {
+            kind: Some(data_message::Kind::Message(m)),
+            ..
+        })) => {
+            let target = m.quote?.target?;
+            Some((
+                target.author.as_slice().try_into().ok()?,
+                target.message_id.as_slice().try_into().ok()?,
+            ))
+        }
+        _ => None,
     }
 }
 

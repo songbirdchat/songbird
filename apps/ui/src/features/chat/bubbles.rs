@@ -1045,10 +1045,13 @@ fn photo_frame(shot: Memo<(String, u64, u32, u32)>, label: impl Fn() -> String +
         .child(
             image(move || {
                 shot.with(|s| {
-                    // A real photo: its bytes once this device has them
-                    // (tap to download); the illustrations only in the demo.
-                    if crate::backend::chat::is_media(s.1) {
-                        crate::backend::chat::media_src(s.1).unwrap_or_else(|| ImageSrc::from(""))
+                    // A real photo: its bytes once this device has them (tracked, so a photo
+                    // still sending or downloading appears when it can; D-0183: a sent photo
+                    // stayed blank until tapped); the illustrations only in the demo.
+                    if let Some(src) = crate::backend::chat::media_src(s.1) {
+                        src
+                    } else if crate::backend::chat::is_media(s.1) || !crate::store::demo() {
+                        ImageSrc::from("")
                     } else {
                         portrait::photo(&s.0, s.1, s.2.max(1), s.3.max(1))
                     }
@@ -1066,8 +1069,18 @@ fn photo_frame(shot: Memo<(String, u64, u32, u32)>, label: impl Fn() -> String +
                 })
             },
             move || {
-                icon_btn(Icon::Download, "Download photo", move || {
-                    crate::backend::chat::load_photo(shot.with_untracked(|s| s.1));
+                let msg = shot.with_untracked(|s| s.1);
+                // A failed download says so and offers to try again.
+                dynamic(move || {
+                    Some(if crate::backend::chat::photo_failed(msg) {
+                        icon_btn(Icon::Refresh, "Couldn't download the photo. Try again", move || {
+                            crate::backend::chat::retry_photo(msg);
+                        })
+                    } else {
+                        icon_btn(Icon::Download, "Download photo", move || {
+                            crate::backend::chat::retry_photo(msg);
+                        })
+                    })
                 })
             },
         ))

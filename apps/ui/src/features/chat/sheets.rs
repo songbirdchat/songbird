@@ -138,15 +138,36 @@ fn tile(glyph: Icon, label: &'static str, f: impl Fn() + 'static) -> AnyElement 
         .into_element()
 }
 
+/// Runs the share sheet's chosen action once, under no owner (a picker's task outlives the sheet).
+fn run_chosen(chosen: Signal<Option<fn(Conv)>>, cv: Conv) {
+    if let Some(f) = chosen.try_get().flatten() {
+        chosen.set(None);
+        Owner::detached().run(|| f(cv));
+    }
+}
+
 /// Photo & video, Camera, Document, Location, Contact, Poll, Event,
 /// Sticker: four to a row. Each picker is a mock that sends a realistic
 /// body. A sheet on phones; on desktops a popover above the paperclip.
 fn attach_sheet(cv: Conv) -> AnyElement {
     let open = cv.attach_open;
+    // A tile's choice runs once the sheet has gone (`app_sheet_then`): on a phone the next sheet
+    // or the system picker can't show while this one is still leaving, and a picker's task
+    // started under the tile was cancelled with it (D-0183).
+    let chosen: Signal<Option<fn(Conv)>> = signal(None);
     let then = move |f: fn(Conv)| {
         move || {
-            open.set(false);
-            f(cv);
+            if cv.wide {
+                open.set(false);
+                f(cv);
+            } else {
+                chosen.set(Some(f));
+                open.set(false);
+                // Where the sheet tells no `Close` (no exit to wait for), the choice still runs.
+                Owner::detached().run(|| {
+                    set_timeout(std::time::Duration::from_millis(450), move || run_chosen(chosen, cv));
+                });
+            }
         }
     };
     let whatsapp =
@@ -266,7 +287,10 @@ fn attach_sheet(cv: Conv) -> AnyElement {
             .child(footnote("Files and photos are end-to-end encrypted too.").text_center())
     };
     if !cv.wide {
-        return app_sheet(open, "Share", content().px_3().pb_3()).into_element();
+        return app_sheet_then(open, "Share", content().px_3().pb_3(), move || {
+            run_chosen(chosen, cv);
+        })
+        .into_element();
     }
     // Desktops: a popover anchored above the paperclip, its leading edge
     // on the button's, kept 8pt inside the window; Escape or a press
@@ -1061,4 +1085,34 @@ pub(crate) fn timer_sheet(s: crate::store::Store, chat: ChatId, open: Signal<boo
             ])),
     )
     .into_element()
+}
+
+#[cfg(test)]
+mod attach_tests {
+    use nsh_engine::{EngineConfig, Root};
+    use nsh_testing::Headless;
+
+    use super::*;
+    use crate::store::Store;
+
+    #[component]
+    fn AttachProbe() -> impl IntoElement {
+        let s = Store::new();
+        crate::store::install(s);
+        view().flex_1().child(crate::features::chat::conversation(1))
+    }
+
+    /// Each picker the share sheet opens after closing itself shows (found on an iPhone: Poll
+    /// closed the sheet and opened nothing, D-0183).
+    #[test]
+    fn the_share_sheet_opens_the_poll_editor() -> Result<(), String> {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<AttachProbe>()))
+            .map_err(|e| e.to_string())?;
+        app.wait_for("Attach")?;
+        app.press("Attach")?;
+        app.wait_for("text:Poll")?;
+        app.press("Poll")?;
+        app.wait_for("text:Create poll")?;
+        Ok(())
+    }
 }

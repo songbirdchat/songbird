@@ -165,30 +165,56 @@ impl std::fmt::Debug for RemoteVideo {
 impl RemoteVideo {
     /// Its decoded frames as RGBA, ready for the app's canvas.
     pub fn frames(&self) -> impl futures_util::Stream<Item = Rgba> {
-        NativeVideoStream::new(self.0.rtc_track()).map(|f| {
-            let (width, height) = (f.buffer.width(), f.buffer.height());
-            let stride = width.saturating_mul(4);
-            let mut pixels =
-                vec![0u8; usize::try_from(u64::from(stride) * u64::from(height)).unwrap_or(0)];
-            if let (Ok(w), Ok(h)) = (i32::try_from(width), i32::try_from(height))
-                && !pixels.is_empty()
-            {
-                // libyuv names formats by 32-bit word order: its "ABGR" is the bytes R, G, B, A.
-                f.buffer
-                    .to_argb(VideoFormatType::ABGR, &mut pixels, stride, w, h);
-            }
-            Rgba {
-                width,
-                height,
-                rotation: match f.rotation {
-                    VideoRotation::VideoRotation0 => 0,
-                    VideoRotation::VideoRotation90 => 90,
-                    VideoRotation::VideoRotation180 => 180,
-                    VideoRotation::VideoRotation270 => 270,
-                },
-                pixels,
+        NativeVideoStream::new(self.0.rtc_track()).map(|f| to_rgba(&f))
+    }
+
+    /// The newest decoded frame as RGBA, at most `max_fps` a second (D-0183): frames waiting
+    /// behind a newer one are skipped, so a slow screen shows the present rather than falling
+    /// further behind, and only frames that will be shown are converted.
+    pub fn latest_frames(&self, max_fps: u32) -> impl futures_util::Stream<Item = Rgba> {
+        use futures_util::FutureExt as _;
+        let gap = std::time::Duration::from_millis(1000 / u64::from(max_fps.max(1)));
+        let stream = Box::pin(NativeVideoStream::new(self.0.rtc_track()));
+        let start = std::time::Instant::now().checked_sub(gap);
+        futures_util::stream::unfold((stream, start), move |(mut stream, mut last)| async move {
+            loop {
+                let mut frame = stream.next().await?;
+                // Whatever arrived meanwhile is newer: keep only the last of it.
+                while let Some(Some(newer)) = stream.next().now_or_never() {
+                    frame = newer;
+                }
+                if last.is_some_and(|t| t.elapsed() < gap) {
+                    continue;
+                }
+                last = Some(std::time::Instant::now());
+                return Some((to_rgba(&frame), (stream, last)));
             }
         })
+    }
+}
+
+/// A decoded frame as RGBA, with how to turn it for display.
+fn to_rgba(f: &livekit::webrtc::video_frame::BoxVideoFrame) -> Rgba {
+    let (width, height) = (f.buffer.width(), f.buffer.height());
+    let stride = width.saturating_mul(4);
+    let mut pixels = vec![0u8; usize::try_from(u64::from(stride) * u64::from(height)).unwrap_or(0)];
+    if let (Ok(w), Ok(h)) = (i32::try_from(width), i32::try_from(height))
+        && !pixels.is_empty()
+    {
+        // libyuv names formats by 32-bit word order: its "ABGR" is the bytes R, G, B, A.
+        f.buffer
+            .to_argb(VideoFormatType::ABGR, &mut pixels, stride, w, h);
+    }
+    Rgba {
+        width,
+        height,
+        rotation: match f.rotation {
+            VideoRotation::VideoRotation0 => 0,
+            VideoRotation::VideoRotation90 => 90,
+            VideoRotation::VideoRotation180 => 180,
+            VideoRotation::VideoRotation270 => 270,
+        },
+        pixels,
     }
 }
 
@@ -213,6 +239,8 @@ impl std::fmt::Debug for Rgba {
 pub struct VideoSender {
     source: NativeVideoSource,
     track: LocalVideoTrack,
+    /// The runtime the call runs on: muting tells the server from a task of it (D-0183).
+    rt: tokio::runtime::Handle,
 }
 
 impl std::fmt::Debug for VideoSender {
@@ -397,6 +425,9 @@ impl VideoSender {
 
     /// Stops sending frames (the others see the camera off) or starts again.
     pub fn set_muted(&self, muted: bool) {
+        // From any thread: LiveKit spawns the server's mute request on the current runtime,
+        // which the app's UI thread has none of (D-0183).
+        let _rt = self.rt.enter();
         if muted {
             self.track.mute();
         } else {
@@ -454,6 +485,8 @@ pub struct Call {
     own: ParticipantIdentity,
     send_index: Arc<Mutex<i32>>,
     microphone: Mutex<Option<(PlatformAudio, LocalAudioTrack)>>,
+    /// The runtime the call was joined on, entered by the calls made from other threads.
+    rt: tokio::runtime::Handle,
 }
 
 impl std::fmt::Debug for Call {
@@ -594,6 +627,7 @@ impl Call {
                 own,
                 send_index,
                 microphone: Mutex::new(None),
+                rt: tokio::runtime::Handle::current(),
             },
             rx,
         ))
@@ -667,6 +701,7 @@ impl Call {
 
     /// Mutes or unmutes the microphone.
     pub fn set_microphone_muted(&self, muted: bool) {
+        let _rt = self.rt.enter();
         if let Ok(m) = self.microphone.lock()
             && let Some((_, track)) = m.as_ref()
         {
@@ -705,7 +740,11 @@ impl Call {
             LocalVideoTrack::create_video_track("camera", RtcVideoSource::Native(source.clone()));
         self.publish(LocalTrack::Video(track.clone()), TrackSource::Camera)
             .await?;
-        Ok(VideoSender { source, track })
+        Ok(VideoSender {
+            source,
+            track,
+            rt: self.rt.clone(),
+        })
     }
 
     async fn publish(&self, track: LocalTrack, source: TrackSource) -> Result<TrackSid> {
@@ -786,7 +825,14 @@ impl Call {
             sid,
             room: self.room.clone(),
         };
-        Ok((share, VideoSender { source, track }))
+        Ok((
+            share,
+            VideoSender {
+                source,
+                track,
+                rt: self.rt.clone(),
+            },
+        ))
     }
 
     /// Sends `payload` to everyone in the room (or to `to` only) on the data channel, reliably,
@@ -811,7 +857,11 @@ impl Call {
     /// (WebRTC's own counters); `(0, 0)` when they cannot be read.
     pub async fn traffic(&self) -> (u64, u64) {
         use livekit::webrtc::stats::RtcStats;
-        let Ok(stats) = self.room.get_stats().await else {
+        // Bounded: the caller leaves the room after this (D-0183: a statistics request that
+        // didn't finish kept the call open after hanging up).
+        let Ok(Ok(stats)) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), self.room.get_stats()).await
+        else {
             return (0, 0);
         };
         stats
@@ -838,10 +888,11 @@ impl Call {
         if let Ok(mut m) = self.microphone.lock() {
             m.take();
         }
-        self.room
-            .close()
-            .await
-            .map_err(|e| Error::Room(e.to_string()))
+        // The leave the server hears at once; bounded, so a dead link can't hold the call open.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), self.room.close()).await {
+            Ok(r) => r.map_err(|e| Error::Room(e.to_string())),
+            Err(_) => Err(Error::Room("leaving timed out".into())),
+        }
     }
 
     /// Leaves the call.

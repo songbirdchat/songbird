@@ -71,7 +71,11 @@ fn content() -> AnyElement {
                 .child(
                     view()
                         .size(px(112.0))
-                        .child(avatar(me.with_untracked(|p| p.name.clone()), seed, 112.0))
+                        .child({
+                            // Follows the name as it is typed (its initials).
+                            let name = computed(move || me.with(|p| p.name.clone()));
+                            dynamic(move || Some(avatar(name.get(), seed, 112.0)))
+                        })
                         .child(
                             view()
                                 .absolute()

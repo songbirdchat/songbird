@@ -711,11 +711,14 @@ fn profile_card() -> AnyElement {
                 .outline_color(move || c::ring())
         })
         // Presence shows once on this tab: the choice right below.
-        .child(avatar(
-            me.with_untracked(|p| p.name.clone()),
-            me.with_untracked(|p| p.seed),
-            64.0,
-        ))
+        .child({
+            // Follows a name changed on the profile page.
+            let who = computed(move || me.with(|p| (p.name.clone(), p.seed)));
+            dynamic(move || {
+                let (name, seed) = who.get();
+                Some(avatar(name, seed, 64.0))
+            })
+        })
         .child(
             view()
                 .flex_1()

@@ -1017,6 +1017,30 @@ impl Store {
         self.calls.update(|cs| cs.insert(0, record));
     }
 
+    /// A call through a call link (no chat): kept under the link's name, as a group call
+    /// (D-0183: link calls never reached the history).
+    pub fn log_link_call(
+        &self,
+        title: String,
+        seed: u64,
+        video: bool,
+        direction: CallDirection,
+        secs: u32,
+    ) {
+        let record = CallRecord {
+            id: self.id(),
+            chat: 0,
+            title,
+            seed,
+            video,
+            group: true,
+            direction,
+            at: now(),
+            secs,
+        };
+        self.calls.update(|cs| cs.insert(0, record));
+    }
+
     pub fn create_call_link(&self, name: String, lobby: bool) -> CallLink {
         let id = self.id();
         let link = CallLink {

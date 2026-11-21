@@ -866,7 +866,8 @@ mod preview {
         }
     );
 
-    struct Preview(Retained<PreviewView>);
+    /// The view, and the session id its layer shows.
+    struct Preview(Retained<PreviewView>, Option<u64>);
 
     impl Preview {
         fn layer(&self) -> Retained<AVCaptureVideoPreviewLayer> {
@@ -885,17 +886,29 @@ mod preview {
             if name != "session" {
                 return;
             }
+            // The same session again (props are sent again as the screen around the view
+            // changes) is left alone: iOS aborts the app when a preview layer attached to a
+            // session is attached again (found on an iPhone, D-0183). Another session is
+            // attached only after the old one is let go.
+            let id = value.and_then(serde_json::Value::as_u64);
+            if id == self.1 {
+                return;
+            }
             let session = session_for(value);
             // SAFETY: setting the layer's session on the main thread, where NSH calls
             // components.
             unsafe {
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
                 let layer = self.layer();
+                if self.1.is_some() {
+                    layer.setSession(None);
+                }
                 layer.setSession(session.as_deref());
                 if let Some(fill) = AVLayerVideoGravityResizeAspectFill {
                     layer.setVideoGravity(fill);
                 }
             }
+            self.1 = session.is_some().then_some(id).flatten();
         }
     }
 
@@ -912,7 +925,7 @@ mod preview {
                 // SAFETY: UIView's designated initializer.
                 let view: Retained<PreviewView> =
                     unsafe { msg_send![PreviewView::alloc(mtm), initWithFrame: CGRect::ZERO] }; // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                Box::new(Preview(view)) as Box<dyn NativeComponent>
+                Box::new(Preview(view, None)) as Box<dyn NativeComponent>
             }),
         );
     }

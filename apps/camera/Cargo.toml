@@ -65,7 +65,7 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
 objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std", "UIResponder", "UIView", "objc2-quartz-core"] }
 # Call video drawn natively (D-0183): CGImages on a layer.
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGImage", "CGDataProvider", "CGColorSpace"] }
-objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "CALayer", "objc2-core-foundation"] }
+objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "CALayer", "CATransaction", "objc2-core-foundation"] }
 nsh-platform-ios = { version = "0.6.0", default-features = false }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dev-dependencies]

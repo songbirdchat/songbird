@@ -324,7 +324,7 @@ pub fn join_requests_page(chat: ChatId) {
                 virtual_list(move || requests.with(Vec::len), move |at| {
                     let id = computed(move || requests.with(|r| r.get(at.index()).copied()));
                     let name = move || id.get().map(|i| s.contact_name(Some(i))).unwrap_or_default();
-                    let username = move || id.get().and_then(|i| s.contact(i)).map(|c| format!("@{}", c.username)).unwrap_or_default();
+                    let username = move || id.get().and_then(|i| s.contact(i)).filter(|c| !c.username.is_empty()).map(|c| format!("@{}", c.username)).unwrap_or_default();
                     let seed = move || id.get().unwrap_or(0);
                     // Wide windows: the buttons at the row's end. Narrow ones:
                     // under the name, on the text column, so the line beside

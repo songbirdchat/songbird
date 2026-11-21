@@ -291,17 +291,23 @@ fn end(s: Store, reason: EndReason) {
     let mut chat = None;
     let mut video = false;
     let mut real = None;
+    let mut link = None;
     with_call(|c| {
         log = c.end(reason);
         chat = c.chat;
         video = c.video;
         real = c.real.then_some(c.id);
+        link = c.link.then(|| (c.title.clone(), c.seed));
     });
     if let Some(id) = real {
         crate::backend::calls::closed(id, reason, true);
     }
-    if let (Some((direction, secs)), Some(chat)) = (log, chat) {
-        s.log_call(chat, video, direction, secs);
+    match (log, chat, link) {
+        (Some((direction, secs)), Some(chat), _) => s.log_call(chat, video, direction, secs),
+        (Some((direction, secs)), None, Some((title, seed))) => {
+            s.log_link_call(title, seed, video, direction, secs);
+        }
+        _ => {}
     }
     if let Some(line) = calls().with_untracked(|st| st.call.as_ref().map(state::status)) {
         announce_for_accessibility(line);
@@ -553,15 +559,21 @@ pub mod live {
         let mut log = None;
         let mut chat = None;
         let mut video = false;
+        let mut link = None;
         update(id, |c| {
             log = c.end(reason);
             chat = c.chat;
             video = c.video;
+            link = c.link.then(|| (c.title.clone(), c.seed));
         });
-        if let (Some((direction, secs)), Some(chat), Some(s)) =
-            (log, chat, crate::store::try_store())
-        {
-            s.log_call(chat, video, direction, secs);
+        if let (Some((direction, secs)), Some(s)) = (log, crate::store::try_store()) {
+            match (chat, link) {
+                (Some(chat), _) => s.log_call(chat, video, direction, secs),
+                (None, Some((title, seed))) => {
+                    s.log_link_call(title, seed, video, direction, secs);
+                }
+                _ => {}
+            }
         }
         crate::sounds::stop();
         if let Some(line) = with(id, super::state::status) {

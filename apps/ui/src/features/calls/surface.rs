@@ -1068,8 +1068,8 @@ fn notices(people: Signal<bool>) -> View {
 /// The top bar of the call: minimise, title and lock line, and the
 /// group's layout and participants.
 fn top_bar(verify: Signal<bool>, people: Signal<bool>) -> View {
-    let title =
-        calls().with_untracked(|x| x.call.as_ref().map(|c| c.title.clone()).unwrap_or_default());
+    // Followed, not read once: a link call's name arrives from its admin after joining (D-0183).
+    let title = field(|c| c.title.clone(), String::new());
     let group = calls().with_untracked(|x| x.call.as_ref().is_some_and(|c| c.group));
     let ended = field(|c| c.ended(), false);
     let count = field(|c| c.joined().len() + 1, 1);
@@ -1109,7 +1109,7 @@ fn top_bar(verify: Signal<bool>, people: Signal<bool>) -> View {
                 .items_center()
                 .gap(px(2.0))
                 .child(group.then(|| {
-                    text(title.clone())
+                    text(move || title.get())
                         .number_of_lines(1)
                         .text_size(px(font::TITLE))
                         .font_weight(FontWeight::SEMIBOLD)

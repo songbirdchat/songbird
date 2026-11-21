@@ -171,12 +171,27 @@ fn body() -> impl IntoElement {
                     ))
                     .child(section_title("Contacts on Songbird")),
             )
-            .empty(empty_state(
-                Icon::Search,
-                "No contacts found",
-                "Check the spelling, or invite them to Songbird with a link.",
-                None,
-            ))
+            // Nothing typed yet is no failed search (D-0183).
+            .empty(dynamic(move || {
+                let searching = query.with(|q| !q.trim().is_empty());
+                Some(untracked(move || {
+                    if searching {
+                        empty_state(
+                            Icon::Search,
+                            "No contacts found",
+                            "Check the spelling, or invite them to Songbird with a link.",
+                            None,
+                        )
+                    } else {
+                        empty_state(
+                            Icon::Users,
+                            "No contacts yet",
+                            "Type someone's exact username above to message them, or invite a friend.",
+                            None,
+                        )
+                    }
+                }))
+            }))
             .footer(view().h(px(24.0)))
             .flex_1(),
         )

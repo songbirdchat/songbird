@@ -55,15 +55,18 @@ fn restore_me(store: Store) {
     if crate::store::demo() {
         return;
     }
-    let Some(v) =
-        Storage::get_item(K_ME).and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-    else {
-        return;
-    };
+    // Nothing kept yet still restores the claimed username (below).
+    let v = Storage::get_item(K_ME)
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_default();
     let text = |k: &str| v[k].as_str().unwrap_or_default().to_owned();
     store.me.update(|me| {
         me.name = text("name");
         me.username = text("username");
+        // Kept before the profile was (D-0183): the claimed username is the account's own.
+        if me.username.is_empty() {
+            me.username = Storage::get_item("sb.username").unwrap_or_default();
+        }
         me.about = text("about");
         me.status_line = v["status"].as_str().map(str::to_owned);
         if let Some(seed) = v["seed"].as_u64() {

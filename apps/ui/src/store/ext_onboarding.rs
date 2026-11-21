@@ -438,6 +438,15 @@ pub struct AccountExtra {
 
 impl Default for AccountExtra {
     fn default() -> Self {
+        // A real account: its own link from the server, no made-up other accounts (D-0183).
+        if !super::demo() {
+            return Self {
+                username_link: crate::backend::username::my_link().unwrap_or_default(),
+                passkeys: Vec::new(),
+                others: Vec::new(),
+                report: None,
+            };
+        }
         Self {
             username_link: "https://songbird.chat/u/radu#7Fq2-xN8p".into(),
             passkeys: Vec::new(),
@@ -499,6 +508,16 @@ impl Store {
 
     /// Mock: a new username link; the old one stops working.
     pub fn reset_username_link(&self) {
+        if !super::demo() {
+            // The server's reset: the old link stops working.
+            let extra = self.account_extra();
+            crate::backend::run(async move {
+                let l = crate::backend::username::reset().await?;
+                extra.update(|a| a.username_link = l);
+                Ok(())
+            });
+            return;
+        }
         let me = self.me.with_untracked(|m| m.username.clone());
         self.account_extra().update(|a| {
             let next = hash(&a.username_link) & 0xffff_ff;

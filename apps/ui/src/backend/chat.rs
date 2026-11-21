@@ -507,20 +507,25 @@ pub fn create_group(s: Store, title: String, members: Vec<ContactId>) -> ChatId 
         }))
         .collect();
     });
-    super::run(async move {
-        let lock = core();
-        let mut guard = lock.lock().await;
-        let m = guard
-            .as_mut()
-            .ok_or_else(|| super::problem("Not connected yet."))?;
-        m.create_group_with_id(gid, &title, &accounts)
-            .await
-            .map_err(|_| {
-                super::problem(
-                    "The group couldn't be created. Check your connection and try again.",
-                )
-            })?;
-        Ok(())
+    // Detached: the creating screen closes right away, and a failure must still be told.
+    Owner::detached().run(|| {
+        spawn(async move {
+            let created = {
+                let lock = core();
+                let mut guard = lock.lock().await;
+                match guard.as_mut() {
+                    Some(m) => m.create_group_with_id(gid, &title, &accounts).await.is_ok(),
+                    None => false,
+                }
+            };
+            if !created {
+                // A group no server knows can't carry a message: it goes, and the user is told
+                // (D-0183: a failed creation left a chat whose every message failed).
+                GROUPS.with_borrow_mut(|g| g.remove(&chat));
+                s.delete_chat(chat);
+                crate::ui::toast("The group couldn't be created. Check your connection and try again.");
+            }
+        });
     });
     chat
 }
@@ -981,7 +986,9 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
             body,
             at: minutes(row.sent_ms),
             status: tick(row.status),
-            reply_to: None,
+            // The message it answers, when this device shows that one too.
+            reply_to: songbird_app_core::messenger::quote_in(&row.content)
+                .and_then(|(author, id)| ui_of(&author, &id)),
             reactions: Vec::new(),
             edited: false,
             starred: false,
@@ -993,7 +1000,7 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
     // Auto-download (Settings → Storage and data): what the user allowed,
     // by kind. Phones can't tell Wi-Fi from mobile data here, so they follow
     // the mobile choice; desktops the Wi-Fi one.
-    if media && !mine {
+    if media {
         let photo = s
             .message(chat, id)
             .is_some_and(|m| matches!(m.body, Body::Image { .. }));
@@ -1001,7 +1008,8 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
             .settings
             .with_untracked(|x| if photo { x.auto_photos } else { x.auto_docs });
         let allowed = if is_desktop() { wifi } else { mobile };
-        if allowed && photo {
+        // This device's own photos are in its store already: always shown (D-0183).
+        if photo && (mine || allowed) {
             load_photo(id);
         }
     }
@@ -1309,11 +1317,64 @@ pub fn open_view_once(s: Store, chat: ChatId, msg: MsgId) {
     });
 }
 
-/// Shows a photo (downloading it if needed).
+/// Photos whose download failed (by UI message): their bubble offers to try again.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FailedMedia(pub std::collections::HashSet<MsgId>);
+
+/// Whether `msg`'s photo couldn't be downloaded (tracked).
+pub fn photo_failed(msg: MsgId) -> bool {
+    global::<FailedMedia>().with(|f| f.0.contains(&msg))
+}
+
+/// Shows a photo (downloading it if needed), quietly: an automatic download that fails leaves
+/// its bubble offering to try again.
 pub fn load_photo(msg: MsgId) {
-    if media_src(msg).is_none() {
-        with_file(msg, move |b| show_bytes(msg, &b));
+    fetch_photo(msg, false);
+}
+
+/// Downloads a photo the user asked for: a failure is said (D-0183: a failed download left a
+/// blank bubble with no word why).
+pub fn retry_photo(msg: MsgId) {
+    fetch_photo(msg, true);
+}
+
+fn fetch_photo(msg: MsgId, asked: bool) {
+    if media_src(msg).is_some() {
+        return;
     }
+    let Some((author, id)) = MEDIA.with_borrow(|m| m.get(&msg).copied()) else {
+        return;
+    };
+    let failed = global::<FailedMedia>();
+    failed.update(|f| {
+        f.0.remove(&msg);
+    });
+    // Detached: the bubble that asked may scroll away before the file arrives.
+    Owner::detached().run(|| {
+        spawn(async move {
+            let got = {
+                let lock = core();
+                let mut guard = lock.lock().await;
+                match guard.as_mut() {
+                    Some(m) => m.file(&author, &id, 0).await.ok().map(|b| b.to_vec()),
+                    None => None,
+                }
+            };
+            match got {
+                Some(bytes) => show_bytes(msg, &bytes),
+                None => {
+                    failed.update(|f| {
+                        f.0.insert(msg);
+                    });
+                    if asked {
+                        crate::ui::toast(
+                            "The photo couldn't be downloaded. Check your connection and try again.",
+                        );
+                    }
+                }
+            }
+        });
+    });
 }
 
 /// Saves a real media message's file where the user chooses.
@@ -1778,6 +1839,8 @@ fn set_status(s: Store, core_id: &[u8; 16], status: Status) {
 /// Sends what the user wrote in a real chat (`ui_id` is the message the UI
 /// already shows as Sending).
 pub fn send(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
+    // A reply names the message it answers, so the other side shows the quote too (D-0183).
+    let quoted = quoted_of(s, chat, ui_msg);
     if let Body::Poll {
         question,
         options,
@@ -1837,7 +1900,11 @@ pub fn send(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
                 .as_mut()
                 .ok_or_else(|| super::problem("Not connected yet."))?;
             let me = m.local().account;
-            match m.send_group_text(&gid, &text).await {
+            let sent = match &quoted {
+                Some((target, words)) => m.send_reply(&gid, &text, *target, words).await,
+                None => m.send_group_text(&gid, &text).await,
+            };
+            match sent {
                 Ok(id) => {
                     drop(guard);
                     OUTGOING.with_borrow_mut(|o| o.insert(ui_msg, id));
@@ -1908,7 +1975,11 @@ pub fn send(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
         let m = guard
             .as_mut()
             .ok_or_else(|| super::problem("Not connected yet."))?;
-        match m.send_text(&to, &text).await {
+        let sent = match &quoted {
+            Some((target, words)) => m.send_reply(&to, &text, *target, words).await,
+            None => m.send_text(&to, &text).await,
+        };
+        match sent {
             Ok(id) => {
                 OUTGOING.with_borrow_mut(|o| o.insert(ui_msg, id));
                 IDS.with_borrow_mut(|m| m.insert(ui_msg, (me_account(), id)));
@@ -1938,6 +2009,22 @@ pub fn send(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
             }
         }
     });
+}
+
+/// The message `ui_msg` replies to, as app-core knows it (author account, message ID), and its
+/// words for the quote.
+/// A quoted message as app-core names it (author account, message ID), and its words.
+type Quoted = (([u8; 16], [u8; 16]), String);
+
+fn quoted_of(s: Store, chat: ChatId, ui_msg: MsgId) -> Option<Quoted> {
+    let target = s.message(chat, ui_msg)?.reply_to?;
+    let ids = IDS.with_borrow(|m| m.get(&target).copied())?;
+    let words = match s.message(chat, target).map(|m| m.body) {
+        Some(Body::Text(t)) => t,
+        Some(Body::Link { text, .. }) => text,
+        _ => String::new(),
+    };
+    Some((ids, words.chars().take(200).collect()))
 }
 
 pub(super) fn me_account() -> [u8; 16] {

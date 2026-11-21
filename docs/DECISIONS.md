@@ -239,7 +239,44 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
     basis collapsed it in scrolling pages, its words over what followed); the Server connection page says what the server carries and can't read.
   - **Development builds** may trust one extra certificate authority, set when built
     (`SONGBIRD_DEV_CA`), for a test server on a local network; release builds never set it.
-- Consequences: a development backend needs `[api.profiles]`, `[api.storage]`,
+  - **Hanging up**: ending a call left the device in the room: the others kept its tile and
+    heard of no leave, and the room kept its connection until the server timed it out. Muting
+    a track (the Mute and camera buttons too) has LiveKit spawn the server's request on the
+    current Tokio runtime, and the app's UI thread has none: it panicked there. A call and its
+    video senders now keep the runtime they were made on and enter it to mute. Ending a call
+    mutes the microphone and camera at once, then leaves in the background, its statistics and
+    the leave each bounded (1 s and 5 s) so a dead network can't hold it. In group and link
+    calls, someone leaving is said ("… left the call") as well as their tile going.
+  - **Second round, two iPhones driven by VMPal**: onboarding's Continue sat under the keyboard
+    (the steps now keep their actions on its edge); a toast raised by a closing screen never
+    went (its timer died with the screen; it is detached now); every choice in the share sheet
+    only closed it (the next sheet opened while it was leaving, and a picker's task died with
+    the tile: the choice now runs once the sheet has gone); the profile's avatar ignored a new
+    name; an account from before the profile was kept showed no username; and a real account
+    started from the demo's settings (PIN on, WhatsApp linked, invites it never had, a made-up
+    username link and second account). A preview build may name a LAN backend at build time
+    (`SONGBIRD_DEV_SERVER`), so a fresh phone reaches it before sign-up.
+  - **Third round**: call-link calls now reach the call history (under the link's name); a group
+    the server didn't create is removed and the user told, instead of staying a chat whose every
+    message fails; group screens' action bar rides on the keyboard; a contact with no known
+    username shows none (not "@"); New chat says "No contacts yet" before any search. Groups
+    need the API's clustered send path (`[api.send]`, Iggy), which neither the LAN test nor
+    `deploy/dev-vps` runs: they are tested on a production-shaped environment.
+  - **Fourth round, a three-way call**: turning the camera on crashed the iPhone that asked for
+    camera access (the preview re-attached its layer to the same session; it now ignores a
+    repeated session). Remote video lagged: every decoded frame was converted before the frame
+    limit dropped it, and every shown frame rotated on the CPU, so a slow screen fell behind;
+    now only the newest frame is converted, iOS turns the layer instead of the pixels. A link
+    call's header read its title once and kept "Call link"; it follows the admin's name now.
+  - **Replies and photos**: a reply reached the other side without its quote: the app sent plain
+    text and showed every stored message with no reply. A reply now goes as a `Quote` naming the
+    quoted message (author account and ID) with its words (`Messenger::send_reply`, 1:1 and
+    groups), and a received one shows the message it answers (`messenger::quote_in`). A photo
+    showed only once tapped: the bubble chose between the real photo and the demo's illustration
+    on a check that isn't reactive, so a photo still sending stayed blank; it now shows the
+    photo whenever this device has it, and this device's own photos load from its store.
+- Consequences: a development backend needs `[api.media]` (or every attachment download answers
+  503: photos are sent but never received), `[api.profiles]`, `[api.storage]`,
   `[api.requests]` with `[delivery.requests]`, and `[delivery] franking_key`, or profiles,
   message requests and first messages are refused (the LAN test lacked them).
   `scripts/dev-app-backend.sh` should gain them. Ringing one-to-one calls need Iggy.

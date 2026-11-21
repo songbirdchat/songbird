@@ -22,7 +22,7 @@ pub use button::{BtnSize, Variant, btn, btn_with_icon, fab, icon_btn};
 pub use calls_controls::{CallTone, call_btn, call_pill};
 pub use chat_menu::{app_menu, menu_entry, menu_rule, pressable};
 pub use controls::{
-    ToastInset, ToastState, app_header, app_sheet, ask_first, confirm, field, labelled_field, page,
+    ToastInset, ToastState, app_header, app_sheet, app_sheet_then, ask_first, confirm, field, labelled_field, page,
     page_with, save_file, search_field, segmented, set_toast_inset, share_text, toast, toast_layer,
     toggle, toggle_row, toggle_row_icon, toggle_row_with,
 };

@@ -77,6 +77,9 @@ secret = { file = "$(secret keys)" }
 secret = { file = "$(secret profiles)" }
 [api.storage]
 secret = { file = "$(secret storage)" }
+# Attachment downloads (signed media URLs): without it every download answers 503.
+[api.media]
+secret = { file = "$(secret media)" }
 [api.requests]
 secret = { file = "$(secret requests)" }
 TOML

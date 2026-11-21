@@ -665,6 +665,18 @@ pub fn app_sheet(
     title: impl Into<SharedString>,
     content: impl IntoElement + 'static,
 ) -> nsh_base::SheetElement {
+    app_sheet_then(open, title, content, || {})
+}
+
+/// [`app_sheet`], calling `closed` each time the sheet has gone (its exit finished, whoever
+/// closed it): where a choice in it opens another sheet or a system picker, which can't show
+/// while this one is still leaving (found on an iPhone, D-0183).
+pub fn app_sheet_then(
+    open: Signal<bool>,
+    title: impl Into<SharedString>,
+    content: impl IntoElement + 'static,
+    closed: impl Fn() + 'static,
+) -> nsh_base::SheetElement {
     let title: SharedString = title.into();
     let content = std::cell::RefCell::new(Some(content.into_element()));
     let sp = spec();
@@ -699,10 +711,10 @@ pub fn app_sheet(
                     .pointer_events(PointerEvents::BoxNone)
             })
         })
-        .on_open_change(move |e: &SheetEvent| {
-            if let SheetEvent::OpenChange(next, _) = e {
-                open.set(*next);
-            }
+        .on_open_change(move |e: &SheetEvent| match e {
+            SheetEvent::OpenChange(next, _) => open.set(*next),
+            SheetEvent::Close => closed(),
+            _ => {}
         })
         .child({
             view()
@@ -842,11 +854,16 @@ pub fn toast(message: impl Into<SharedString>) {
         message: Some(message),
         serial,
     });
-    set_timeout(Duration::from_millis(2600), move || {
-        state.update(|s| {
-            if s.serial == serial {
-                s.message = None;
-            }
+    // Detached: a timer belongs to the owner it is made under, and a screen that toasts as it
+    // closes (onboarding's "Welcome to Songbird") would take the hiding with it, leaving the
+    // toast up for good (found on an iPhone, D-0183).
+    Owner::detached().run(|| {
+        set_timeout(Duration::from_millis(2600), move || {
+            state.update(|s| {
+                if s.serial == serial {
+                    s.message = None;
+                }
+            });
         });
     });
 }

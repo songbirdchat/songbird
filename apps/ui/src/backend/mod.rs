@@ -87,6 +87,21 @@ impl Default for Endpoint {
                 billing: format!("https://billing.{domain}"),
             };
         }
+        // A preview build may name a development backend on the local network at build time
+        // (`SONGBIRD_DEV_SERVER=192.168.1.49`, the address `scripts/dev-app-backend.sh` serves
+        // on): a phone reaches it from its first run, before sign-up. Release builds ignore it.
+        if let Some(host) = option_env!("SONGBIRD_DEV_SERVER")
+            .filter(|h| !h.is_empty())
+            .filter(|_| crate::PREVIEW_BUILD)
+        {
+            return Self {
+                api: format!("http://{host}:8443"),
+                api_name: "api.localhost".into(),
+                ws_addr: format!("{host}:9201"),
+                ws_name: "localhost".into(),
+                billing: format!("http://{host}:8445"),
+            };
+        }
         Self {
             api: "http://127.0.0.1:8443".into(),
             api_name: "api.localhost".into(),
