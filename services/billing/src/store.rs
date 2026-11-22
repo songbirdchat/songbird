@@ -444,6 +444,20 @@ impl Store {
         Ok(())
     }
 
+    /// Mollie: renewal on again with a new subscription (D-0169).
+    ///
+    /// # Errors
+    /// [`StoreError`].
+    pub async fn mollie_resumed(&self, key: &SubKey, subscription: &str) -> Result<(), StoreError> {
+        self.db
+            .query(
+                "UPDATE sub:[$k] SET renews = true, msub = $s, at = time::floor(time::now(), 1d) RETURN NONE;",
+                vec![var("k", bytes(key)), var("s", text(subscription))],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Mollie: the row of a subscription ID.
     ///
     /// # Errors

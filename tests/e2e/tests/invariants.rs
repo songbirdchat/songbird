@@ -1058,3 +1058,184 @@ async fn a_client_reaches_delivery_through_a_proxy_link() {
         b"through the proxy"
     );
 }
+
+/// D-0164: HTTPS to Songbird's own hosts goes through the proxy too (TLS to the proxy, the api's
+/// TLS inside): requests, bodies and redirects arrive; a host the proxy doesn't carry is refused
+/// by the proxy, and nothing is reached around it.
+#[tokio::test]
+async fn https_requests_go_through_a_proxy_and_unknown_hosts_are_refused() {
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::Bytes;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let provider = || Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let dir = tempfile::tempdir().unwrap();
+
+    // The "api": HTTPS for api.proxy.test, answering /hello, echoing POSTs and redirecting.
+    let api_ck = rcgen::generate_simple_self_signed(vec!["api.proxy.test".to_owned()]).unwrap();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(api_ck.signing_key.serialize_der().into());
+    let server = rustls::ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![api_ck.cert.der().clone()], key)
+        .unwrap();
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+    let api = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_addr = api.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _) = api.accept().await.unwrap();
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let svc = hyper::service::service_fn(
+                    |req: hyper::Request<hyper::body::Incoming>| async move {
+                        let path = req.uri().path().to_owned();
+                        let host = req
+                            .headers()
+                            .get("host")
+                            .and_then(|h| h.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned();
+                        let body = req.into_body().collect().await.unwrap().to_bytes();
+                        let r = match path.as_str() {
+                            "/hello" => {
+                                hyper::Response::new(Full::new(Bytes::from(format!("hi {host}"))))
+                            }
+                            "/redir" => hyper::Response::builder()
+                                .status(302)
+                                .header("location", "/hello")
+                                .body(Full::new(Bytes::new()))
+                                .unwrap(),
+                            _ => hyper::Response::new(Full::new(body)),
+                        };
+                        Ok::<_, std::convert::Infallible>(r)
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(tls), svc)
+                    .await;
+            });
+        }
+    });
+
+    // The proxy, carrying only api.proxy.test.
+    let proxy_ck = rcgen::generate_simple_self_signed(vec!["proxy.test".to_owned()]).unwrap();
+    let pcert = dir.path().join("proxy.pem");
+    let pkey = dir.path().join("proxy-key.pem");
+    std::fs::write(&pcert, proxy_ck.cert.pem()).unwrap();
+    std::fs::write(&pkey, proxy_ck.signing_key.serialize_pem()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&pkey, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let config = songbird_proxy::config::ProxyConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        tls: songbird_proxy::config::TlsConfig {
+            cert: pcert,
+            key: songbird_types::SecretRef::File(pkey),
+        },
+        upstream: vec![songbird_proxy::config::Upstream {
+            sni: "api.proxy.test".into(),
+            address: api_addr.to_string(),
+        }],
+        limits: songbird_proxy::config::Limits::default(),
+    };
+    let acceptor = songbird_proxy::relay::tls_acceptor(&config.tls).unwrap();
+    let listener = tokio::net::TcpListener::bind(config.listen).await.unwrap();
+    let paddr = listener.local_addr().unwrap();
+    tokio::spawn(songbird_proxy::relay::Relay::new(config, acceptor).serve(
+        listener,
+        std::future::pending(),
+        Duration::from_secs(1),
+    ));
+
+    let tls_with = |der: rustls::pki_types::CertificateDer<'static>| {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(der).unwrap();
+        Arc::new(
+            rustls::ClientConfig::builder_with_provider(provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    };
+    let link = songbird_types::proxy_link::ProxyLink::parse(
+        &format!("songbird://proxy#proxy.test:{}", paddr.port()),
+        &[],
+    )
+    .unwrap();
+    let mut proxy =
+        songbird_client::ProxyRoute::from_link(&link, tls_with(proxy_ck.cert.der().clone()));
+    proxy.addr = paddr.to_string();
+    let tunnel = songbird_client::https::Tunnel {
+        proxy,
+        inner: tls_with(api_ck.cert.der().clone()),
+        timeout: Duration::from_secs(10),
+    };
+
+    let r = tunnel
+        .request(
+            "GET",
+            "https://api.proxy.test/hello",
+            &[],
+            Vec::new(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (r.status, r.body.as_slice()),
+        (200, &b"hi api.proxy.test"[..])
+    );
+    let r = tunnel
+        .request(
+            "POST",
+            "https://api.proxy.test/echo",
+            &[("content-type".into(), "application/octet-stream".into())],
+            b"sealed bytes".to_vec(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!((r.status, r.body.as_slice()), (200, &b"sealed bytes"[..]));
+    let r = tunnel
+        .request(
+            "GET",
+            "https://api.proxy.test/redir",
+            &[],
+            Vec::new(),
+            false,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status, 302);
+    let r = tunnel
+        .request("GET", "https://api.proxy.test/redir", &[], Vec::new(), true)
+        .await
+        .unwrap();
+    assert_eq!(r.status, 200);
+    // A host the proxy doesn't carry: refused by the proxy, not reached.
+    assert_eq!(
+        tunnel
+            .request(
+                "GET",
+                "https://elsewhere.test/hello",
+                &[],
+                Vec::new(),
+                false
+            )
+            .await,
+        Err(songbird_client::https::ProxyHttpError::Upstream)
+    );
+    assert_eq!(
+        tunnel
+            .request("GET", "http://api.proxy.test/hello", &[], Vec::new(), false)
+            .await,
+        Err(songbird_client::https::ProxyHttpError::Url)
+    );
+}

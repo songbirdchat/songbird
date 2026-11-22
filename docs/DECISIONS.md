@@ -199,6 +199,1457 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0185 — PR #72's checks: reviewed CodeQL lines, Semgrep markers, the SQLite advisory
+
+- Date: 2026-11-22
+- Status: accepted (the owner approved the three waivers, 2026-11-22)
+- Decided by: owner, on the agent's review
+- Context: PR #72 (A2) failed three checks. The quality bar stopped at `cargo fmt`; run locally
+  past it, the client-crypto manifest guard and `cargo deny` failed too. CodeQL (Rust,
+  `security-extended`) reported 20 `rust/hard-coded-cryptographic-value` findings outside
+  `tests/`; Semgrep reported 123 blocking findings in the new native code.
+- Decision:
+  1. **Fixed in code, not waived.** `cargo fmt`. CodeQL: buffers zero-filled then overwritten
+     (`unhex`, `pow::decode`, the ratchet's nonce split) now come from `try_into`; unit tests in
+     `src/` use random keys and nonces. Semgrep: app-core's store test uses `tempfile` (already
+     the workspace's test dependency). The manifest guard (`crates/groups/tests/
+     no_service_links_client_crypto.rs`) exempts the client core `crates/app-core` by name, which
+     keeps OpenMLS state on the device (D-0145), and now fails if any service or other crate
+     depends on it.
+  2. **CodeQL, 11 reviewed lines waived** in `.github/codeql-waivers.json`, read by
+     `scripts/codeql-gate.py` (which also keeps D-0015's `tests/` waiver). A waiver matches the
+     rule, the file and the exact trimmed source line, so an edited or new line fails again;
+     unused waivers are reported. The lines: PQXDH's and the Double Ratchet's zero HKDF salts
+     and HPKE's empty salts (required by their specifications); public domain labels used as
+     HKDF salts or blob contexts; the envelope's fixed nonce, under a key derived from a fresh
+     ephemeral X25519 exchange that seals exactly one message.
+  3. **Semgrep, as D-0118:** each of the 119 `unsafe` lines in `apps/camera`, `apps/device` and
+     `crates/aws-lc-ext` (recorded exceptions D-0110, D-0172 to D-0174, D-0145) checked for its
+     `SAFETY:` comment and marked `// nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage`;
+     the passkey probe's argument (`args`) and the iOS photo save's sandboxed temporary file
+     (`temp-dir`) marked with their reasons. No rule changed or disabled.
+  4. **RUSTSEC-2026-0459 ignored** in `deny.toml` (and `.cargo/audit.toml`'s reason corrected:
+     the crate is now built). SQLite before 3.54 can return stale memory for a crafted database
+     and `-wal` pair. Exposure needs a less trusted party to write both files; app-core opens
+     only its own sandboxed database and the maps tool only tiles our pipeline made. The fix
+     (rusqlite 0.41+, SQLCipher 4.20 with SQLite 3.54.1) does not resolve: OpenMLS 0.9.2, the
+     latest, pins its optional SQLite storage to rusqlite 0.37 and `links = "sqlite3"` allows one
+     copy.
+  5. **cargo-vet:** `flate2`, `miniz_oxide`, `crc32fast`, `adler2` and `simd-adler32` exempt
+     with notes: they reach only the operator-run maps import tool (D-0142, gzip of tiles).
+- Consequences: the iOS photo save could hand Photos the bytes instead of a file (no plaintext
+  copy on disk); not done until videos are checked on a device. Revisit the SQLite ignore with
+  the next OpenMLS release, by 2027-02-22.
+- Evidence (2026-11-22, local): Semgrep 1.185.0 with CI's configs, 0 findings; `cargo deny
+  check`, `cargo vet --locked` ok; `scripts/codeql-gate.py` on the PR's SARIF waives the 11 lines and fails only on
+  the 9 rewritten ones; `cargo xtask workflows` ok.
+
+## D-0184 — No mock a real account can reach
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Context: the real-device pass (D-0183) found demo behaviour reachable by real accounts: a
+  WhatsApp link that "linked" nothing, support requests that sent nothing, made-up receipt
+  times, message requests never shown. An audit of every `mock` path in `apps/ui` (and every
+  store intent, for real chats and accounts) followed.
+- Rule: **only the demo fixtures (`store::demo()`) simulate**. A real account's intent reaches
+  app-core or the server, or, where the service doesn't exist yet, the entry point says so
+  plainly. Nothing says "sent", "linked" or "reported" before the server has answered.
+- Decision:
+  - **The server switch**: "Connect to Songbird's server" showed for real accounts and, off,
+    sent every screen down its sample-data branch. It shows only for the demo fixtures, and
+    `set_enabled(false)` is refused otherwise. The demo camera (a scanner that "sees" a code)
+    and the demo arrivals (`SONGBIRD_DEMO_ARRIVALS`) are the demo fixtures' only, not every
+    preview build's.
+  - **Message requests** (PROTOCOL §5.10): app-core's store (schema 8) marks each account the
+    user *accepted*: wrote to (every 1:1 send), accepted the request of, or whose chat another
+    of the user's devices wrote to (sent transcripts). Accounts known before schema 8 count as
+    accepted. A 1:1 chat with anyone else is a request (`Messenger::is_request`), shown under
+    Message requests; it gets no read receipts until accepted. Accept, delete and block are
+    real (`accept_request`, `delete_request`, the block), and accept and delete reach the
+    user's other devices as `SyncMessage.request_response`. Report-and-block reports, blocks,
+    then deletes, in that order in one task (the report needs the messages).
+  - **Deleting**: chats, cleared chats and "delete for me" were removed from the screen only,
+    and came back at the next start. app-core deletes them (`delete_chat`, `clear_chat`,
+    `delete_message` with their files, reactions, receipts, report proofs, pins and polls; the
+    list's preview never keeps a deleted message's text).
+  - **Sending**: an edit from the composer never reached the network (it called the local
+    edit); it is sent as a revision now, within a 15-minute window the UI enforces. "Retry" on a
+    failed real message faked Sent, Delivered and Read and then a canned reply from the real
+    contact; it deletes app-core's failed copy and sends again. A chat no server carries fails
+    its messages instead of simulating them. Files dropped on a desktop chat and photos from
+    the in-chat camera are sent as encrypted attachments (they were bodies with no bytes).
+  - **Reports**: every Report said "Reported. Thank you." at once; the result is said when the
+    server answers. Groups and channels are reportable for real: app-core keeps each group
+    message's franking proof too, and `report_group` reports the newest five from others,
+    each against its own sender (the server accepts a group's shared body, §5.14).
+  - **Group admin** (§6.6, §6.8): roles ("make admin"), permissions (who sends, adds, edits the
+    info, calls; approval), and the group's name and description changed this device only.
+    Roles and policy are commits of the roles extension, which every member checks
+    (`roles::authorize`); name and description are `GroupUpdate`s each receiver accepts only
+    from those the roles let edit the info (a description no longer overwrites the title).
+    Pinning and deleting others' messages are the protocol's (moderators and above), so for a
+    real group those two switches show as fixed. A link's expiry and number of joins are
+    registered with the server (`ttl`, `max_uses`, already in §6.8), so changing them makes a
+    new link; the screen says "Up to 10 people can join with it", not a count of joins the
+    server doesn't share. Unfollowing a channel leaves it. A real account's group of one (the
+    first run's "Create a group") is a real group, its link made on the server.
+  - **Message info**: delivered and read times were the send time plus one and two minutes.
+    app-core keeps each level's own time per recipient (schema 8); receipts from before show
+    "Earlier".
+  - **Support**: a ticket attached a hard-coded sample log (an example email, phone number and
+    IP) and the screen said "Sent" before anything left. The app keeps its own log of this run
+    (`backend::applog`: info and above, in memory only, at most 24 hours and 2,000 lines,
+    scrubbed by `crash::scrub` before the user previews it); the screen waits for the server.
+    Appeals likewise.
+  - **Accounts**: the account page showed a made-up username link and a "Switch accounts" whose
+    other account ("Radu (Work)") would have replaced the published profile. The link is the
+    server's (`username::make_link` at sign-up); one device holds one real account, said
+    plainly, until app-core keeps a store per account. A failed account report is said.
+  - **Things real accounts kept in memory only**: chat themes ride in each chat's state record
+    (`t=`); stars in `c/<chat>/stars`; "mute nudges" in `c/<contact>/nudges`; broadcast lists
+    and profile links as synced settings (`s/broadcasts`, `s/links`). The demo's broadcast
+    list, profile link and child's name ("Maria") are no longer a real account's defaults.
+  - **Scanning**: New chat's "Scan QR code" and the first run's "Scan a friend's code" were a
+    frame and a timer that "found" Ana; both use the camera now and open the scanned username
+    or group link. The page shows the user's real username link.
+  - **Hidden with an explanation**: WhatsApp chats need the bridge Prompt 14 builds after a
+    legal review: a real account's WhatsApp page says so, and nothing links. A second account
+    on one device: "isn't available yet".
+  - **Smaller**: the backups "Sign in again" opens the destination chooser instead of toasting
+    "Signed in"; a real video keeps only its player's controls (not the demo's scrubber); the
+    returning-device step refuses on a device that already has an account; username
+    suggestions check only the form (the claim asks the server); invite codes come from the
+    server only; plan and pack fallbacks are the demo's only; group create's Share opens the
+    share sheet.
+- Evidence: `apps/ui` `cargo test --lib` (226, new: link limits' summary, the edit window,
+  dropped files' paths, the app log); `songbird-app-core` (48, new: accepted marks and the
+  schema-8 migration, receipt times, deleting and clearing chats).
+- Consequences: app-core schema 8 (two migrations' worth of columns, forward only). Not done
+  here, for later: the attachment sheet still offers Event and Contact cards in real chats,
+  which fail honestly ("can't be sent in this chat yet") until app-core carries them; group
+  member lists for groups joined by Welcome still come only from what the device saw; a chat
+  scene is the user's own view (members aren't told). Comments that still called the device's
+  keys a stand-in were stale (the vault seals them under the platform's secure store, D-0172)
+  and say so now. Needs the end-to-end check on two phones:
+  requests, group roles and policy, link limits, and group reports against a server.
+
+## D-0183 — What the first real-device call found
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Context: the first test between a real iPhone and a simulator, on a LAN copy of the backend.
+- Decision (each a fix in the app):
+  - **Accounts and stores**: a device signing up a second account reopened the first account's
+    message store, so it never published its keys or device list and no one could reach it.
+    Forget now erases the store (its key first, then the files) with the contacts' names, and
+    a store another account left is reset at start.
+  - **Video**: a group or link call never opened the camera (only the one-to-one corner
+    self-view did), so it published an empty video track: black for everyone, and the user's
+    own tile showed initials. The call's stage now owns one camera session; the user's tile
+    shows its live preview and its frames go to the call. And a call never asked for camera
+    access: on a fresh install the camera waited, with no prompt, for a button the call
+    screen doesn't have. Turning the camera on now asks; refused, it goes off and says where
+    to allow it. Checked on an iPhone: its camera seen live, decrypted, on the other device.
+  - **Video on phones**: frames were NSH images, each encoded to PNG and decoded again and
+    loaded asynchronously: they lagged and blinked. A native view, `songbird/video` (iOS: a
+    CGImage on a layer; Android: a reused bitmap), now takes each decoded frame straight from
+    the decoder's thread, at 24 a second. Call tiles rebuild only when what they show changes
+    (they were rebuilt with every audio-level update), and the user's camera preview is made
+    once: iOS aborts the app when a second preview layer attaches to a camera session, which
+    crashed calls.
+  - **Names**: the user's own profile lived in memory only (empty after a restart); it is kept
+    in the vault. Contacts' names (the username typed, the name their profile gives) are kept
+    too, so a restart no longer shows "Songbird user …". A call link's name goes from its admin
+    to each person who joins, sealed under the link, over the call's data channel; it is in
+    neither the URL nor the server.
+  - **Time**: the clock was the demo's fixed Tuesday 17 Nov 2026, 10:24, so real messages
+    showed made-up times. Times now count from the app's start and show in the device's time
+    zone; tests keep the fixed day.
+  - **Links**: Songbird's call, group and username links open in the app, not the browser.
+  - **History and screens**: a call that never connected is "Couldn't connect", not "No
+    answer"; the first run no longer opens the demo's welcome chat ("Chat not found"); a
+    username no one has says so; every empty state grows from its own size (`flex_1`'s zero
+    basis collapsed it in scrolling pages, its words over what followed); the Server connection page says what the server carries and can't read.
+  - **Development builds** may trust one extra certificate authority, set when built
+    (`SONGBIRD_DEV_CA`), for a test server on a local network; release builds never set it.
+  - **Hanging up**: ending a call left the device in the room: the others kept its tile and
+    heard of no leave, and the room kept its connection until the server timed it out. Muting
+    a track (the Mute and camera buttons too) has LiveKit spawn the server's request on the
+    current Tokio runtime, and the app's UI thread has none: it panicked there. A call and its
+    video senders now keep the runtime they were made on and enter it to mute. Ending a call
+    mutes the microphone and camera at once, then leaves in the background, its statistics and
+    the leave each bounded (1 s and 5 s) so a dead network can't hold it. In group and link
+    calls, someone leaving is said ("… left the call") as well as their tile going.
+  - **Second round, two iPhones driven by VMPal**: onboarding's Continue sat under the keyboard
+    (the steps now keep their actions on its edge); a toast raised by a closing screen never
+    went (its timer died with the screen; it is detached now); every choice in the share sheet
+    only closed it (the next sheet opened while it was leaving, and a picker's task died with
+    the tile: the choice now runs once the sheet has gone); the profile's avatar ignored a new
+    name; an account from before the profile was kept showed no username; and a real account
+    started from the demo's settings (PIN on, WhatsApp linked, invites it never had, a made-up
+    username link and second account). A preview build may name a LAN backend at build time
+    (`SONGBIRD_DEV_SERVER`), so a fresh phone reaches it before sign-up.
+  - **Third round**: call-link calls now reach the call history (under the link's name); a group
+    the server didn't create is removed and the user told, instead of staying a chat whose every
+    message fails; group screens' action bar rides on the keyboard; a contact with no known
+    username shows none (not "@"); New chat says "No contacts yet" before any search. Groups
+    need the API's clustered send path (`[api.send]`, Iggy), which neither the LAN test nor
+    `deploy/dev-vps` runs: they are tested on a production-shaped environment.
+  - **Fourth round, a three-way call**: turning the camera on crashed the iPhone that asked for
+    camera access (the preview re-attached its layer to the same session; it now ignores a
+    repeated session). Remote video lagged: every decoded frame was converted before the frame
+    limit dropped it, and every shown frame rotated on the CPU, so a slow screen fell behind;
+    now only the newest frame is converted, iOS turns the layer instead of the pixels. A link
+    call's header read its title once and kept "Call link"; it follows the admin's name now.
+  - **Replies and photos**: a reply reached the other side without its quote: the app sent plain
+    text and showed every stored message with no reply. A reply now goes as a `Quote` naming the
+    quoted message (author account and ID) with its words (`Messenger::send_reply`, 1:1 and
+    groups), and a received one shows the message it answers (`messenger::quote_in`). A photo
+    showed only once tapped: the bubble chose between the real photo and the demo's illustration
+    on a check that isn't reactive, so a photo still sending stayed blank; it now shows the
+    photo whenever this device has it, and this device's own photos load from its store.
+- Consequences: a development backend needs `[api.media]` (or every attachment download answers
+  503: photos are sent but never received), `[api.profiles]`, `[api.storage]`,
+  `[api.requests]` with `[delivery.requests]`, and `[delivery] franking_key`, or profiles,
+  message requests and first messages are refused (the LAN test lacked them).
+  `scripts/dev-app-backend.sh` should gain them. Ringing one-to-one calls need Iggy.
+
+## D-0181 — Passkeys on Windows
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - Windows makes and uses passkeys through its own WebAuthn (`webauthn.dll`, Windows 10 1903
+    and later): the system's Windows Security dialog chooses Windows Hello, a security key or a
+    phone nearby. Discoverable credentials, user verification required, no attestation, ES256
+    then RS256. The dialog is modal, so it runs on its own thread, owned by Songbird's window.
+  - Windows binds no app to a domain, so the app writes `clientDataJSON` itself, as a browser
+    on the relying party's site would: `type`, the challenge, `origin` `https://<rp_id>`,
+    `crossOrigin` false. The server checks the origin against `[api.keys.devices] origins`
+    like a browser's; with the site's origin there, Windows needs no extra entry.
+  - Cancelling answers Cancelled (`ERROR_CANCELLED`, which the dialog's Cancel gives on
+    Windows 11 25H2, or `NTE_USER_CANCELLED`); any other refusal, Not allowed.
+  - `apps/device/examples/passkey.rs` makes one and asserts with it against a test relying
+    party, to check a real system.
+- Consequences: Account → Passkeys and linking with a passkey now show on Windows. Linux still
+  has no system passkeys (no platform API); it keeps the PIN.
+
+## D-0180 — Sharing the screen from a phone
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Android**: MediaProjection. Share screen shows the system's own "start recording or
+    casting" prompt; on yes, a foreground service (type `mediaProjection`, as Android 14 asks)
+    takes the projection, mirrors the display into an `ImageReader` at most 1280 pixels on the
+    long side, and hands each RGBA frame, at up to 15 a second, to Rust in place. Its
+    notification says the screen is shared and has Stop sharing.
+  - **iOS**: a ReplayKit broadcast upload extension (`apps/ios/ScreenShare`), the only way iOS
+    lets an app share more than itself. Share screen opens the system's broadcast sheet with
+    Songbird's extension chosen; once the person starts it, the extension scales each frame
+    (vImage, NV12, at most 1280 pixels, 15 a second) and sends it, with its orientation, over a
+    Unix socket in the app group's container (`group.chat.songbird.app`, mode 0600), which only
+    Songbird's own processes reach. The app listens only while a share is starting or running.
+  - In the call, the frames go out as the screen-share track, end-to-end encrypted like the
+    camera (`Call::share_frames`). Nothing is recorded or kept. Stopping in the app ends the
+    system's capture; stopping from the system (the notification, the status bar) takes the
+    track out of the call and the app says so.
+  - Phones share the whole screen (the system offers nothing finer); desktops keep their
+    screen-or-window choice.
+- Consequences: on a device, the iOS app and the extension need the App Group in their
+  provisioning profiles (the notification extension needs it already). The simulator can't
+  broadcast, so iOS sharing is checked on a device.
+
+## D-0179 — App icons: the artwork, and changing it for real
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Artwork**: Songbird's feather (Lucide, ISC, the glyph the app already draws) on four
+    grounds from `theme.json`: Songbird (primary), Night (the call screen's), Paper and
+    Lavender. The masters are SVGs in `apps/ui/assets/icon`; `scripts/render-icons.sh` renders
+    them with macOS's own tools: full-bleed and opaque for iOS and Android (the system masks),
+    and Apple's rounded square with its margin for macOS, Windows and Linux. Before this the app
+    had no icon at all; `nsh.json` now gives one per platform.
+  - **Changing it** (Appearance → App icon, Plus): iOS's alternate icons, compiled into the
+    app's asset catalog by `apps/ios/alternate-icons.sh` (NSH packages the main icon only);
+    Android's adaptive icons as vectors (with the monochrome layer for themed icons), one
+    launcher alias per icon, the chosen one enabled; on macOS the Dock's icon and on Windows
+    the windows' and taskbar's, while Songbird is open (changing the bundle's or executable's
+    icon would break its signature), set again at every start. Linux desktops take the icon
+    from the launcher entry, which an app shouldn't rewrite: the choice isn't shown there.
+  - The tiles show the icons' own artwork, not theme-tinted drawings, so the preview is what
+    the system shows in light and dark. The choice stays a synced setting; each device applies
+    it at start-up, and the main icon comes back when Plus ends.
+  - **The main thread**: NSH runs the app's code on its engine thread on every platform, so the
+    Apple calls that checked for the main thread and gave up never ran from the app: macOS
+    screen protection, iOS's recording check, location, push registration, CallKit, passkeys.
+    They now run on the main queue (`apple::on_main`); the recording check reads UIKit's answer
+    there and the app's one-second poll sees it.
+- Consequences: an App Store build runs `alternate-icons.sh` before signing, like the
+  simulator build. Changing a master means running the render script and committing its PNGs.
+
+## D-0178 — Buying a plan in the App Store and Google Play
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **iOS and macOS** buy with StoreKit 2 (`apps/device/swift/Store.swift`, built by the device
+    crate's `build.rs` with `xcrun swiftc` into a static library, called from Rust through two
+    C functions). **Android** buys with Google Play Billing 9.1.0 in the Gradle host
+    (`chat.songbird.store.PlayStore`). Windows and Linux keep the EU provider (D-0129).
+  - The plan sheet chooses the interval; Subscribe opens the store's own sheet. Its proof, the
+    signed transaction (`{"apple": jws}`) or the purchase token (`{"google": token}`), is kept
+    in the vault and is the proof `POST /v1/billing/tokens` takes instead of the subscriber
+    secret; tokens are fetched and redeemed as before (§14.4). While billing hasn't confirmed
+    the purchase (402), the app retries every 5 s for 15 minutes.
+  - **Restore** asks the store for the account's current subscription (StoreKit's current
+    entitlements, Play's `queryPurchasesAsync`), keeps its proof and fetches this month's
+    tokens. Billing verifies and acknowledges the purchase with the store itself.
+  - No appAccountToken and no obfuscated account ID: the store never learns the Songbird
+    account, and billing never learns it either.
+  - Product IDs, the same in both stores: `plus.monthly`, `plus.yearly`, `family.monthly`,
+    `family.yearly`. Before this, buying on a phone opened the EU provider in the browser, which
+    the App Store and Play don't allow for digital subscriptions, and Restore did nothing there.
+  - Apple's Swift runtime is in the OS; the app links it from `/usr/lib/swift` (an rpath in
+    `apps/ui/.cargo/config.toml`, as Xcode sets for any Swift app).
+- Consequences: the products must exist in App Store Connect and the Play Console, with
+  billing's App Store Server API key and Play service account configured; until then the store
+  says the plan isn't offered, and the app says so. A Mac build sold outside the Mac App Store
+  can't use StoreKit; it would need the EU provider instead (decide with distribution).
+
+## D-0177 — Passkeys on the device; the IP setting that wasn't one
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Passkeys** are made and used by the system's own sheet: AuthenticationServices on macOS
+    and iOS, the platform CredentialManager on Android 14+ (no Play Services library; older
+    Android has no passkeys here). Adding one (Account → Passkeys) asks the server for a
+    challenge, makes the passkey, registers it (`PUT /v1/account/passkeys`) and lists the
+    account's from the server; removing one deletes it there. A device being linked can answer
+    the factor with a passkey instead of the PIN: an assertion over
+    `link_challenge(transcript)`, as the server checks. The relying party a new device uses is
+    the server's web domain (the api host without its first label). Before this, "Add a
+    passkey" waited a moment and added a made-up entry.
+  - **"Protect IP address in calls"** did nothing, and needn't: every call's media goes
+    through Songbird's call server, so the people you call never see your IP address. The
+    toggle became a plain statement of that.
+- Consequences: the system binds passkeys to the domain: the iOS app needs the
+  `webcredentials:songbird.chat` entitlement and `apple-app-site-association` (team ID), the
+  Android app `assetlinks.json` (signing key), and `[api.keys.devices]` the apps' origins.
+  Until then the system refuses, and the app says so. Windows Hello passkeys (webauthn.dll) and
+  Linux have none yet. (Windows since: D-0181.)
+
+## D-0176 — Calls and push on phones
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Call audio**: Android asks for the microphone before a call joins (and before a voice
+    note records); without it the call still joins and says why nobody hears you. A call puts
+    Android in its communication mode; "Speaker" routes the sound to the loudspeaker
+    (`setCommunicationDevice` on 12+, `setSpeakerphoneOn` before) or on iOS overrides the audio
+    session's port; the call's end puts both back.
+  - **iOS incoming calls**: PushKit and CallKit in the device crate. A ring's VoIP push carries
+    nothing (§9), and iOS requires every VoIP push to show a call, so each one reports a call
+    from "Songbird" at once; the app connects, and the offer names the caller
+    (`reportCallWithUUID:updated:`), or after 30 s without one the call ends as failed. Answer,
+    end and mute on the system's screen act on the app's call; answering in the app ends the
+    system's call (answered elsewhere). While a CallKit call runs, WebRTC's audio waits for
+    CallKit's audio session (`RTCAudioSession` manual audio), as Apple requires; other calls
+    are unchanged. The PushKit token joins the APNs token in `PUT /v1/push`. Info.plist:
+    `UIBackgroundModes` voip, audio, remote-notification.
+  - **Android push**: UnifiedPush through the user's own distributor (connector 3.3.6,
+    Apache-2.0, with kotlin-stdlib and Tink; pinned by SHA-256 in Gradle's verification
+    metadata), registered as Web Push. A ring and a message are the same wake-up (§9): in front,
+    the connection already has them; otherwise one notification ("You may have new messages or
+    a call") opens the app, which connects and fetches.
+- Consequences: real APNs and PushKit tokens need the push entitlement and a provisioning
+  profile; FCM needs the Firebase app's configuration (`google-services.json`) from the
+  owner's console; a ConnectionService call screen on Android would need a push that tells a
+  ring from a message, which §9 deliberately doesn't. Screen sharing on phones (ReplayKit,
+  MediaProjection) stays undone.
+
+## D-0175 — Mobile builds; libwebrtc per target; the APNs token
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Mobile builds** need CMake and `bindgen` (aws-lc-sys has no pregenerated bindings for the
+    iOS simulator; `LIBCLANG_PATH` is Xcode's), and for Android JDK 21, the SDK and NDK 28.
+  - **libwebrtc per target**: NSH packages a phone app together with a host tool built for the
+    Mac, and `webrtc-sys` read one `LK_CUSTOM_WEBRTC` for both. LiveKit's `webrtc-sys-build`
+    0.3.21 is vendored (`apps/vendor/webrtc-sys-build`, Apache-2.0, `PATCH.md`) with one
+    change: `LK_CUSTOM_WEBRTC_<target>` first. `scripts/fetch-libwebrtc.sh` exports both, so
+    every target still links only its pinned, checksum-verified archive.
+  - **SQLCipher off Apple**: `scripts/build-aws-lc-libcrypto.sh` builds AWS-LC's libcrypto for
+    the target from the very source `aws-lc-sys` ships (CMake, the NDK's toolchain) and exports
+    `<TARGET>_OPENSSL_LIB_DIR`/`_INCLUDE_DIR`, which `libsqlite3-sys` reads per target (the
+    D-0137 step; no OpenSSL anywhere). Android builds arm64-v8a only (LiveKit's libwebrtc), with
+    the NDK's clang for API 26 named for C and C++ crates. The Android libwebrtc archive has
+    headers that differ only in case; the fetch script overwrites them on a case-insensitive disk.
+  - **Verified**: the app runs on the iOS simulator and the Android emulator (arm64, API 36).
+  - **Screen sharing on phones** needs ReplayKit or MediaProjection: the desktop capturer is
+    built for computers only, and the call screen hides "Share screen" on iOS and Android.
+  - **APNs token**: NSH's app delegate doesn't take the token callbacks, so the device crate
+    adds them to its class at run time (`class_addMethod`, which never replaces a method NSH
+    has), then asks UIKit to register; the token goes to `PUT /v1/push` (`{"apns": {"token"}}`)
+    once the account is connected. Real tokens need the push entitlement and a provisioning
+    profile (the Apple account steps).
+
+## D-0174 — Saving photos and videos; the device's location, once
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Saving**: the viewer's Save and "Save to photos" (received photos and videos, as they
+    arrive) save the decrypted file: to the Photos library on iOS (add-only access: Songbird
+    can't read the library), to the shared Pictures and Movies collections on Android
+    (MediaStore, `Songbird` in them; Android 8 and 9 ask for storage access first), and to
+    Pictures › Songbird on macOS, Windows and Linux (never over an existing file). View-once
+    media are never saved. The file name is cleaned of any folder.
+  - **Location**: "Use my location" in the place picker centres it on where the device is: one
+    fix, asked at that moment, permission while using the app only (CoreLocation, Android's
+    LocationManager, the Windows Geolocator, GeoClue). Nothing tracks or runs in the
+    background; the place still goes only where the person sends it.
+  - Info.plist gains the location, photo-add and Face ID reasons; macOS the location
+    entitlement; Android the location permissions and storage access up to Android 9.
+- Consequences: alternate app icons stay undone: the app has no icon artwork yet (not even its
+  main icon), and NSH packaging builds a single app icon set. (Done since: D-0179.)
+
+## D-0173 — Screen protection and the app switcher cover
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: "Block screenshots" keeps Songbird out of screenshots and recordings where the
+  system allows: Android `FLAG_SECURE`, macOS `NSWindowSharingNone`, Windows
+  `WDA_EXCLUDEFROMCAPTURE`, applied again every second to windows opened since. iOS lets no
+  app block screenshots: there the setting says so, and a cover hides the app while the screen
+  is recorded, mirrored or shared (`UIScreen.isCaptured`). Linux has no such API, so the
+  setting isn't shown there. "Hide content in app switcher" (iOS and Android only, where the
+  switcher shows a snapshot) covers the app whenever it isn't in front, and on Android 13+
+  also blanks the recents thumbnail without blocking screenshots. The cover has no motion: it
+  must be whole in the frame the system snapshots.
+
+## D-0172 — The device's own services: device secrets in the secure store; biometric unlock
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: a new crate, `apps/device` (`songbird-device`), holds every call into the
+  platforms' own services, like `songbird-camera` (D-0110): objc2 and Security.framework on
+  Apple, JNI to `chat.songbird.device.DeviceBridge` in the Gradle host on Android, the `windows`
+  crate on Windows, D-Bus on Linux. `unsafe` stays in its platform modules.
+  - **Device secrets at rest** (the identity and device seeds, the message store's key, the
+    recovery key, the profile key, the records' replica, the passcode's hash, the subscriber
+    secret, Family and seat tokens, support tickets, supervision links, the backup
+    destination's sign-in): encrypted in app storage under a **vault key** (AES-256-GCM, the
+    key name as associated data), which the system keeps: the Keychain (iOS: this device only,
+    after first unlock, never in backups; macOS: the login keychain, as a development build
+    can't use the data-protection keychain), the Android Keystore (a non-exportable AES key,
+    StrongBox where present, wraps it), DPAPI (wraps it), the Secret Service. Values written
+    before are encrypted on first read. A Linux without a keyring keeps them as before, and
+    the app can tell (`vault::protected`).
+  - **Biometric unlock**: "Unlock with Face ID / Touch ID / fingerprint / Windows Hello" in App
+    lock, turned on only after a match. The lock screen prompts at once and on a button; a
+    miss counts nothing against the passcode's tries, and the passcode always works. Linux has
+    no system biometrics, so the option doesn't show there.
+- Consequences: the D-0165 note (secrets in app storage until the keychain) is closed.
+
+## D-0171 — Audits on the device; the new device gets the log key; dead leaves go
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Audits.** The KT publisher records every epoch's root as it publishes (and the current
+    one first on each pass, so a crash leaves no gap); `POST /v1/kt/roots` serves them. When a
+    device's head moves forward it checks akd's append-only proof over those roots, whose two
+    ends must be the signed heads' roots; a failure is a fork, noticed and refused.
+  - **Pinned log keys.** Release builds carry the log and VRF keys
+    (`SONGBIRD_KT_LOG_KEY`, `SONGBIRD_KT_VRF_KEY` at build time); a release without them checks
+    nothing rather than trust the server. Development builds pin the first keys they read.
+  - **The new device's log key and title.** When a member account's new device joins, that
+    account's other devices send a `DEVICE_JOINED` group update (a new kind, 13) carrying the
+    change log's key and the title; no line shows.
+  - **Dead leaves.** After following its account's new device, a device removes every leaf
+    whose device no member account's signed list names (read fresh), never its own. Only lists
+    it verifies count, so the server can't make it remove a device someone still lists.
+- Consequences: the D-0167 and D-0168 gaps are closed. Calls through the proxy, keychain storage
+  of device secrets, and client-side parental rules on modified phones stay as they were.
+
+## D-0170 — Crash reports: opt-in, scrubbed, sealed, unlinked
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: a panic hook writes one report on the device: version, platform, the UTC day, the
+  panic's message and place, and Songbird's own function names on the stack, each scrubbed
+  (quoted text, IDs, long numbers, tokens, usernames, emails, URLs and paths replaced; only a
+  `.rs` file name and line kept). At the next start it goes only if "Send crash reports" is on,
+  as an **unsigned** support ticket of kind `crash` sealed to the support key (the server
+  keeps ciphertext, no account, no device; signed crash tickets are refused); either way the
+  file is deleted. The support channel's throttle and 90-day deletion apply.
+- Consequences: staff read crash reports with the support key, like tickets.
+
+## D-0169 — A cancelled renewal can be resumed
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: `POST /v1/billing/mollie/resume` turns renewal back on while the paid period lasts.
+  Mollie can't reactivate a cancelled subscription, so billing starts a new one on the
+  customer's mandate, its first charge the day the paid period would have renewed (never
+  before tomorrow): nothing is charged twice. One resume per paid period at a time; cancelling
+  again allows another. Refused when revoked, expired (buy again), already renewing, or when
+  Mollie refuses the mandate (pay again by checkout). If recording fails, the new subscription
+  is cancelled at once. StoreKit and Play resume in their own pages (native hosts, later).
+
+## D-0168 — Key transparency checked on the device; security notices shown
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: app-core checks the log (PROTOCOL §4.9) with akd's own verifier: the log's keys
+  are pinned on first read; every signed head is checked and must move forward (an older
+  epoch, or the same epoch with another root, is a fork); whenever a device accepts a newer
+  signed device list (a contact's or its own) it verifies a lookup proof that the log publishes
+  exactly that list. A list the log hasn't published yet is checked again with the next fetch;
+  the same list contradicted twice is noticed. New devices on an account the device already
+  knew are noticed too. The app shows: a line in the contact's chat for their new devices or a
+  list the log doesn't vouch for, a warning for the user's own new devices, and a lasting
+  problem banner for a fork. The A2 gate now runs with the real log.
+- Consequences: audit proofs need every epoch's root, which no endpoint serves one by one, so
+  devices rely on forward-only heads and leave audits to auditors (`POST /v1/kt/audit`). The
+  log's keys are trusted on first use until release builds ship them pinned (A12).
+
+## D-0167 — A new device joins its account's groups by external commit
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: every device keeps an encrypted record `g/<group ID hex>` per group the account is
+  in (§10.2); a device that finds one for a group it isn't in joins by external commit through
+  `POST /v1/groups/commit` (§6.3 rule 5: a listed device of an account in the group, removing
+  nothing). Members follow such a join only when the joiner is on the signed device list of an
+  account that already has a device in the group, checked from lists they verify themselves, so
+  the server can't slip a device in under someone's account. No line shows in the chat (it's
+  the same person). A restore joins the restored groups the same way. Leaving or being removed
+  deletes the record.
+- Consequences: the joining device doesn't get the change log's key until the next key handoff
+  (D-0156); the dead leaf of a reinstalled device stays until a member removes it (§6.3).
+
+## D-0166 — The parent's app-side rules are enforced on the child's app
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: the child's app keeps the signed policy (checked against the key scanned at linking
+  at every read; a newer version only; fetched at start and every 30 minutes) and enforces the
+  sealed client rules (PROTOCOL §10.6):
+  - **Calls only from contacts:** an offer from someone who hasn't shared their profile with
+    the child is answered busy.
+  - **Nudges off:** none shows, none can be sent.
+  - **Quiet hours:** no notifications inside the window, in the device's local time.
+  - **Each new contact needs approval, in person:** starting a chat with someone new shows a
+    code (`SONGBIRD:APPROVE:<account>:<username>`); the parent's phone scans it and shows eight
+    digits, `HMAC(HKDF(link secret, "contact-approval"), child ‖ contact)`, which the child
+    types. Nothing goes through the server, so it never learns who parents whom or who is
+    approved. Five wrong codes make the next try wait a minute, doubling. Approvals stay on the
+    child's device until supervision ends.
+  A policy that ends supervision (or its date passing) lifts every rule and forgets approvals.
+- Consequences: these rules are the child's app's to enforce, as §10.6 says: a child who
+  modifies their phone can get around them. The server-enforced flags (no requests, group
+  approval, hidden) hold regardless.
+
+## D-0165 — Backups hold app-core's chats; schedule, media and a second copy are real
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **What a backup holds** for a real account: every chat and message app-core keeps, as its
+    `Content` protobuf with real IDs (PROTOCOL §11.5), read on the backup's own thread from a
+    second connection to the SQLCipher store (WAL lets it read while the app writes). Before
+    this, backups held only what the screen showed, as text, and restored into the screen alone
+    (gone at the next start). A restore writes chats, messages and files back into app-core,
+    holding app-core's lock so the store isn't opened twice, then shows them.
+  - **Never in a backup:** disappearing messages (their timer is a promise to the whole chat),
+    view-once messages, deleted ones, sessions, keys.
+  - **Include media** puts the files this device has into the backup (deduplicated by the
+    format); off, messages keep their pointers only.
+  - **Frequency** runs backups: checked a minute after start and every ten minutes; a backup is
+    due a day, a week or 30 days after the last.
+  - **A second destination** gets the same content after the main one; its failure is reported
+    without undoing the main backup. Rollback state (§11.4) is kept per destination, since
+    each place has its own generations.
+  - **The settings are kept on this device** (they weren't: a restart turned backups off): on,
+    destination, media, frequency, second copy, last time and size (both real now; the size was
+    a made-up "1.2 GB"). The destination's sign-in sits with the device's other secrets and
+    moves to the keychain with them.
+- Consequences: a backup made before this restores as before (its IDs are the app's own); a
+  restored group shows its history but needs a re-add or external commit to send again (§6).
+
+ to Songbird's hosts goes through the proxy too
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: with a proxy set, the app's HTTPS requests to Songbird's own hosts (api, media and
+  the vault on it, billing) go through it like the connection (`songbird_client::https::Tunnel`:
+  TCP and TLS to the proxy, the endpoint's TLS 1.3 inside, HTTP/1.1, redirects only to HTTPS
+  and only through the proxy). Fail closed: an unreachable proxy, or one that doesn't carry a
+  host, is an error, never a direct connection. Destinations the user chose for backups are
+  reached directly, since a proxy is not an open relay. The proxy example adds billing's host.
+- Consequences: before this, only the delivery connection used the proxy, and every HTTP
+  request showed the user's IP address to Songbird. Calls still connect directly (WebRTC needs
+  UDP, which the proxy doesn't carry); the proxy page says only that it hides the IP address
+  from Songbird's servers.
+
+## D-0163 — Chat-list state follows the account across devices
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision: each real chat's archived, pinned, muted-until, marked-unread and favourite state
+  and the custom lists it is in are one encrypted record `c/<account or group ID, hex>/state`
+  (PROTOCOL §10.2), last writer wins. Changes are written when the chat list changes; a sync
+  from another device applies them. A chat this device has not written yet takes the synced
+  state instead of overwriting it with its own defaults. Locked chats stay device-only: a lock
+  protects whoever holds this device, and the passcode never leaves it.
+- Consequences: the records server sees one more opaque record per chat that has state; it
+  learns nothing of which chat (the logical key is inside the encrypted record, D-0102).
+
+## D-0162 — Locked chats open with the app passcode; real storage and network usage
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Locked chats** open with the app passcode (the six digits kept only on this device as a
+    slow hash, D-0101), with the lock screen's growing wait after wrong tries, served on the
+    Locked chats page too. Locking a chat needs a passcode to exist; without one the user is
+    sent to Privacy → App lock. Before this, "Unlock" opened them with a press. Face ID and
+    fingerprints join with the native host projects.
+  - **Manage storage** lists what app-core keeps on this device (every decrypted file in the
+    SQLCipher store, by chat, with its real size, type and name) and deletes files from it (the
+    messages stay). A real account no longer sees the made-up files.
+  - **Network usage** counts what crosses the network on this device, by lane (messages,
+    media, calls), kept on the device until reset: every HTTP request and answer (by its path:
+    attachments, packs, GIFs, map tiles and storage URLs are media), every delivery-connection
+    frame sent and received, and each call's bytes as WebRTC counted them on its transports
+    (`Call::traffic`), added when the call ends. Header sizes are estimated (a flat 200 bytes an
+    HTTP request and answer); bodies are exact.
+- Evidence: `apps/ui` 214 tests (the lanes of URLs, the date); the app builds with every
+  counter wired. Not exercised against a live session.
+
+## D-0161 — Voice notes: a recorder on every platform, WAV, played receipts
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Context: D-0158 found that libwebrtc's audio device module does not record outside a call.
+- Decision:
+  - **`apps/recorder`** (its own workspace, no `unsafe`): the default microphone through
+    `cpal` 0.16 (Apache-2.0: CoreAudio on macOS and iOS, WASAPI on Windows, ALSA on Linux,
+    AAudio on Android), one API instead of a native module per platform. Whatever the device
+    gives is mixed to mono and averaged down (or repeated up) to 16 kHz, kept in memory as
+    16-bit PCM, at most 10 minutes; the level of the last 100 ms; at the end a waveform of at
+    most 256 bytes and a WAV file. Nothing touches the disk before encryption.
+  - **Why WAV, not Opus**: no codec library to vendor and review, played by every platform's
+    own player; 32 KB a second (a minute is about 1.9 MB, inside the attachment limits). An
+    Opus encoder can come later without changing the protocol (the pointer's content type says
+    what it is).
+  - **Sending**: the composer's record button records in real chats (the system asks for the
+    microphone the first time, with the purpose string added to `nsh.json` in D-0152); release or
+    Send sends a `FLAG_VOICE_NOTE` attachment with its duration and waveform, to a 1:1 chat or a
+    group; under half a second is not sent; deleting or sliding away discards it.
+  - **Receiving and playing**: a voice note is a voice note in the chat; it plays in the
+    platform's audio player (from a decrypted copy in the app's `media-playing` folder, D-0158),
+    its bar moved by the player's own progress events, at the chosen speed, then the next unplayed
+    note; the bubble draws the waveform the sender measured. Playing a received note keeps it
+    played and sends the author a played receipt (`Messenger::mark_played`).
+- Evidence: the recorder's unit tests (48 kHz stereo to 16 kHz mono at the right level, slower
+  devices brought up, the WAV header, the waveform's bounds, the 10-minute stop); a live capture
+  on this Mac (two seconds recorded, a WAV and a 256-byte waveform); `gate_a2::a_voice_note_
+  arrives_with_its_waveform_and_is_marked_played` against the real stack (flag, duration and
+  waveform arrive; the file opens; the played receipt reaches the sender); the A2 gate (19) and
+  `apps/ui` (213) pass. `cargo deny` passes licences, bans and sources for the recorder.
+- Not exercised: recording inside the packaged app on iOS, Android, Windows and Linux (cpal
+  builds there; Linux needs `libasound`'s headers to build; iOS needs the record audio session
+  category, which cpal sets for an input stream).
+
+## D-0160 — Broadcast lists, presence and nudges on the real backend
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Broadcast lists** send: a list's message goes to each person separately, as a 1:1
+    message in their chat with the user, and only to people who shared their profile key (the
+    lists' own promise: "only people who saved you as a contact get it"); the others are counted
+    and named in the toast. Lists can hold real contacts (the picker offered only demo ones), and
+    New chat → New broadcast list now makes the list it announced. Sending each person a direct
+    message (rather than one send in the broadcast lane) keeps each copy in its own chat; the
+    broadcast lane's single send is not used yet.
+  - **Presence** (§10.5): the presence rules already in the app (`Presencer`) now reach real
+    contacts: app-core lists the contacts who shared their profile key with their devices and
+    access keys (`presence_peers`), seals each payload for each device in its Signal session
+    (`seal_for`), and the app sends the sealed batch as before. Presence received updates the
+    contact, and a contact who asks gets one answer. The contacts are read when app-core opens
+    and every five minutes.
+  - **Nudges** go sealed per device in the attention class (`Messenger::nudge`, new
+    `Net::attention`), and are taken only from it (`receive_attention`): the same payload as an
+    ordinary ephemeral event is not a nudge. A nudge shows unless nudges are off globally or for
+    that person, or they are blocked. A real nudge is a line in the chat, never a stored message;
+    the demo's "nudge back" stays in demo chats only.
+- Evidence: `gate_a2::presence_and_nudges_reach_contacts_sealed` (presence reaches exactly the
+  contact who shared a profile key; a sealed presence arrives as it was sent; a nudge arrives
+  only through the attention class) and the whole A2 gate (18); `apps/ui` 213 tests.
+- Not exercised: `PUT /v1/ephemeral/sealed` from the app (P09's gate covers the endpoint).
+
+## D-0159 — Sticker packs on the device; stickers in real chats
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **Installing** from `https://songbird.chat/pack#<id>.<key>` (§7.4): app-core fetches the
+    manifest and every asset with no account, opens each with keys derived from the pack key,
+    checks each asset against the manifest's commitment, and keeps the pack (key, manifest,
+    assets) in the SQLCipher store (schema 7). Packs are listed, reordered and removed there; a
+    real account starts with none (the sample packs are the demo's).
+  - **Sending** an installed pack's sticker carries the pack ID, key and emoji, and the asset as
+    an encrypted attachment (`StickerRef.data`), so the receiver needs nothing installed; the
+    receiver shows the artwork.
+  - **The built-in "Songbird friends" pack** is emoji: its stickers carry a fixed public pack ID
+    (`songbird-friends`), an all-zero key that hides nothing, and no data; each device draws
+    the emoji. Before this, built-in stickers could not be sent to real chats.
+  - The UI's pack link format was not the protocol's (`/pack/<id>#<key>`); it is now.
+  - Received videos and view-once messages are registered as media (D-0158 had missed it, so
+    they could not be opened).
+- Evidence: `gate_a2::sticker_packs_install_from_a_link_and_stickers_travel` (a pack made on
+  the server as P06 makes it, installed from its link with every asset checked; a sticker
+  reaches someone with nothing installed, with its image; a built-in sticker; removal);
+  `apps/ui` 214 tests.
+- Consequences: making a pack on the device (uploading one's own artwork) is not offered yet.
+
+## D-0158 — View-once photos and videos; real video playback
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - **View once** (`Message.view_once`, §5): a "View once" attach option sends one photo; the
+    sender keeps no copy to view again. A receiving device reads the file, deletes it from its
+    store at once (and refuses to fetch it again), and shows it in a viewer that keeps no copy;
+    the message then reads "Opened" on that device. A view-once video plays from a copy in the
+    app's own data folder that goes when the viewer closes.
+  - **Videos** received in real chats are videos (not files); the media viewer plays them in
+    the platform's player with its own controls, from a decrypted copy in the app's data folder
+    (`media-playing`, emptied whenever app-core opens; the player needs a file). Real photos in
+    the viewer are the photos themselves (the viewer showed the demo illustration for every
+    message before).
+- Not done: voice notes. libwebrtc's audio device module does not record without a call's send
+  stream (tried: a local track from the platform's audio delivers no samples, and recording
+  fails to start for a process without microphone access); recording needs each platform's own
+  recorder, a native module like the camera's.
+- Evidence: `gate_a2::a_view_once_photo_is_shown_once_then_gone` (the sender keeps nothing; the
+  receiver reads it once; after that it is gone and cannot be fetched again); the A2 gate (16)
+  and `apps/ui` (214) pass.
+- Consequences: a decrypted video exists on disk, inside the app's container, while it plays.
+
+## D-0157 — Retries: the outbox, group operations, offline sends
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Decision:
+  - Messages a budget (429) or a busy server held back already waited in the outbox, but went
+    out again only on a reconnect. The app now flushes the outbox every 15 seconds while it has
+    entries, and updates each message's ticks.
+  - A send that fails for want of a network keeps its message (status Sending) and its outbox
+    entry instead of showing it failed; the flush sends it.
+  - Group operations (add, remove, leave, answer a request) are tried up to four times, 2, 4
+    and 8 seconds apart, when the failure may pass (409: another commit came first; 429; 503;
+    the network). The core is unlocked in between, so the commit that came first is received
+    and the next try starts from the new epoch.
+- Evidence: the A2 gate (15) passes with the changes; not exercised against an induced 409 or
+  429 (the test stack's budgets are raised for the gate).
+
+## D-0156 — The group change log on the device
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent, within D-0070 ("ciphertext under a key the members share")
+- Decision: a per-group random **log key**, made by the creator, kept in the encrypted store and
+  handed to members in a group message (`GroupUpdate.log_key`, a new field 5): the "created"
+  update, an update after each add, and one from any member that processes a join by link.
+  Each commit a device makes (adds, removals, committed leaves, link-key settings) carries a
+  version-2 bundle entry sealed under the key, bound to the group and the commit's epoch, and
+  signed by the committer's leaf as §6.7 already required (the server checks the signature, and
+  cannot read or forge an entry). "Member changes" reads the log, opens what it can and names
+  people from the store.
+- Rejected: the epoch's exporter as the key (no device that joins later could read anything
+  before it joined, which is the log's purpose).
+- Also fixed: `songbird-content`'s guard test refused the client-only app-core crate it was
+  written before; client-only crates are now named, and nothing else may depend on them.
+- Evidence: `gate_a2::the_change_log_is_written_encrypted_and_read_by_members` (the creator's
+  key reaches the member; the add is in the log with actor and subject; a removal is logged
+  after it); the whole A2 gate (15) and P05 (14) pass.
+- Consequences: a change naming more people than 2 KiB of ciphertext holds is left unlogged.
+
+## D-0155 — Devices enforce group roles: verified member accounts
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent
+- Context: roles (§6.6) were enforced only by the server; a device took any commit the server
+  fanned out, because the MLS tree names devices, not accounts (D-0147 recorded the gap).
+- Decision:
+  1. `POST /v1/groups/state` ends with each member device's account, for members only.
+  2. The device keeps a per-group device→account map (in the encrypted store), refreshed from
+     that answer, and uses a pair only after finding the device in the account's signed device
+     list (a device no longer listed is dead and has no account). The map is warmed on joining
+     and after every merged commit, so a later removal can still be checked.
+  3. Before merging a member's commit, the device computes the change in accounts (before,
+     after, gained, lost, left, server removals) exactly as `ds` does and runs
+     `roles::authorize`. A refused commit is not merged; the app says the device stopped
+     following the group. A commit removing this device is accepted (the server merged it; the
+     device cannot follow the group any further either way).
+  4. Group messages from an account the roles do not let send are dropped; pins from an
+     account that may not pin are ignored.
+- Rejected: carrying accounts in leaf credentials (changes the credential every server and
+  harness checks) or in each commit's change-log entry (unreadable to a device that joins
+  later, and the log's key is not settled).
+- Evidence: every A2 group test (creation, adds, removals, leaving, links, requests,
+  communities, channels, calls, polls) passes with the check active (14); a joiner's verified
+  map names the creator's device and account; P05 (14) and P07 (7) pass with the extended state
+  answer.
+- Consequences: a server can make a device refuse a valid commit only by leaving its committer
+  out of the answer, which every member would notice; it cannot make one accept a commit the
+  roles forbid. The change log ("View member changes") is still open.
+
+## D-0154 — Disappearing messages, polls, pins, safety numbers, mutes and GIFs in real chats
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision:
+  1. **One place for events** (`Messenger::apply_event`), used by 1:1 and group receive alike:
+     reactions, edits, deletes, poll votes and closes, pins and timer changes. Before this, a
+     group's reactions, edits and deletes were stored as empty messages. Sending an event to a
+     group goes through MLS (`send_event` picks the group path for a group ID).
+  2. **Disappearing messages** (§5.9): each chat's timer is kept (schema 6, `chat_timers`);
+     every message and event carries it; a message goes `expire_timer_s` after it is stored on
+     each device (with its files, reactions, votes, pins and franking proof). The app sweeps
+     every 15 seconds. The UI's "90 days" choice is now "4 weeks": the protocol's longest timer
+     (`MAX_TIMER_S`); a synced setting of "quarter" reads as 4 weeks.
+  3. **Polls** (§5.8): a vote counts only for an open poll, for options it has, one unless it
+     allows several; the highest counter wins; only the author closes it, and then only each
+     voter's vote at the listed counter counts. The UI holds several choices (`mine` is a list)
+     and offers "Close poll" to the author, "Final results" after.
+  4. **Pins**: for everyone in the chat, 7 days (the protocol offers 24 hours, 7 days or 30
+     days), only for a message of that chat.
+  5. **Safety numbers from real keys** (D-0136's construction over both accounts' identity
+     keys); "verified" kept in the store; a changed identity key, which used to block sending
+     for good, can now be accepted from the safety-number screen (unverified until compared
+     again).
+  6. **Mute for 8 hours, 1 week or always**, lifted on time (checked every minute); backups
+     keep when a mute ends.
+  7. **GIFs** through the privacy proxy (`/v1/gifs/*`), in a GIFs tab of the sticker sheet in
+     real chats; a GIF picked is fetched through the proxy and sent as an encrypted photo.
+  8. **Mark all as read** marks every real chat read in app-core (and sends read receipts when
+     they are on).
+- Evidence: `gate_a2::timers_pins_polls_and_group_events` (a poll voted, a bad vote refused,
+  closed and a later vote refused; a pin; a 5-second timer learnt by the other side and the
+  next message gone from both devices; a group reaction and a multiple-choice vote arriving as
+  events) and `gate_a2::safety_numbers_match_and_verification_is_kept` against the real stack
+  (14 gate tests pass); `apps/ui` 214 tests.
+- Consequences: built-in emoji stickers still cannot be sent to real chats (sticker packs from
+  links are the next item); a group's pins follow no admin rule yet (roles on received commits
+  and events wait for the device-to-account map).
+
+## D-0153 — Call links on the device
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent, within the owner's design (D-0085 §2: Signal's link calls)
+- Decision (`songbird_app_core::call_links`, `apps/ui/src/backend/calls.rs`):
+  1. **Making a link**: a random root (the link, `https://songbird.chat/call#…`, new
+     `songbird_proto::call_link`) and admin token; the server gets the link ID and admin token
+     to hash (§8.7); the device keeps both in the SQLCipher store (schema 5, `call_links`). The
+     Calls tab lists them; each can be copied, joined (as admin, skipping the lobby) or revoked
+     (after a confirmation; the server ends its call for everyone).
+  2. **Joining**: a link pasted into New call or New chat, or tapped in the list. With a lobby,
+     the device's card waits (identity `lobby`, the device has none yet) and its place is asked
+     again every 3 s until admitted (then the ticket) or turned away ("You weren't let in").
+     Admins in the call see who waits (cards opened with the link key, unverified names unless a
+     contact) and admit or turn them away.
+  3. **Keys on the data channel, sealed in Signal sessions.** The message lanes refuse a
+     stranger whose account is closed (reason 10), and a link call is mostly strangers, so the
+     `sender_key` envelope (built by `link_key_envelope`, opened by the receiver's ordinary
+     `receive`) travels on the room's data channel to that participant only. A key is used only
+     if it came, over the session, from the account and device the sender's card names, for the
+     card's identity; one that arrives before the card waits for it. Each participant draws a
+     new key at the next index on every join and leave, installs it, sends it to everyone whose
+     card arrived, and sends with it a second later.
+  4. **The data channel is not LiveKit-encrypted in a link call** (`Call::join_with(…, false)`):
+     LiveKit encrypts data packets under the sender's key, which a newcomer does not hold before
+     the exchange that needs the channel. Everything sent there is sealed by the app instead
+     (cards and other data under the link key, keys in Signal sessions); media stays encrypted
+     under the sender keys. No hello is sent (it would name the device to the server in the
+     clear; the sealed card does that job).
+  5. **Names**: a contact's name once their key came from the device their card names; anyone
+     else's card name marked "(unverified)", as §8.7 requires (anyone with the link can write
+     any name). Link calls have no shared verification code; the sheet says why and points to
+     safety numbers.
+- Evidence:
+  - `gate_a2::call_links_lobby_keys_and_revoke` against the real stack: a link with a lobby, a
+    stranger waits, the admin sees his card's name and admits him, both get tickets to the same
+    room with different identities; cards open only with the link key; a sender key reaches the
+    other device in a Signal session naming the sender's device, though they are strangers; a
+    turned-away joiner gets 404; a revoked link cannot be joined and the other link stays.
+  - `apps/calls-media::a_link_calls_keys_arrive_by_data_and_unlock_media`: on the compose
+    LiveKit, with the data channel not LiveKit-encrypted, a participant without the sender's key
+    hears nothing, receives the key on the data channel, installs it and hears the sender.
+  - App-core unit tests (cards, sealed link data, join answers); `apps/ui` 213 tests; the app
+    starts.
+  - Not yet exercised: two app instances in one link call through the UI.
+- Consequences: the server learns, from the room's data channel, that participants exchange
+  sealed blobs (as it would see message traffic); it reads none of them.
+
+## D-0152 — Calls, part 3: the app's call screens on real calls
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision (`apps/ui/src/backend/calls.rs`, `features/calls`):
+  1. **A call in a chat app-core owns is real.** Its phases come from signalling and the room,
+     not timers: Calling until the ticket is in, Ringing (1:1) until the answer, Connecting until
+     the other person is in the room, Connected; a group call is open as soon as the room is.
+     Incoming offers ring for their own deadline, only from chats app-core owns (never a
+     non-contact); an offer during a call answers "busy" (new `Messenger::busy_call`). Another
+     of the account's devices answering stops the ring here. Whoever ends a 1:1 call tells the
+     other side (hang-up, or decline while ringing); a ring that runs out ends as "No answer" or
+     "Missed". New end lines: declined, on another call, no answer, couldn't connect / lost.
+  2. **Keys without the core lock.** `Messenger::group_call_secret` gives the epoch secret and
+     epoch; the media layer derives every sender key from it as newcomers arrive. Every commit
+     in the call's group (received, or this device's own) installs the new epoch at once and
+     sends with it a second later (§8.2).
+  3. **Names are signed** (PROTOCOL §8.2 "Hellos"): a participant identity is unlinkable, so a
+     group call's tiles would otherwise name nobody; any member could claim to be another if
+     the hello were not signed by the device key and checked against the signed device list. A
+     1:1 call's other participant can only be the person called (the only other key holder),
+     and a hello naming anyone else is ignored.
+  4. **Verification code from the key** (PROTOCOL §8.2): `songbird_content::call`'s
+     `verification_code`, the same on both sides only with the same epoch secret.
+  5. **Media in the UI:** the microphone through the platform's audio device module (macOS asks
+     on first use; `NSMicrophoneUsageDescription` and the audio-input entitlement added); the
+     self-view's camera session feeds the call's encoder (NV12 or BGRA); remote video shows as
+     RGBA frames (`ImageSrc::rgba`, no encoding) at up to 15 a second, turned upright; a tile
+     whose frames do not decrypt shows "Can't decrypt" and nothing of theirs; a ring around who
+     speaks; the mic meter follows the level the room measures. Screen sharing uses macOS's
+     system picker (elsewhere the first screen or window listed). The devices sheet lists the
+     computer's microphones, cameras and speakers and switches to the one picked. Raised hands
+     travel on the encrypted data channel.
+  6. **Demo-only until real:** the demo's timed calls stay for demo chats; the Calls tab's "make
+     it ring" rows and call links show only in demo builds until call links are real on the
+     device (a link nobody can join must never be offered).
+  7. **Build:** `apps/ui` links libwebrtc (`-ObjC` on Apple targets in `apps/ui/.cargo/config.toml`)
+     and `apps/calls-media` refuses to build without `LK_CUSTOM_WEBRTC` (so `webrtc-sys` never
+     downloads one unchecked).
+- Evidence:
+  - `gate_a2::calls_ring_answer_and_agree_on_keys` against the real stack, extended: equal
+    verification codes; a hello verifies to its account, and fails for another identity or with
+    a forged account; `group_call_secret` gives the same keys and code on both members; a busy
+    reply reaches the caller.
+  - `apps/calls-media`: the data channel carries a payload end to end; NV12 frames arrive as
+    the right picture (three LiveKit tests pass).
+  - `songbird-content`: codes agree only on the same secret; `apps/ui`: 213 tests, including
+    frame rotation and participant IDs; the app starts with libwebrtc linked.
+  - Not yet exercised: two app instances calling each other through the UI (the pieces each
+    have their test; the end-to-end run needs two registered devices on screen).
+- Consequences: call links on the device are next; the phone speaker route and the mobile
+  builds of call media wait for the native hosts (P08).
+
+## D-0151 — Calls, part 2: call media on LiveKit's Rust SDK, end-to-end encrypted
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner); the SDK is the owner's choice (2026-11-20: "LiveKit
+  Rust SDK")
+- Decided by: owner (SDK); agent (the rest)
+- Context: part 1 (D-0150) gives each device a ticket and per-sender keys; something must carry
+  audio and video through the SFU with every frame encrypted under those keys, on macOS, iOS,
+  Android, Linux and Windows.
+- Decision (`apps/calls-media`, its own Cargo workspace so libwebrtc never enters the server's
+  build):
+  1. **`livekit` =0.12.0** over LiveKit's prebuilt **libwebrtc**, release `webrtc-a545de4`.
+     The SDK's build script would download it unverified, so `scripts/fetch-libwebrtc.sh`
+     fetches it, checks it against the SHA-256 pinned in `supply-chain/libwebrtc.sha256` (six
+     platforms, as GitHub recorded them at upload; macOS also checked by download) and hands it
+     to the build as `LK_CUSTOM_WEBRTC`. Apple targets link with `-ObjC`
+     (`apps/calls-media/.cargo/config.toml`; every binary linking the crate needs it), or
+     libwebrtc's Objective-C codec factories are dropped and the process aborts at start.
+  2. **Keys.** A `KeyProvider` per call, never shared-key mode: each identity's key comes from a
+     `KeySource` (app-core's `one_to_one_key` or `Messenger::group_call_key`) and is installed
+     for this device before connecting, for everyone already in the room on joining, and for
+     each newcomer when it connects, before its tracks are subscribed. `install_epoch` puts a new
+     epoch's keys in the ring for everyone at once; `send_with` moves this device's senders to
+     the new index (the app calls it a second later, §8.2). A (re)published track is put on the
+     current index at once (LiveKit starts every sender at 0).
+  3. **LiveKit's ratchet is off** (`ratchet_window_size = 0`): keys change only with epochs; a
+     ratcheted key is one no epoch secret produced. Frame keys are derived from sender keys with
+     LiveKit's default PBKDF2 and salt, so the web app interoperates.
+  4. **"Can't decrypt" is reported** (§8.3): with LiveKit's default tolerance (-1) a failing
+     frame is dropped silently; with 25 failed frames it reports the participant and marks the
+     key invalid. The room then installs the participant's current key again, so a burst of bad
+     frames never leaves a good key unused while a wrong key stays reported. Each change of
+     state is reported once.
+  5. **TLS on aws-lc-rs.** LiveKit's `rustls-tls-webpki-roots` feature turns on rustls's `ring`
+     provider; instead the crate takes `__rustls-tls` and asks tokio-tungstenite and reqwest for
+     Mozilla's roots directly, compiles rustls with aws-lc-rs only, and installs it as the
+     process default before connecting (reqwest without a provider needs one). `ring` and
+     `openssl-probe` are no longer in the shipped tree (`ring` remains only in `webrtc-sys-build`,
+     a build dependency that downloads nothing when `LK_CUSTOM_WEBRTC` is set). No OpenSSL
+     anywhere.
+  6. **Media:** the microphone and speaker through WebRTC's platform audio device module;
+     camera frames pushed by the app as I420 (VP8, simulcast); remote audio as PCM streams and
+     remote video as RGBA frames for the app's canvas (libyuv's `ABGR`, which is the bytes R, G,
+     B, A).
+- What is not ours to choose: the frame cryptor (AES-GCM) and DTLS-SRTP run on the BoringSSL
+  built into libwebrtc, not on aws-lc-rs (aws-lc descends from BoringSSL). Sender keys cross into
+  it as a `Vec` LiveKit's API takes by value, which is dropped without being wiped; the key
+  schedule's own copies are `Zeroizing`.
+- Licences: `zlib-rs` (Zlib), flate2's backend that LiveKit selects, gets a `deny.toml`
+  exception; libwebrtc's own `LICENSE.md` (BSD-3-Clause and its third-party notices) goes on
+  the app's licences page with it.
+- Evidence (`apps/calls-media/tests/media.rs`, against the compose LiveKit with rooms created as
+  the `calls` service creates them, keys from `songbird_content::call`):
+  - `audio_and_video_cross_encrypted`: B hears A's tone and sees A's grey frames; A's frames
+    decrypt.
+  - `a_wrong_key_is_never_played`: a participant under another secret is reported as failing
+    to decrypt, and nothing of it is heard.
+  - `a_new_epoch_locks_out_old_keys`: after a group epoch change, the members who installed it
+    still hear the sender at the new index; a removed device that kept the old epoch's keys is
+    reported failing and hears nothing.
+  - `tls_runs_on_aws_lc_rs` (unit). Clippy with the workspace's lints is clean; `cargo deny`
+    passes licences, bans and sources for the crate.
+- Consequences: the app's call screens are wired to this crate next (signalling from app-core,
+  media from here). Camera capture needs each platform's camera host (desktop through NSH's
+  camera, mobile through the native hosts, D-0117); until then a call can be audio-only.
+
+## D-0150 — Calls, part 1: tickets, encrypted signalling and the key schedule
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner); the media stack is the owner's choice (2026-11-20:
+  "LiveKit Rust SDK"), built in part 2
+- Decided by: owner (media stack); agent (this part)
+- Decision (`songbird_app_core::calls`): tickets from `POST /v1/calls` (presenting the callee's
+  access key, so only a contact's call wakes anyone), `/v1/calls/group` and `/v1/calls/join`;
+  `Content.call` signals sealed per device with `EXPIRES` 60 s (1:1) or as MLS messages (groups,
+  not franked: not visible messages); offers ring no longer than `ring_left_ms` allows; sender
+  keys from `songbird_content::call` (1:1: the offer's secret; groups: the MLS exporter at the
+  current epoch). No key reaches a server.
+- Evidence: `gate_a2::calls_ring_answer_and_agree_on_keys` against the real `calls` service and
+  the compose LiveKit: a ticketed room, an offer that rings, an answer with a second identity,
+  the same per-sender keys on both sides (and different keys per sender), a hang-up, a group call
+  with exporter keys equal on both members (eleven gate tests pass).
+
+## D-0149 — Communities and private channels on the device
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision:
+  1. **Channels** (§6.10): a group created with `Policy::CHANNEL`; subscribers join by its
+     link read-only; the server refuses their posts (reason 14). The app's "New channel" makes
+     one and opens its link page.
+  2. **Communities** (§6.9): a community's ID is its announcement group's ID (only admins post
+     there), so members need no new content format to know it: a group whose roles let only
+     admins send, and which is not a channel, is asked for its community
+     (`POST /v1/communities/state`, 404 for a plain group). The community's name is the
+     announcement group's title (an encrypted group update); the server's meta blob stays
+     unused. Admins of both add a group (`/v1/communities/groups/add`).
+  3. **No public directory** (public channels await the owner's legal review, D-0065 §4): the
+     seeded directory shows only in the demo fixtures.
+  4. The app's bridge gained the handlers four earlier edits had silently missed (a typing
+     indicator received, joining a group, group updates, removal), found while wiring this:
+     every bridge hook was then checked to exist.
+- Evidence: `gate_a2::channels_and_communities` against the real stack: an owner posts in a
+  channel a subscriber reads, the subscriber's post is refused, a community's announcement group
+  and an added group are listed for a member (ten gate tests pass); `apps/ui` 211 tests.
+- Consequences: joining a community's other groups is by their own links (the protocol's
+  rule); a community's encrypted info beyond its name, and its picture, come with group info
+  (`/v1/groups/meta`, not yet used).
+
+## D-0148 — Group invite links and join requests
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision: links are `https://songbird.chat/g#<base64url(handle ‖ secret)>`
+  (`songbird_proto::group_link`); `auth` and the `proof` key come from the secret by HKDF
+  (salt `songbird.v1/group-link`). Making a link commits its proof key into the roles, then
+  registers `SHA-256(auth)` with the server; revoking withdraws both. Opening a link joins by
+  external commit whose authenticated data carries the link proof, or, where joins need
+  approval, asks to join; admins list, approve (an ordinary add) and decline requests. Members
+  follow an external commit only if it passes the structural rule (D-0078) and carries a valid
+  proof under a key the group published, unless it only replaces the joiner's own old leaf. The
+  group's context check gained `context_extensions_allowed` (the same rule on extensions a
+  client holds). The app's invite page makes or reads the real link, resets it, shares it with
+  the system sheet; join requests and pasted group links are real.
+- Evidence: `gate_a2::invite_links_and_join_requests` against the real stack: a link joins Bob
+  with a proof Alice's device checks, a revoked link opens nothing, an approval link files a
+  request Alice lists and approves (nine gate tests pass). The test raises the commit and link
+  budgets, which `gate_p05` tests; a real burst of group changes meets 429 (retrying is the
+  app's follow-up).
+
+## D-0147 — Groups: removing, leaving, adding later, media
+
+- Date: 2026-11-20
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision: removing a person removes every leaf of their devices in one commit (the server
+  enforces the roles rule); leaving proposes the device's own `SelfRemove`
+  (`POST /v1/groups/propose`) and forgets the group; a member who receives a `SelfRemove`
+  stores it and commits it at once (no role needed); a commit that removes this device ends the
+  group here; adding people later is the same commit as creating; photos and files in groups are
+  uploaded once with `fetches` = the other devices in the group. The app's Exit group, Remove
+  and Add members act on real groups.
+- Evidence: `gate_a2::group_photos_removals_and_leaving` against the real stack (eight gate
+  tests pass).
+- Consequences, recorded rather than faked: a device does not learn other members' accounts
+  from the MLS tree (credentials are device IDs), so it cannot yet apply the roles rule to
+  received commits or judge the delivery service's removal proposals itself; the server applies
+  both today. A device-to-account map signed into the group (or carried in the roles extension)
+  is the follow-up.
+
+## D-0146 — The group client: create, join, commit and talk over the delivery service
+
+- Date: 2026-11-19
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision (`songbird_app_core::mls::client`, on D-0145's provider):
+  1. KeyPackages with the capabilities every Songbird leaf has, the device ID as credential,
+     single use plus one last resort (`PUT /v1/keypackages`); the private halves saved first.
+  2. Creating: epoch 0, the roles extension (this account owner), the delivery service pinned
+     from `POST /v1/groups/ds` as the one external sender; `POST /v1/groups`; then one commit
+     adding every device of each member, each KeyPackage validated in full and its device on
+     the account's verified list (`POST /v1/groups/commit`, merged only on 200).
+  3. Group messages: `account ‖ padded Content` in a `PrivateMessage`, shared body, franked.
+     The receiver accepts it only if the MLS sender device is on that account's verified list
+     (fetched when unknown) and the franking stamp opens.
+  4. Receiving: a Welcome joins with the server's tree, only if the group names exactly the
+     pinned service key; commits merge only under the same rule; group state saved after each.
+  5. Titles travel as `GroupUpdate` data messages (members' devices only).
+- Evidence: `gate_a2::a_group_is_created_joined_and_talked_in` against the real `api` (groups
+  service, rosters) and `delivery`: the server validates the group and commit, the Welcome
+  reaches Bob, the title and messages cross both ways (seven gate tests pass).
+- Consequences: not yet: the roles rule on received commits (`songbird_groups::roles::authorize`;
+  the server enforces it today), server-proposed removals, removing members and leaving,
+  invite links and join requests, external commits for a member's new devices, the stale-epoch
+  retry, communities and channels. The app's group screens are next.
+
+## D-0145 — Groups on the device: an OpenMLS provider on aws-lc-rs; the third `unsafe` exception
+
+- Date: 2026-11-19
+- Status: accepted (owner, 2026-11-19: "aws-lc-rs provider", over shipping OpenMLS's RustCrypto
+  provider with `hpke-rs` (MPL-2.0) and its `crypto-bigint` advisory); the `unsafe` exception
+  is proposed, for the owner's review
+- Decided by: owner (the provider); agent (its construction)
+- Context: groups need a full MLS provider on the device (the server's only verifies). aws-lc-rs
+  does not expose seeded ML-KEM key generation (X-Wing derives node keys from path secrets) or
+  SHAKE256.
+- Decision:
+  1. `songbird-aws-lc-ext`: two FFI calls into the aws-lc build aws-lc-rs already links
+     (`EVP_PKEY_keygen_deterministic` for ML-KEM-768 from `d ‖ z`; SHAKE256), each object freed
+     by a guard, each buffer owned and sized by Rust. `unsafe` is denied in the crate and allowed
+     only on its FFI module (as D-0033, D-0118). Tests: SHAKE256 against FIPS 202's empty-input
+     vector; seeded keys deterministic, the expanded key embedding its public key.
+  2. `songbird_app_core::mls::crypto::DeviceCrypto`: X-Wing (draft-06: SHAKE256 expansion,
+     `SHA3-256(ss_M ‖ ss_X ‖ ct_X ‖ pk_X ‖ label)`), HPKE base mode (RFC 9180) with X-Wing's
+     HPKE code point `0x647a` in the suite ID, HKDF-SHA256 and AES-128-GCM, the exporter;
+     AEAD, HKDF, HMAC, SHA-2 and Ed25519 from aws-lc-rs. Only
+     `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519`.
+  3. `DeviceProvider`: that crypto, aws-lc-rs randomness, OpenMLS's in-memory storage (MIT),
+     snapshotted into the SQLCipher store.
+- Evidence: `tests/groups/tests/device_provider.rs` against OpenMLS's RustCrypto provider
+  (libcrux, `x-wing`, `hpke-rs`): identical X-Wing keys from the same path secrets; HPKE
+  ciphertexts opened in both directions; equal exporter secrets; a whole group with one member
+  on each provider exchanging messages, the aws-lc-rs member's state restored from its snapshot
+  in between. The first cross-check failed twice and found the suite-ID code point (OpenMLS's
+  `0x004D` is not HPKE's `0x647a`) — the reason the cross-check exists. `cargo deny`: ok.
+- Consequences: the group client over `/v1/groups…` (next) uses this provider; the provider and
+  the FFI crate join the external audit's scope.
+
+## D-0144 — Block, report and typing through app-core
+
+- Date: 2026-11-19
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision:
+  1. **Block** (§5.11): `PUT /v1/blocks`; the device keeps its own block list (store schema 4)
+     and drops anything a blocked account still sends; the profile key is rotated, the profile
+     republished, and the new key shared with every remaining contact as a silent
+     `ProfileChanged`, so the blocked account's old access key fails. Unblock:
+     `DELETE /v1/blocks` (the primary only). A block of an account never met leaves no fake
+     identity: an empty key is "not pinned yet".
+  2. **Report** (§5.14): every franked message from another account is kept with its stamp,
+     franking key and content exactly as received (`franks`); "Report" sends the newest five
+     from that person, each verified by the server; a repeat counts as reported.
+  3. **Typing** (§5.7): sealed per device on the ephemeral lane, only to devices with a session
+     (typing never starts one); "started" at most every 10 s; shown for 15 s. With "Typing
+     indicators" off nothing is sent or shown. Signed `api` requests now cover any request with a
+     body, `DELETE` included (unblock carries one).
+- Evidence: `gate_a2::typing_reports_and_blocks_work_for_real` against the real stack with the
+  production send gate and the reports service (six gate tests pass).
+
+## D-0143 — Reactions, edits and deletes for everyone through app-core
+
+- Date: 2026-11-19
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Decision: reactions, edits and deletes travel as franked `DataMessage` events
+  (`Reaction`, `Edit`, `Delete`, PROTOCOL §5.4) through the outbox like messages, but are not
+  messages themselves. A reaction is one per reactor and message, the highest counter wins
+  (store schema 3, `reactions`); an edit or delete is applied only when its sender is the
+  message's author, on both sides (the sender refuses before sending); a deleted message keeps
+  its row with no text, content, files or reactions, shown as "deleted". With "Read receipts"
+  off, reading a chat marks it read on this device and sends nothing.
+- Evidence: `gate_a2::reactions_edits_and_deletes_reach_the_other_side` against the real stack
+  (five gate tests pass); `apps/ui` 211 tests.
+- Consequences: the 24-hour window for edits and deletes (D-0058) is not yet enforced on
+  receipt; edit history is not kept (only the newest text).
+
+## D-0142 — Maps from self-hosted OpenStreetMap vector tiles
+
+- Date: 2026-11-19
+- Status: accepted (owner, 2026-11-19: "Self-hosted OSM tiles"); the threat-model row below is
+  proposed, for the owner's approval
+- Decided by: owner (the source); agent (the design)
+- Context: sharing a location needs a map. Public OSM tile servers forbid app traffic and would
+  learn where every user looks; Apple's and Google's map SDKs would too.
+- Options considered: OSM's public tiles (policy, privacy), platform maps (Apple and Google see
+  every place shown), self-hosted vector tiles (chosen by the owner).
+- Decision:
+  1. **Data:** OpenStreetMap in the OpenMapTiles schema, built with Planetiler (Europe, z0–14),
+     loaded by `tools/maps-import` from an MBTiles file into RustFS as raw MVT objects
+     (`maps/v1/z/x/y.mvt`; TMS rows flipped; gzip removed so clients need no inflater). New
+     dependency for that tool only: `flate2` with its pure-Rust backend.
+  2. **Serving:** `GET /v1/maps/v1/<z>/<x>/<y>` on `api`, unsigned (no account, no device, like
+     attachment downloads), on the media serving budget per IP range (kind `t`); 204 for an empty
+     tile; publicly cacheable.
+  3. **Device:** `songbird_app_core::maps` decodes tiles (bounded: 4 MiB, 20,000 features,
+     400,000 points per tile), styles them (water, green, urban, buildings at z14, roads by class,
+     rail, rivers, borders, place names) and projects Web Mercator; the app draws them on an NSH
+     canvas. A picked place goes inside the end-to-end encrypted message as a `LocationPin`.
+     "© OpenStreetMap contributors" shows on every map (ODbL).
+  4. **Threat-model row (proposed):** the server sees which map tiles an IP address asks for
+     (an area being looked at), never which account; tile requests carry no identifier.
+- Consequences: the operator runs Planetiler and the import before maps work (a runbook entry);
+  the user's own GPS position needs a native location module (NSH has none), so picking on the
+  map comes first; live location stays out of scope (the prompt set).
+
+## D-0141 — A2 app-core, milestone 6 (first part): attachments end to end
+
+- Date: 2026-11-19
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's no-mocks rule
+- Context: every photo, document and voice note in the app was invented; the server's
+  attachment service (Prompt 6) and the format in `crates/content` existed but no client used them.
+- Decision: `songbird_app_core::attachments` encrypts with `songbird_content::attachment`
+  (AES-256-GCM STREAM, key-committing, Padmé-padded), takes a grant for every recipient device
+  plus this account's other devices, uploads in one `PUT` or in parts then `complete`, and puts
+  the pointer in the encrypted message; downloads follow the signed URL, verify every chunk, and
+  only then confirm `fetched`. `Net` gained `upload` (signed, body not covered, §7.2), `fetch`
+  and `fetch_post` (unsigned, §7.3). Held in memory up to 256 MiB per file for now.
+- Evidence: `gate_a2::a_photo_goes_encrypted_and_arrives_verified` against RustFS and the real
+  `api`: a 300,000-byte photo crosses five chunks, Bob's app-core downloads and verifies it
+  byte for byte, and a pointer with a changed digest is refused.
+- Then (same day): the app's Photos and Document buttons use the system pickers in real chats;
+  photos show from their bytes, files save through the save dialog; received files are kept in
+  the SQLCipher store (schema 2, `files`), never as plaintext files on disk. Auto-download
+  follows Settings (phones follow the mobile choice: NSH cannot tell Wi-Fi from mobile data);
+  "HD uploads" off scales photos to 1,600 px. The gate test reads files through
+  `Messenger::file`, and shows the object deleted once its one recipient device confirmed it.
+- Consequences: streaming from disk for files above 256 MiB, thumbnails and blurhash, voice
+  notes (the microphone needs a native module) and video playback come after.
+
+## D-0140 — Nothing mocked: profiles, photos and username links made real
+
+- Date: 2026-11-19
+- Status: proposed (waiting for the owner)
+- Decided by: agent, under the owner's rule (2026-11-19): "everything must be implemented. no
+  mock allowed or placeholder"
+- Context: the app's mocked layer (D-0092) included the seeded demo, fake invite and username
+  links, a photo button that only toasted, generated portraits on every avatar, and contacts
+  named "Songbird user …" because no one fetched their profiles.
+- Decision:
+  1. A real account starts empty on the real backend; the demo data serves only screenshot
+     fixtures and unit tests (`store::demo`).
+  2. Avatars: the system picker (NSH 0.6 `pick_images`, scaled to 640 px), sealed on the device
+     under a fresh key (`songbird_app_core::blob`: HKDF to an AES-256-GCM key, a random nonce,
+     context `songbird.v1/avatar`), uploaded with `PUT /v1/profile/avatar`, named with its key
+     inside the encrypted profile only when the photo's audience is not Nobody. Contacts' profiles
+     are fetched with the profile key they shared and opened on the device: real names, about,
+     status and photo.
+  3. Username links: `https://songbird.chat/u#<base64url(handle [16] || key [32])>`
+     (`songbird_proto::username_link`); the username sealed under the link key (same blob
+     construction, context `songbird.v1/username-link`); `PUT /v1/username/link` stores only the
+     ciphertext. Opening a link passes its handle to the lookup, so a link works when its owner
+     is not findable by username (§10.3). Changing the username claims it on the server and
+     makes a new link.
+  4. Invites use the real invite card (§14.10); sharing uses the system share sheet (NSH
+     `share`), copying where a platform has none.
+- Consequences: telling contacts a profile changed (`ProfileChanged`, sealed and silent) still
+  needs to be sent by app-core; the photo crop is the platform picker's.
+
+## D-0139 — A2 app-core, milestone 4: the app's 1:1 chats on app-core
+
+- Date: 2026-11-19
+- Status: proposed (waiting for the owner, with the A2 report)
+- Decided by: agent (owner: "Yes, do M4")
+- Context: the app's chat screens ran on the mock store (D-0092); the delivery reader counted
+  envelopes and never acknowledged them.
+- Decision: `apps/ui/src/backend/chat.rs` bridges the UI store and `songbird-app-core`:
+  1. With the real backend on and the device registered, app-core opens a SQLCipher file in the
+     app's data folder on connect; on its first run it publishes the device's keys, the signed
+     device list (the primary, with the account key) and the profile, whose key is the one the
+     app's profile code already publishes.
+  2. Each delivery is decrypted and stored by app-core, then acknowledged, in `seq` order; one
+     it cannot store stays on the server.
+  3. Sending in a real chat goes through app-core (no simulated ticks); ticks follow the server's
+     answer and the recipient's receipts; reading a real chat sends read receipts. Only text (and
+     text with a link) is sent; other kinds fail with a plain message until M5/M6.
+  4. New chat → "Message this username on Songbird": the username's hash is looked up and the
+     account's identity and devices are checked before the chat opens.
+  5. Real accounts and messages get UI IDs from their first 8 bytes with the top bit set, so they
+     never collide with the mock's small IDs and need no table on disk.
+- Evidence: `cargo build` and `cargo test --lib` (208 tests) in `apps/ui`; the pipeline itself is
+  proven by `tests/e2e/tests/gate_a2.rs` (D-0138). Not yet run: two app instances against
+  `scripts/dev-app-backend.sh` or the phone test environment (D-0135).
+- Consequences: the store key and the device identity seed sit in NSH app storage (marked
+  `mock:`) until the Keychain/Keystore modules exist. The mock's seeded chats still show beside
+  real ones; a live account should start empty (follow-up). Message times use real minutes
+  relative to the UI's "now".
+
+## D-0138 — A2 app-core, milestone 3: the message pipeline; `POST /v1/devices/identity`
+
+- Date: 2026-11-19
+- Status: proposed (waiting for the owner, with the A2 report)
+- Decided by: agent (owner's request: fill the backend gaps the app needs)
+- Context: a client must verify a contact's signed device list (PROTOCOL §4.6) before encrypting
+  to their devices, which needs the account identity key that signs it. No endpoint served it:
+  the server stored it (registration) but only the account's own devices and recovery used it.
+  A backend gap, found while wiring app-core.
+- Options considered: put the key inside the device-list answer (changes a format clients
+  already parse); learn it in-band from links and QR codes only (a username lookup would then
+  give no way to verify a list); a separate endpoint (chosen).
+- Evidence: `tests/e2e/tests/gate_a2.rs` against SurrealDB and `valkey-hot`, the real `api` and
+  `delivery` with the production send policy (franking key, contact gate): two app-cores with
+  their own SQLCipher stores publish keys, signed device lists and profiles; Alice's first
+  message goes as a franked request through PQXDH; Bob decrypts, checks the franking stamp,
+  stores it, and sends a delivery receipt; a read receipt follows; Bob's reply accepts the request
+  and both then send as contacts with each other's access key; six more messages both ways;
+  search finds the first over the encrypted store. `cargo clippy -D warnings` clean for
+  `songbird-app-core`, `songbird-api` and the test.
+- Decision:
+  1. `POST /v1/devices/identity` `{"account"}` → `{"identity_key"}`, signed like every device
+     request, on the list-fetch budget. The key is public and already on the threat model's list;
+     clients pin it on first sight and prove it with a KT lookup (§4.9). A changed key is refused
+     (`IdentityChanged`) until the user accepts it.
+  2. `songbird_app_core::messenger`: the pipeline behind a `Net` trait (signed `api` requests and
+     `Send`), so the app and the tests share it. Sends: sealed content with a franking key, stored
+     as `Sending` with its idempotency key in the outbox before any network; the verified device
+     list; sessions from fetched bundles whose identity must equal the list's; `ACCESS` with the
+     contact's access key, else `REQUEST`; device mismatches refresh the list and retry with the
+     same key; retryable rejections stay in the outbox; a `SentTranscript` to the account's own
+     devices. Receives: franking stamp split and checked (an unfranked or mismatched visible
+     message from another account is dropped), system frames verified with the pinned system
+     key (`PrekeysLow` refills, `DeviceListChanged` refreshes), the sender's identity from their
+     verified list, everything stored before the caller acknowledges.
+  3. Writing to someone shares this account's profile key with them (a request is an invitation
+     to talk; a reply accepts theirs, §5.10); receipts and sync messages never carry it.
+- Consequences: the app's screens still read the mock store until M4 wires them to app-core.
+  KT proofs of the pinned key (`akd_core` verifiers on the device) are not yet checked: TOFU
+  until then, with the identity-change warning.
+
+## D-0137 — A2 app-core, milestone 2: the SQLCipher store
+
+- Date: 2026-11-19
+- Status: accepted (owner chose SQLCipher, 2026-11-19); the non-Apple `libcrypto` build is to
+  be wired in the platform builds
+- Decided by: owner (SQLCipher over column sealing); agent (how it is built and keyed)
+- Context: A0 asks for SQLCipher; the locked stack names aws-lc-rs; `deny.toml` bans the
+  `openssl` crates; OpenMLS already pins `rusqlite 0.37` (one `libsqlite3-sys` per build).
+- Options considered: `bundled-sqlcipher-vendored-openssl` (pulls `openssl-sys`, banned);
+  `bundled-sqlcipher` with the platform's crypto (chosen); a custom SQLCipher build against
+  aws-lc-sys's prefixed symbols (possible later, more build code).
+- Evidence: `cargo test -p songbird-app-core` 27 tests, among them: the database file holds no
+  plaintext and does not start with SQLite's header; a wrong key is refused (`Locked`); messages
+  are stored once per (author, id); status never moves back; receipts from a group take the
+  lowest level over the whole audience; device lists never roll back; FTS5 search folds
+  diacritics ("buna" finds "Bună") and never parses user input as query syntax. `cargo deny
+  check bans licenses`: ok.
+- Decision: `rusqlite =0.37.0` with `bundled-sqlcipher` only. Apple: CommonCrypto (the OS's own
+  library). Android, Windows, Linux: SQLCipher's OpenSSL provider linked against an AWS-LC
+  `libcrypto` built for the target (`OPENSSL_LIB_DIR`/`OPENSSL_INCLUDE_DIR`), so no second
+  crypto library ships. A raw 32-byte key (no password KDF), wrapped by the Secure Enclave or
+  Android Keystore by the host; `cipher_memory_security`, `secure_delete`, WAL; schema by
+  `user_version`. FTS5 lives inside the encrypted file.
+- Consequences: the Android, Windows and Linux app builds need the AWS-LC `libcrypto` step (to
+  be added to the app's build scripts with the platform hosts).
+
+## D-0136 — A2 app-core, milestone 1: 1:1 sessions implemented from the specifications
+
+- Date: 2026-11-19
+- Status: accepted (owner, 2026-11-19, the three questions of `A2-plan.md` §2); the post-quantum
+  ratchet step is proposed, for review and formal modelling before release
+- Decided by: owner (protocol source, store, execution); agent (the constructions below)
+- Context: every app screen exists (D-0092) but app-core (A2) does not, so no message can be
+  exchanged. libsignal is AGPL-3.0 (D-0047).
+- Options considered: link libsignal (AGPL, audited) versus implement from Signal's published
+  specifications on aws-lc-rs (chosen by the owner, as D-0047 for the server). Local store:
+  SQLite with column sealing versus SQLCipher (chosen by the owner: whole-file encryption hides
+  schema, row counts, sizes and the search index). Post-quantum ratchet: none (PQXDH only, Signal
+  2023–2025), Signal's SPQR (erasure-coded ML-KEM braid; complex), or a KEM step on every DH
+  ratchet step (chosen; PQ3's idea, simpler than SPQR, ~2.3 KB per message of a chain).
+- Evidence: `cargo test -p songbird-app-core`: 21 tests, among them PQXDH agreement with and
+  without a one-time key, forged prekey signatures refused, the ratchet's round trips, out of order
+  and lost messages, tampering leaving state unchanged, a stripped KEM ciphertext refused, a
+  property test over random send schedules and deliveries, simultaneous session starts converging,
+  every state surviving its encoding. Prekey uploads are signed by the same XEdDSA code the server
+  verifies with. `cargo clippy -D warnings` clean.
+- Decision:
+  1. **PQXDH** per the specification (X25519, SHA-256, ML-KEM-1024, info
+     `Songbird_PQXDH_X25519_SHA-256_ML-KEM-1024`); `AD` also binds `SHA-256(PQPK || CT)`.
+  2. **Double Ratchet** per the specification; AES-256-GCM with key and nonce from HKDF of the
+     message key; at most 1,000 skipped per step and 2,000 kept.
+  3. **Post-quantum step**: each sending chain carries its sender's fresh ML-KEM-768 key and a
+     ciphertext to the peer's newest; `KDF_RK(rk, DH || SS)`. Only the initiator's first chain may
+     lack a ciphertext (PQXDH covers it); later headers without one are refused.
+  4. **Envelope**: the sender's account and device sealed to the recipient device's identity key
+     (ephemeral X25519, HKDF, AES-256-GCM), since `Deliver` names no sender. A prekey message's
+     identity must equal the one the sender's signed device list names.
+  5. **Safety numbers** over account identity keys (Signal's numeric fingerprint, 5,200 SHA-512
+     iterations), one number for all devices of both accounts.
+- Consequences: an external audit and a formal model of 3 and 4 before public launch. M2 (the
+  SQLCipher store) brings OpenSSL inside SQLCipher only, recorded then.
+
 ## D-0135 — A phone test environment on one Coolify server; TLS to delivery in the app
 
 - Date: 2026-11-19

@@ -1,0 +1,20 @@
+[package]
+name = "songbird-maps-import"
+description = "Loads OpenStreetMap vector tiles (an MBTiles file, OpenMapTiles schema, e.g. from Planetiler) into RustFS for the api's map endpoint (D-0142). An operator tool; never linked by a service."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+songbird-s3.workspace = true
+songbird-types.workspace = true
+bytes.workspace = true
+clap.workspace = true
+flate2.workspace = true
+rusqlite.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
+
+[lints]
+workspace = true

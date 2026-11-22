@@ -3,7 +3,7 @@
 
 use nsh_core::prelude::*;
 
-use super::{join_link, simulate_in, start_call_in, state};
+use super::{join_link, open_link, simulate_in, start_call_in, state};
 use crate::{
     nav,
     store::{
@@ -25,6 +25,7 @@ enum Filter {
 fn direction(r: &CallRecord) -> (Icon, &'static str, bool) {
     match r.direction {
         CallDirection::Missed => (Icon::PhoneMissed, "Missed", true),
+        CallDirection::Failed => (Icon::PhoneOff, "Couldn't connect", true),
         CallDirection::Incoming if r.secs == 0 => (Icon::PhoneIncoming, "Declined", false),
         CallDirection::Incoming => (Icon::PhoneIncoming, "Incoming", false),
         CallDirection::Outgoing if r.secs == 0 => (Icon::PhoneOutgoing, "No answer", false),
@@ -65,81 +66,88 @@ pub fn calls_tab() -> AnyElement {
                 .collect::<Vec<_>>()
         })
     });
-    let header = view()
-        .pb_1()
-        .child(view().px_4().pt_3().child(segmented(
-            vec![(Filter::All, "All"), (Filter::Missed, "Missed")],
-            move || filter.get(),
-            move |f| filter.set(f),
-        )))
-        .child(
-            view().pt_3().child(group([Row::new("Create call link")
-                .leading(
+    let header = move || {
+        view()
+            .pb_1()
+            .child(view().px_4().pt_3().child(segmented(
+                vec![(Filter::All, "All"), (Filter::Missed, "Missed")],
+                move || filter.get(),
+                move |f| filter.set(f),
+            )))
+            // Links are made on the server (real) or are the demo's samples.
+            .child((crate::store::demo() || real_links()).then(|| {
+                view().pt_3().child(group([Row::new("Create call link")
+                    .leading(
+                        view()
+                            .size(px(40.0))
+                            .rounded_full()
+                            .items_center()
+                            .justify_center()
+                            .bg(move || c::accent())
+                            .text_color(move || c::primary())
+                            .child(icon(Icon::Link, 20.0)),
+                    )
+                    .subtitle("Anyone with the link can join")
+                    .on_press(move || link_open.set(true))
+                    .build()]))
+            }))
+            .child(when(
+                move || {
+                    (crate::store::demo() || real_links()) && s.call_links.with(|l| !l.is_empty())
+                },
+                move || {
                     view()
-                        .size(px(40.0))
-                        .rounded_full()
-                        .items_center()
-                        .justify_center()
-                        .bg(move || c::accent())
-                        .text_color(move || c::primary())
-                        .child(icon(Icon::Link, 20.0)),
-                )
-                .subtitle("Anyone with the link can join")
-                .on_press(move || link_open.set(true))
-                .build()])),
-        )
-        .child(when(
-            move || s.call_links.with(|l| !l.is_empty()),
-            move || {
-                view()
-                    .child(section_title("Call links"))
-                    .child(group_links(s))
-            },
-        ))
-        .child(section_title(move || {
-            if filter.get() == Filter::Missed {
-                "Missed"
+                        .child(section_title("Call links"))
+                        .child(group_links(s))
+                },
+            ))
+            .child(section_title(move || {
+                if filter.get() == Filter::Missed {
+                    "Missed"
+                } else {
+                    "Recent"
+                }
+            }))
+    };
+    // No calls: a plain page (the empty state sizes itself; D-0183: inside the list's footer
+    // it collapsed under the rows' header and its text ran over the footnote).
+    let empty = move || {
+        let missed = filter.get_untracked() == Filter::Missed;
+        empty_state(
+            if missed {
+                Icon::PhoneMissed
             } else {
-                "Recent"
-            }
-        }));
-    let footer = view()
-        .pb_safe_area_plus(px(24.0))
-        .child(when(
-            move || list.with(Vec::is_empty),
-            move || {
-                let missed = filter.get_untracked() == Filter::Missed;
-                empty_state(
-                    if missed {
-                        Icon::PhoneMissed
-                    } else {
-                        Icon::Calls
-                    },
-                    if missed {
-                        "No missed calls"
-                    } else {
-                        "No calls yet"
-                    },
-                    if missed {
-                        "Calls you didn't answer show here."
-                    } else {
-                        "Start a call from a chat, or with New call."
-                    },
-                    None,
-                )
-                .flex_none()
-                .py_8()
+                Icon::Calls
             },
-        ))
-        .child(footnote(
+            if missed {
+                "No missed calls"
+            } else {
+                "No calls yet"
+            },
+            if missed {
+                "Calls you didn't answer show here."
+            } else {
+                "Start a call from a chat, or with New call."
+            },
+            None,
+        )
+        .flex_none()
+        .py_8()
+    };
+    let footer = move || {
+        view().pb_safe_area_plus(px(24.0)).child(footnote(
             "Your call history is end-to-end encrypted and synced across your devices.",
-        ));
+        ))
+    };
     // Developer and preview builds only (never a release): rows that make
-    // the mock ring, to test calls and their notifications on a device.
-    let footer = if crate::PREVIEW_BUILD {
-        footer.child(demo(s))
-    } else {
-        footer
+    // the demo ring, to test calls and their notifications on a device.
+    let footer = move || {
+        let f = footer();
+        if crate::store::demo() {
+            f.child(demo(s))
+        } else {
+            f
+        }
     };
     view()
         .flex_1()
@@ -148,29 +156,46 @@ pub fn calls_tab() -> AnyElement {
             false,
             Some(icon_btn(Icon::Plus, "New call", move || new_call(s)).into_element()),
         ))
-        .child(
-            virtual_list(
-                move || list.with(Vec::len),
-                move |at| {
-                    let rec = computed(move || list.with(|l| l.get(at.index()).cloned()));
-                    dynamic(move || {
-                        let r = rec.get();
-                        untracked(move || r.map(|r| call_row(s, r)))
-                    })
-                },
-            )
-            .keys(move || list.with(|l| l.iter().map(|r| r.id).collect::<Vec<_>>()))
-            .estimated_item_size(px(if is_desktop() { 60.0 } else { 72.0 }))
-            .header(header)
-            .footer(footer)
-            .label("Call history")
-            .flex_1(),
-        )
+        .child(dynamic(move || {
+            let none = list.with(Vec::is_empty);
+            untracked(move || {
+                if none {
+                    return scroll()
+                        .flex_1()
+                        .child(header())
+                        .child(empty())
+                        .child(footer())
+                        .into_element();
+                }
+                virtual_list(
+                    move || list.with(Vec::len),
+                    move |at| {
+                        let rec = computed(move || list.with(|l| l.get(at.index()).cloned()));
+                        dynamic(move || {
+                            let r = rec.get();
+                            untracked(move || r.map(|r| call_row(s, r)))
+                        })
+                    },
+                )
+                .keys(move || list.with(|l| l.iter().map(|r| r.id).collect::<Vec<_>>()))
+                .estimated_item_size(px(if is_desktop() { 60.0 } else { 72.0 }))
+                .header(header())
+                .footer(footer())
+                .label("Call history")
+                .flex_1()
+                .into_element()
+            })
+        }))
         .child(link_sheet(s, link_open))
         .into_element()
 }
 
-/// The user's call links: tap to join (as its admin), copy its link.
+/// Whether call links are real here: a registered account on the real backend.
+fn real_links() -> bool {
+    !crate::store::demo() && crate::backend::is_live() && crate::backend::registered()
+}
+
+/// The user's call links: tap to join (as its admin), copy its link, revoke it.
 fn group_links(s: Store) -> View {
     view()
         .mx_4()
@@ -216,8 +241,13 @@ fn group_links(s: Store) -> View {
                                         } else {
                                             "Anyone with the link joins"
                                         })
-                                        .on_press(move || {
-                                            join_link(name.clone(), seed, lobby, false)
+                                        .on_press({
+                                            let url = url.clone();
+                                            move || {
+                                                if !open_link(&url) {
+                                                    join_link(name.clone(), seed, lobby, false);
+                                                }
+                                            }
                                         })
                                         .build(),
                                 ),
@@ -225,11 +255,26 @@ fn group_links(s: Store) -> View {
                             .child(icon_btn(
                                 Icon::Copy,
                                 format!("Copy link to {}", l.name),
-                                move || {
-                                    set_clipboard(url.clone());
-                                    toast("Link copied");
+                                {
+                                    let url = url.clone();
+                                    move || {
+                                        set_clipboard(url.clone());
+                                        toast("Link copied");
+                                    }
                                 },
-                            )),
+                            ))
+                            .child(real_links().then(|| {
+                                let (url, name) = (url.clone(), l.name.clone());
+                                icon_btn(Icon::Trash, format!("Revoke {name}"), move || {
+                                    let url = url.clone();
+                                    confirm(
+                                        format!("Revoke “{name}”?"),
+                                        "Nobody can join with this link any more, and its call ends for everyone in it.",
+                                        "Revoke",
+                                        move || crate::backend::calls::revoke_link(&url),
+                                    );
+                                })
+                            })),
                     )
             },
         ))
@@ -346,14 +391,17 @@ fn call_row(s: Store, r: CallRecord) -> View {
                         ),
                 ),
         )
-        .child(icon_btn(
-            if r.video { Icon::Video } else { Icon::Phone },
-            format!(
-                "{} {title}",
-                if video { "Video call" } else { "Voice call" }
-            ),
-            move || start_call_in(&s, chat, video),
-        ))
+        // A link call has no chat to call back into: its link rejoins it.
+        .child((s.chat(chat).is_some()).then(|| {
+            icon_btn(
+                if r.video { Icon::Video } else { Icon::Phone },
+                format!(
+                    "{} {title}",
+                    if video { "Video call" } else { "Voice call" }
+                ),
+                move || start_call_in(&s, chat, video),
+            )
+        }))
 }
 
 /// A call's info: who, the calls with them that day, call back.
@@ -514,12 +562,28 @@ fn new_call(s: Store) {
                                     .pt_3()
                                     .child(search_field("Search name or username", query)),
                             )
-                            .child(
+                            .child(when(
+                                move || {
+                                    query
+                                        .with(|q| crate::backend::calls::describe_link(q).is_some())
+                                },
+                                move || {
+                                    view().pt_3().child(group([Row::new("Join this call link")
+                                        .icon(Icon::Video)
+                                        .on_press(move || {
+                                            let url = query.get_untracked();
+                                            nav::pop();
+                                            open_link(&url);
+                                        })
+                                        .build()]))
+                                },
+                            ))
+                            .child((crate::store::demo() || real_links()).then(|| {
                                 view().pt_3().child(group([Row::new("New call link")
                                     .icon(Icon::Link)
                                     .on_press(move || link_open.set(true))
-                                    .build()])),
-                            )
+                                    .build()]))
+                            }))
                             .child(section_title("Contacts")),
                     )
                     .footer(view().child(when(
@@ -563,14 +627,21 @@ fn link_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
         } else {
             n
         };
-        // mock: app-core creates the link's room and its key; the key
-        // travels in the link's fragment, never to the server.
+        // The link's root (its key) travels only in the link's fragment, never to the server.
         // One link per name and lobby setting: creating it again (a
         // double press, the same form twice) shows the link you have.
         let lob = lobby.get_untracked();
         let existing = s
             .call_links
             .with_untracked(|ls| ls.iter().find(|l| l.name == n && l.lobby == lob).cloned());
+        if real_links() {
+            // The server registers the link; its root (the link itself) stays on this device.
+            crate::backend::calls::create_link(n, true, lob, move |link| {
+                announce_for_accessibility("Call link created");
+                created.set(Some(link));
+            });
+            return;
+        }
         let link = existing.unwrap_or_else(|| s.create_call_link(n, lob));
         announce_for_accessibility("Call link created");
         created.set(Some(link));
@@ -622,9 +693,14 @@ fn link_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
                                     set_clipboard(url.clone());
                                     toast("Link copied");
                                 })))
-                                .child(view().flex_1().child(btn_with_icon("Join call", Some(Icon::Video), Variant::Primary, BtnSize::Lg, move || {
-                                    open.set(false);
-                                    join_link(lname.clone(), seed, lob, false);
+                                .child(view().flex_1().child(btn_with_icon("Join call", Some(Icon::Video), Variant::Primary, BtnSize::Lg, {
+                                    let url = link.url.clone();
+                                    move || {
+                                        open.set(false);
+                                        if !open_link(&url) {
+                                            join_link(lname.clone(), seed, lob, false);
+                                        }
+                                    }
                                 }))),
                         )
                         .into_element()
@@ -634,7 +710,7 @@ fn link_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
     )
 }
 
-/// Developer and preview builds only: make the mock ring here (no calls
+/// Developer and preview builds only: make the demo ring here (no calls
 /// arrive yet). Set apart and marked, never in a release build.
 fn demo(s: Store) -> View {
     let ana = 1;

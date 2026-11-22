@@ -18,7 +18,6 @@ pub fn invites() {
 fn invites_page() -> Screen {
     let s = store();
     s.refresh_invites();
-    let share_open = signal(false);
     let shared = signal(String::new());
     let left = move || s.session.with(|x| x.invites_left);
     let used = move || s.session.with(|x| x.invites_used);
@@ -101,7 +100,7 @@ fn invites_page() -> Screen {
                                                 shared.set(format!(
                                                     "Join me on Songbird, a private messenger. Use my invite code {share_value} at https://songbird.chat/join"
                                                 ));
-                                                share_open.set(true);
+                                                share_text(shared.get_untracked());
                                             })
                                             .text_color(move || c::muted_fg()),
                                         ),
@@ -113,13 +112,7 @@ fn invites_page() -> Screen {
         .child(crate::features::settings::foot(
             "Songbird is invite-only while in beta, so we can grow carefully and keep it fast. You can see whether a code was used, but never who used it.",
         ));
-    page(
-        "Invites",
-        view()
-            .flex_1()
-            .child(page_scroll(body))
-            .child(share_sheet(share_open, shared)),
-    )
+    page("Invites", view().flex_1().child(page_scroll(body)))
 }
 
 /// The personal invite link page, pushed.
@@ -134,7 +127,6 @@ fn invite_link_page() -> Screen {
     let link_url = crate::backend::plans::my_invite_link()
         .filter(|_| crate::backend::is_live())
         .unwrap_or_else(|| personal_link(&me.username));
-    let share_open = signal(false);
     let shared = signal(format!(
         "Let's talk on Songbird, a private messenger: {link_url}"
     ));
@@ -186,7 +178,7 @@ fn invite_link_page() -> Screen {
                     toast("Link copied");
                 }))
                 .child(btn_with_icon("Share…", Some(Icon::Share), Variant::Primary, BtnSize::Md, move || {
-                    share_open.set(true)
+                    share_text(shared.get_untracked())
                 })),
         )
         .child(
@@ -196,75 +188,7 @@ fn invite_link_page() -> Screen {
             })
             .text_center(),
         );
-    page(
-        "Invite a friend",
-        view()
-            .flex_1()
-            .child(page_scroll(body))
-            .child(share_sheet(share_open, shared)),
-    )
-}
-
-/// The share sheet. mock: phones show the system's share sheet (NSH has
-/// no share API yet; the native module is `UIActivityViewController` /
-/// `Intent.ACTION_SEND`); this one lets the flow be reviewed.
-fn share_sheet(open: Signal<bool>, message: Signal<String>) -> nsh_base::SheetElement {
-    let target = move |glyph: Icon, label: &'static str, done: &'static str| {
-        view()
-            .items_center()
-            .gap_1()
-            .child(fab_small(glyph, label, move || {
-                if label == "Copy" {
-                    set_clipboard(message.get_untracked());
-                }
-                open.set(false);
-                toast(done);
-            }))
-            .child(
-                text(label)
-                    .text_size(px(font::CAPTION))
-                    .text_color(move || c::muted_fg()),
-            )
-    };
-    app_sheet(
-        open,
-        "Share invite",
-        view()
-            .px_4()
-            .pb_2()
-            .gap_4()
-            .child(
-                card().child(
-                    text(move || message.get())
-                        .text_size(px(font::SMALL + 1.0))
-                        .line_height(px(20.0)),
-                ),
-            )
-            .child(
-                view()
-                    .flex_row()
-                    .justify_around()
-                    .child(target(Icon::Copy, "Copy", "Copied"))
-                    .child(target(Icon::Chats, "Messages", "Opened Messages"))
-                    .child(target(Icon::Send, "Mail", "Opened Mail"))
-                    .child(target(
-                        Icon::MoreHorizontal,
-                        "More",
-                        "Opened the share menu",
-                    )),
-            ),
-    )
-}
-
-/// A round secondary action in the share sheet.
-fn fab_small(glyph: Icon, label: &'static str, on_press: impl Fn() + 'static) -> View {
-    view()
-        .size(px(52.0))
-        .rounded_full()
-        .bg(move || c::secondary())
-        .items_center()
-        .justify_center()
-        .child(icon_btn(glyph, label, on_press))
+    page("Invite a friend", view().flex_1().child(page_scroll(body)))
 }
 
 /// A grouped code on two lines, split between its middle groups, the

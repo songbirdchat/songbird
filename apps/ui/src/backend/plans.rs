@@ -15,10 +15,13 @@
 //! - **Invites**: the link carries the inviter's card in its fragment; the inviter's own codes'
 //!   status is asked by hash.
 //!
-//! StoreKit 2 and Play Billing need the native hosts (deferred, like push): there the proof is
-//! the store's signed transaction or purchase token instead of the subscriber secret.
+//! - **Buying on phones and the Mac** (D-0178): StoreKit 2 or Play Billing sells the plan with
+//!   the store's own sheet (`songbird_device::store`); the store's signed transaction or
+//!   purchase token, kept in the vault, is the proof billing takes instead of the subscriber
+//!   secret. The store knows the payment, never the account.
 
-use nsh_core::{platform::HttpRequest, storage::Storage};
+use super::vault::Storage;
+use nsh_core::platform::HttpRequest;
 use serde_json::Value;
 use songbird_keys::provisioning::{Domain, ProvisioningKey, open_with, seal_with};
 use songbird_tokens::family::Invite;
@@ -27,6 +30,7 @@ use songbird_tokens::token::{self, Info, IssueResponse, Kind, Redemption};
 use super::{Problem, endpoint, ok_json, problem, put, send, signed, wire};
 
 const K_SUBSCRIBER: &str = "sb.subscriber";
+const K_STORE_PROOF: &str = "sb.store_proof";
 const K_TOKEN_PIN: &str = "sb.token_pin";
 const K_FAMILY: &str = "sb.family";
 const K_SEAT: &str = "sb.family_seat";
@@ -87,6 +91,84 @@ pub fn has_subscriber() -> bool {
     Storage::get_item(K_SUBSCRIBER).is_some()
 }
 
+// ---------------------------------------------------------------- billing (the stores)
+
+/// Whether this platform buys through its store (the App Store, Google Play), not the EU
+/// provider.
+pub fn in_store() -> bool {
+    songbird_device::store::available()
+}
+
+/// The proof billing takes: the store's, if this device bought or restored there, else the
+/// subscriber secret.
+fn proof() -> Value {
+    Storage::get_item(K_STORE_PROOF)
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({ "mollie": subscriber() }))
+}
+
+fn keep_store_proof(p: songbird_device::store::Proof) {
+    use songbird_device::store::Proof;
+    let v = match p {
+        Proof::Apple(jws) => serde_json::json!({ "apple": jws }),
+        Proof::Google(token) => serde_json::json!({ "google": token }),
+    };
+    put(K_STORE_PROOF, &v.to_string());
+}
+
+fn store_problem(f: songbird_device::store::Failure) -> Option<Problem> {
+    use songbird_device::store::Failure;
+    match f {
+        Failure::Cancelled => None,
+        Failure::NotFound => Some(problem(
+            "The store doesn't offer this plan here. Try again later.",
+        )),
+        Failure::Failed => Some(problem("The store didn't answer. Try again in a moment.")),
+    }
+}
+
+async fn ask_store(
+    start: impl FnOnce(songbird_device::store::Done),
+) -> Result<songbird_device::store::Proof, songbird_device::store::Failure> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    start(Box::new(move |r| drop(tx.send(r))));
+    rx.await
+        .unwrap_or(Err(songbird_device::store::Failure::Failed))
+}
+
+/// Buys `plan` (`plus`, `family`) for `interval` (`month`, `year`) with the store's sheet and
+/// keeps its proof. `Ok(false)` when the person cancelled or the purchase waits for approval.
+pub async fn buy_in_store(plan: &str, interval: &str) -> Result<bool, Problem> {
+    let product = songbird_device::store::product(plan, interval);
+    match ask_store(|done| songbird_device::store::buy(&product, done)).await {
+        Ok(p) => {
+            keep_store_proof(p);
+            Ok(true)
+        }
+        Err(f) => store_problem(f).map_or(Ok(false), Err),
+    }
+}
+
+/// Asks the store for this store account's current subscription and keeps its proof.
+/// `Ok(false)` when it has none.
+pub async fn restore_from_store() -> Result<bool, Problem> {
+    match ask_store(songbird_device::store::current).await {
+        Ok(p) => {
+            keep_store_proof(p);
+            Ok(true)
+        }
+        Err(
+            songbird_device::store::Failure::NotFound | songbird_device::store::Failure::Cancelled,
+        ) => Ok(false),
+        Err(f) => Err(store_problem(f).unwrap_or_else(|| problem("The store didn't answer."))),
+    }
+}
+
+/// Whether a billing answer is "not paid yet" (a store purchase billing hasn't confirmed).
+pub fn not_paid_yet(p: &Problem) -> bool {
+    p.0.starts_with("The payment hasn't gone through yet")
+}
+
 async fn billing(path: &str, body: &Value) -> Result<(u16, Vec<u8>), Problem> {
     let b = serde_json::to_vec(body).map_err(|_| problem("Couldn't prepare the request."))?;
     send(
@@ -107,6 +189,12 @@ fn billing_problem(status: u16, body: &[u8]) -> Problem {
     problem(match (status, word.as_str()) {
         (402, _) => "The payment hasn't gone through yet. It can take a few minutes.",
         (409, "exists") => "This device already has a subscription. Manage it below.",
+        (409, "renews") => "Your plan already renews.",
+        (409, "expired") => "This plan has ended. Choose a plan to start again.",
+        (409, "revoked") => "This payment was refunded or charged back, so it can't renew.",
+        (409, "mandate") => {
+            "The payment provider needs you to pay again. Choose a plan to start again."
+        }
         (429, "cap") => "This subscription has had all its plans for this month.",
         (404, _) => "No subscription found for this device.",
         (503, _) => "The payment provider isn't answering. Try again in a moment.",
@@ -202,6 +290,20 @@ pub async fn cancel() -> Result<(), Problem> {
     }
 }
 
+/// Turns renewal back on after a cancellation, while the paid period lasts (D-0169).
+pub async fn resume() -> Result<(), Problem> {
+    let (st, body) = billing(
+        "/v1/billing/mollie/resume",
+        &serde_json::json!({ "subscriber": subscriber() }),
+    )
+    .await?;
+    if (200..300).contains(&st) {
+        Ok(())
+    } else {
+        Err(billing_problem(st, &body))
+    }
+}
+
 /// The token keys this build trusts: `(key ID, public key hex)`. A release build ships them
 /// (filled at release from the deployment's `[api.tokens]`, D-0134) and refuses any other, so a
 /// server cannot hand one user a key of their own and recognise their tokens. Empty in
@@ -261,7 +363,7 @@ async fn pinned() -> Result<(u8, [u8; 32]), Problem> {
 }
 
 /// The support key: the shipped one, or in a development build the first one seen.
-async fn support_key() -> Result<[u8; 32], Problem> {
+pub(super) async fn support_key() -> Result<[u8; 32], Problem> {
     if let Some(k) = SHIPPED_SUPPORT_KEY {
         return wire::unhex(k)
             .and_then(|b| b.try_into().ok())
@@ -317,7 +419,7 @@ async fn plan_tokens(month: u32, n: usize) -> Result<Vec<Redemption>, Problem> {
         token::request(id, info, n).map_err(|_| problem("Couldn't prepare the tokens."))?;
     let (st, body) = billing(
         "/v1/billing/tokens",
-        &serde_json::json!({ "proof": { "mollie": subscriber() }, "request": req }),
+        &serde_json::json!({ "proof": proof(), "request": req }),
     )
     .await?;
     if st != 200 {

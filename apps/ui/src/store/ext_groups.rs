@@ -2,15 +2,15 @@
 //! member change log, leaving, communities, following channels, packs and
 //! the media the user keeps.
 //!
-//! **Mock.** The state the store has no field for lives in one global
-//! beside it ([`GroupsState`]); app-core (A2) will own it. Every intent is
-//! the call app-core will take over, marked `// mock:` where it differs.
+//! The state the store has no field for lives in one global beside it
+//! ([`GroupsState`]). A real group's intents reach app-core (roles, policy,
+//! info, links: D-0148, D-0184); the demo's stay here.
 
 use std::{collections::HashSet, time::Duration};
 
 use nsh_core::prelude::*;
 
-use super::{Body, Chat, ChatId, ChatKind, ContactId, Member, Minutes, NOW, Role, Store, seed};
+use super::{Body, Chat, ChatId, ChatKind, ContactId, Member, Minutes, Role, Store, now, seed};
 
 // ------------------------------------------------------------------ roles
 
@@ -127,12 +127,37 @@ impl InviteUses {
 pub struct InviteSettings {
     pub expiry: InviteExpiry,
     pub uses: InviteUses,
-    /// People who joined with the current link.
+    /// People who joined with the current link (the demo's count; the server keeps a real
+    /// link's and doesn't tell).
     pub used: u32,
+    /// A real group's link: the server enforces these limits (D-0184).
+    pub limits_real: bool,
+    /// When a real link stops working (unix ms; 0: never).
+    pub expires_ms: u64,
 }
 
 /// One line under the link: "Never expires · No limit".
 pub fn invite_summary(s: &InviteSettings) -> String {
+    if s.limits_real {
+        // What the server enforces, without a count it doesn't share.
+        let expiry = match s.expires_ms {
+            0 => "Never expires".to_string(),
+            ms => {
+                let left = ms.saturating_sub(crate::store::now_ms()) / 3_600_000;
+                match left {
+                    0 => "Expires within the hour".to_string(),
+                    1..=47 => format!("Expires in {left} h"),
+                    h => format!("Expires in {} days", h / 24),
+                }
+            }
+        };
+        let uses = match s.uses.limit() {
+            None => "No limit on joins".to_string(),
+            Some(1) => "1 person can join with it".to_string(),
+            Some(n) => format!("Up to {n} people can join with it"),
+        };
+        return format!("{expiry} · {uses}");
+    }
     let expiry = match s.expiry {
         InviteExpiry::Never => "Never expires".to_string(),
         e => format!("Expires in {}", e.label()),
@@ -153,6 +178,10 @@ pub fn invite_summary(s: &InviteSettings) -> String {
 
 // ------------------------------------------------------------------ member changes
 
+/// Real groups' change logs as read from app-core, newest first.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RealChanges(pub std::collections::HashMap<ChatId, Vec<MemberChange>>);
+
 /// One line of a group's member change log.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemberChange {
@@ -171,10 +200,14 @@ pub struct DirectoryChannel {
     pub followers: u32,
 }
 
-/// Mock: the directory app-core will fetch. Public channels are an owner
-/// decision after legal review (DECISIONS.md, D-0065 §4), so these are
-/// sample entries.
+/// The demo's channel directory. Public channels are an owner decision after legal review
+/// (DECISIONS.md, D-0065 §4), so there is no directory: a real account gets none.
 pub fn directory() -> Vec<DirectoryChannel> {
+    // There is no public channel directory (public channels await the owner's legal review,
+    // D-0065 §4): real accounts find channels by their invite links. The list is the demo's.
+    if !crate::store::demo() {
+        return Vec::new();
+    }
     vec![
         DirectoryChannel {
             id: 9001,
@@ -260,8 +293,10 @@ pub struct Pack {
     pub kind: PackKind,
     pub name: String,
     pub by: String,
-    /// What the picker shows (emoji stand in for the artwork).
+    /// Each item's emoji (a demo pack's stand-in for its artwork).
     pub items: Vec<String>,
+    /// An installed (real) pack's asset numbers, item by item; empty for a demo pack.
+    pub objects: Vec<u32>,
 }
 
 /// A pack being added from a link.
@@ -276,10 +311,10 @@ pub struct PackInstall {
 pub fn parse_pack_link(link: &str) -> Result<String, &'static str> {
     let rest = link
         .trim()
-        .strip_prefix("https://songbird.chat/pack/")
+        .strip_prefix("https://songbird.chat/pack#")
         .ok_or("This isn't a Songbird pack link.")?;
     let (id, key) = rest
-        .split_once('#')
+        .split_once('.')
         .ok_or("This link has no pack key. Ask for the full link.")?;
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err("This isn't a Songbird pack link.");
@@ -297,6 +332,7 @@ fn seed_packs() -> Vec<Pack> {
         name: name.into(),
         by: by.into(),
         items: items.iter().map(|s| s.to_string()).collect(),
+        objects: Vec::new(),
     };
     vec![
         pack(
@@ -370,8 +406,8 @@ pub struct StoredFile {
     pub at: Minutes,
 }
 
-/// Mock: the files app-core's storage index will list for a chat, made up
-/// deterministically from the chat's id.
+/// A demo chat's files, made up deterministically from the chat's id (a real account's come
+/// from app-core: `backend::chat::kept_files`).
 pub fn files_for(chat: &Chat) -> Vec<StoredFile> {
     if matches!(chat.kind, ChatKind::Community) {
         return Vec::new();
@@ -456,8 +492,9 @@ pub fn largest_first(files: &[StoredFile], chat: ChatId) -> Vec<StoredFile> {
     out
 }
 
-/// Mock network statistics since the last reset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Network statistics since the last reset (`backend::usage` counts a real account's; the
+/// demo shows sample figures).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkUsage {
     pub messages_sent: u64,
     pub messages_received: u64,
@@ -465,7 +502,7 @@ pub struct NetworkUsage {
     pub media_received: u64,
     pub calls_sent: u64,
     pub calls_received: u64,
-    pub since: &'static str,
+    pub since: String,
 }
 
 impl NetworkUsage {
@@ -499,17 +536,26 @@ impl Default for GroupsState {
         Self {
             invites: Vec::new(),
             history: Vec::new(),
-            packs: seed_packs(),
+            // A real account starts with none installed; the demo with sample packs.
+            packs: if crate::store::demo() {
+                seed_packs()
+            } else {
+                Vec::new()
+            },
             installing: None,
             deleted_files: HashSet::new(),
-            usage: NetworkUsage {
-                messages_sent: 18_400_000,
-                messages_received: 42_900_000,
-                media_sent: 612_000_000,
-                media_received: 1_840_000_000,
-                calls_sent: 311_000_000,
-                calls_received: 298_000_000,
-                since: "1 September 2026",
+            usage: if !crate::store::demo() {
+                crate::backend::usage::load()
+            } else {
+                NetworkUsage {
+                    messages_sent: 18_400_000,
+                    messages_received: 42_900_000,
+                    media_sent: 612_000_000,
+                    media_received: 1_840_000_000,
+                    calls_sent: 311_000_000,
+                    calls_received: 298_000_000,
+                    since: "1 September 2026".into(),
+                }
             },
             next: 500_000,
         }
@@ -530,11 +576,15 @@ impl Store {
     }
 
     fn log_change(&self, chat: ChatId, text: String) {
-        groups_state().update(|g| g.history.push((chat, MemberChange { at: NOW, text })));
+        groups_state().update(|g| g.history.push((chat, MemberChange { at: now(), text })));
     }
 
-    /// Makes `contact` an admin or a member again, with a system line.
+    /// Makes `contact` an admin or a member again, with a system line. A real group's change
+    /// is a commit every member checks against its roles (D-0184).
     pub fn change_role(&self, chat: ChatId, contact: ContactId, role: Role) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::set_group_role(chat, contact, role);
+        }
         self.set_role(chat, contact, role);
         let name = self.contact_name(Some(contact));
         let line = match role {
@@ -564,6 +614,9 @@ impl Store {
 
     /// Approves or rejects a join request.
     pub fn answer_request(&self, chat: ChatId, contact: ContactId, approve: bool) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::answer_request(chat, contact, approve);
+        }
         let name = self.contact_name(Some(contact));
         self.answer_join_request(chat, contact, approve);
         if approve {
@@ -573,11 +626,12 @@ impl Store {
         }
     }
 
-    /// The member change log, newest first: the recorded changes, then
-    /// the history before this session.
-    ///
-    /// mock: app-core reads the group's verified change log (D-0070).
+    /// The member change log, newest first. A real group's comes from its encrypted change
+    /// log (D-0156, read when the page opens); a demo group's is made up from its members.
     pub fn member_history(&self, chat: ChatId) -> Vec<MemberChange> {
+        if crate::backend::chat::owns(chat) {
+            return global::<RealChanges>().with(|r| r.0.get(&chat).cloned().unwrap_or_default());
+        }
         let Some(c) = self.chat(chat) else {
             return Vec::new();
         };
@@ -639,6 +693,9 @@ impl Store {
     /// Leaves a group. An owner who leaves hands the group to
     /// [`successor`].
     pub fn exit_group(&self, chat: ChatId) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::leave_group(chat);
+        }
         let Some(c) = self.chat(chat) else { return };
         let was_owner = my_role(&c) == Some(Role::Owner);
         let heir = if was_owner { successor(&c) } else { None };
@@ -675,6 +732,55 @@ impl Store {
         });
     }
 
+    /// Changes a link's limits. A real group's link is made again with them, the server
+    /// enforcing its expiry and number of joins; the old link stops working.
+    pub fn change_invite_limits(&self, chat: ChatId, f: impl FnOnce(&mut InviteSettings)) {
+        self.set_invite_settings(chat, f);
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::ensure_link(*self, chat, true);
+        }
+    }
+
+    /// Changes a group's permissions (and whether only admins send). A real group's are its
+    /// policy: a commit only admins may make, checked by every member (D-0184).
+    pub fn set_group_permissions(
+        &self,
+        chat: ChatId,
+        f: impl FnOnce(&mut super::GroupPermissions, &mut bool),
+    ) {
+        let Some(c) = self.chat(chat) else { return };
+        let (mut perms, mut announcement) = (c.permissions, c.announcement_only);
+        let approval_before = perms.approve_joins;
+        f(&mut perms, &mut announcement);
+        self.update_chat(chat, |c| {
+            c.permissions = perms;
+            c.announcement_only = announcement;
+        });
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::set_group_policy(chat, perms);
+            // Approval is also the link's, registered with it: a new link carries the change.
+            if perms.approve_joins != approval_before && !c.invite_link.is_empty() {
+                crate::backend::chat::ensure_link(*self, chat, true);
+            }
+        }
+    }
+
+    /// Renames a group or changes its description (a real group's members are told).
+    pub fn set_group_info(&self, chat: ChatId, title: String, about: String) {
+        let Some(c) = self.chat(chat) else { return };
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::set_group_info(
+                chat,
+                (c.title != title).then(|| title.clone()),
+                (c.about != about).then(|| about.clone()),
+            );
+        }
+        self.update_chat(chat, |c| {
+            c.title = title;
+            c.about = about;
+        });
+    }
+
     /// A new link; the old one stops working at once.
     pub fn reset_invite(&self, chat: ChatId) {
         self.reset_invite_link(chat);
@@ -686,6 +792,12 @@ impl Store {
 
     /// Creates a community the user owns, with its announcement group.
     pub fn create_community(&self, title: String, about: String) -> ChatId {
+        // A real account: a real community on the server (D-0149).
+        if crate::backend::registered() && !crate::store::demo() {
+            let id = crate::backend::chat::create_community(*self, title.clone());
+            self.update_chat(id, |c| c.about = about.clone());
+            return id;
+        }
         let id = self.id();
         let mut c = seed::chat(id, ChatKind::Community, &title);
         c.about = about;
@@ -729,9 +841,17 @@ impl Store {
         gs
     }
 
+    /// Creates a private channel the user posts in (real accounts; D-0149).
+    pub fn create_channel(&self, title: String) -> Option<ChatId> {
+        crate::backend::registered().then(|| crate::backend::chat::create_channel(*self, title))
+    }
+
     /// Links a group the user admins into a community (both sides'
     /// admins agree, D-0072).
     pub fn link_group(&self, community: ChatId, group: ChatId) {
+        if crate::backend::chat::owns(group) {
+            crate::backend::chat::community_add_group(community, group);
+        }
         self.update_chat(group, |c| c.community = Some(community));
         let name = self.chat(community).map(|c| c.title).unwrap_or_default();
         self.push_message(
@@ -769,13 +889,18 @@ impl Store {
         })
     }
 
+    /// Unfollows a channel: a real one is left (the server stops sending it), then deleted here.
     pub fn unfollow(&self, chat: ChatId) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::leave_group(chat);
+        }
         self.delete_chat(chat);
     }
 
     // -------------------------------------------------------------- packs
 
     pub fn move_pack(&self, id: u64, up: bool) {
+        crate::backend::packs::move_pack(id, up);
         groups_state().update(|g| {
             let Some(i) = g.packs.iter().position(|p| p.id == id) else {
                 return;
@@ -797,16 +922,23 @@ impl Store {
     }
 
     pub fn remove_pack(&self, id: u64) {
+        crate::backend::packs::remove(id);
         groups_state().update(|g| g.packs.retain(|p| p.id != id));
     }
 
-    /// Adds a pack from its link: fetches and decrypts it, showing
-    /// progress. Returns the link's problem, if any.
-    ///
-    /// mock: app-core fetches the manifest and assets anonymously
-    /// (D-0083); here a timer walks the progress.
+    /// Adds a pack from its link: fetches and decrypts it, showing progress. Returns the
+    /// link's problem, if any. A real account's app-core fetches the manifest and assets with no
+    /// account (D-0083, D-0159); the demo walks its progress on a timer.
     pub fn install_pack(&self, link: String, kind: PackKind) -> Result<(), &'static str> {
         let id = parse_pack_link(&link)?;
+        if crate::backend::packs::live() {
+            crate::backend::packs::install(link);
+            return Ok(());
+        }
+        // Only the demo walks a made-up install; a real account not registered yet can't fetch.
+        if !super::demo() {
+            return Err("Finish creating your account first.");
+        }
         let state = groups_state();
         state.update(|g| {
             g.installing = Some(PackInstall {
@@ -838,6 +970,7 @@ impl Store {
                             .iter()
                             .map(|s| s.to_string())
                             .collect(),
+                        objects: Vec::new(),
                     });
                 }
             });
@@ -855,6 +988,13 @@ impl Store {
     /// Every file kept on this device.
     pub fn stored_files(&self) -> Vec<StoredFile> {
         let deleted = groups_state().with(|g| g.deleted_files.clone());
+        // A real account's files are what app-core keeps, decrypted, in its store.
+        if crate::backend::packs::live() {
+            return crate::backend::chat::kept_files()
+                .into_iter()
+                .filter(|f| !deleted.contains(&f.id))
+                .collect();
+        }
         self.chats.with(|cs| {
             cs.iter()
                 .flat_map(files_for)
@@ -865,21 +1005,13 @@ impl Store {
 
     /// Deletes files from this device (the messages stay).
     pub fn delete_files(&self, ids: &[u64]) {
+        crate::backend::chat::delete_kept(ids);
         groups_state().update(|g| g.deleted_files.extend(ids.iter().copied()));
     }
 
     pub fn reset_network_usage(&self) {
-        groups_state().update(|g| {
-            g.usage = NetworkUsage {
-                messages_sent: 0,
-                messages_received: 0,
-                media_sent: 0,
-                media_received: 0,
-                calls_sent: 0,
-                calls_received: 0,
-                since: "today",
-            }
-        });
+        let fresh = crate::backend::usage::reset();
+        groups_state().update(|g| g.usage = fresh);
     }
 }
 
@@ -942,19 +1074,30 @@ mod tests {
             expiry: InviteExpiry::Week,
             uses: InviteUses::Ten,
             used: 9,
+            ..InviteSettings::default()
         };
         assert_eq!(invite_summary(&s), "Expires in 7 days · 1 join left");
+        // A real link: the server's limits, never a made-up count of joins.
+        let real = InviteSettings {
+            uses: InviteUses::Ten,
+            limits_real: true,
+            ..InviteSettings::default()
+        };
+        assert_eq!(
+            invite_summary(&real),
+            "Never expires · Up to 10 people can join with it"
+        );
     }
 
     #[test]
     fn pack_links() {
         assert_eq!(
-            parse_pack_link("https://songbird.chat/pack/ab12#k3y-long-enough"),
+            parse_pack_link("https://songbird.chat/pack#ab12.k3y-long-enough"),
             Ok("ab12".into())
         );
-        assert!(parse_pack_link("https://songbird.chat/pack/ab12").is_err());
-        assert!(parse_pack_link("https://example.com/pack/ab12#key12345").is_err());
-        assert!(parse_pack_link("https://songbird.chat/pack/a/b#key12345").is_err());
+        assert!(parse_pack_link("https://songbird.chat/pack#ab12").is_err());
+        assert!(parse_pack_link("https://example.com/pack#ab12.key12345").is_err());
+        assert!(parse_pack_link("https://songbird.chat/pack#a/b.key12345").is_err());
     }
 
     #[test]

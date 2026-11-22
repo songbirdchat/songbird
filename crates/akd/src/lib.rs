@@ -177,8 +177,9 @@ pub async fn publish_pending(
     Ok(n)
 }
 
-/// The writer's directory, for the service that owns it (the worker).
-pub struct Publisher(pub Writer);
+/// The writer's directory, for the service that owns it (the worker), and its store (where
+/// each epoch's root is recorded, D-0171).
+pub struct Publisher(pub Writer, SurrealStore);
 
 impl std::fmt::Debug for Publisher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -192,7 +193,20 @@ impl Publisher {
     /// # Errors
     /// The storage or the directory refused.
     pub async fn open(store: SurrealStore, vrf: SecretVrf) -> Result<Self, akd::errors::AkdError> {
-        Ok(Self(writer(store, vrf).await?))
+        Ok(Self(writer(store.clone(), vrf).await?, store))
+    }
+
+    /// Records the current epoch's root (so a crash between publishing and recording leaves
+    /// no gap: the next pass records it).
+    async fn record_root(&self) -> Result<(), PublishError> {
+        let h = self.0.get_epoch_hash().await.map_err(PublishError::Akd)?;
+        if h.epoch() > 0 {
+            self.1
+                .put_root(h.epoch(), &h.hash())
+                .await
+                .map_err(|e| PublishError::Akd(akd::errors::AkdError::Storage(e)))?;
+        }
+        Ok(())
     }
 
     /// [`publish_pending`].
@@ -204,7 +218,12 @@ impl Publisher {
         registry: &songbird_accounts::Registry,
         limit: usize,
     ) -> Result<usize, PublishError> {
-        publish_pending(registry, &self.0, limit).await
+        self.record_root().await?;
+        let n = publish_pending(registry, &self.0, limit).await?;
+        if n > 0 {
+            self.record_root().await?;
+        }
+        Ok(n)
     }
 }
 

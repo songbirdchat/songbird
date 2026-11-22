@@ -496,7 +496,17 @@ pub(crate) fn bottom_bar(content: impl IntoElement) -> View {
     view()
         .px_4()
         .pt_3()
-        .pb_safe_area_plus(px(12.0))
+        // On the keyboard's edge while it shows (the home indicator is under it then), over the
+        // home indicator otherwise: under the keyboard, "Create group" couldn't be reached
+        // (found on an iPhone, D-0183).
+        .pb(move || {
+            let keyboard = keyboard_height().0;
+            px(if keyboard > 0.0 {
+                keyboard + 12.0
+            } else {
+                safe_area().bottom.0 + 12.0
+            })
+        })
         .border_t_1()
         .border_color(move || c::border())
         .bg(move || c::background())

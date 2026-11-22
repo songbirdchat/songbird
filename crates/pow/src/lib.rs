@@ -227,8 +227,7 @@ pub fn decode(bytes: &[u8]) -> Result<Challenge, PowError> {
     if b[0] != VERSION {
         return Err(PowError::Malformed);
     }
-    let mut issued = [0u8; 8];
-    issued.copy_from_slice(&b[1..9]);
+    let issued: [u8; 8] = b[1..9].try_into().map_err(|_| PowError::Malformed)?;
     let params = Params {
         memory_kib: u32::from_be_bytes([b[9], b[10], b[11], b[12]]),
         iterations: u32::from_be_bytes([b[13], b[14], b[15], b[16]]),
@@ -238,8 +237,7 @@ pub fn decode(bytes: &[u8]) -> Result<Challenge, PowError> {
     if !params.in_bounds() {
         return Err(PowError::Malformed);
     }
-    let mut nonce = [0u8; NONCE_LEN];
-    nonce.copy_from_slice(&b[19..35]);
+    let nonce: [u8; NONCE_LEN] = b[19..35].try_into().map_err(|_| PowError::Malformed)?;
     Ok(Challenge {
         issued_ms: u64::from_be_bytes(issued),
         params,

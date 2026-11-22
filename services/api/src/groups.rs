@@ -8,8 +8,11 @@
 //!   another commit won; 404 for an unknown group; 400 with the reason; 503 to retry (a retried
 //!   commit that already won is answered 200 again, and its fan-out finished).
 //! - `POST /v1/groups/state`: `version u8 (1) | group [16]`. 200 `epoch u64 | info_len u32 |
-//!   GroupInfo | tree_len u32 | ratchet tree` for a device in the group, or a listed device of an
-//!   account in it (to rejoin by external commit); 404 otherwise, the same as for no group.
+//!   GroupInfo | tree_len u32 | ratchet tree | meta_v u64 | meta_len u32 | meta | n u16 |
+//!   n × (device [16] | account [16])` for a device in the group, or a listed device of an
+//!   account in it (to rejoin by external commit); 404 otherwise, the same as for no group. The
+//!   last part names each member device's account (D-0155): devices check every pair against
+//!   the account's signed device list, so the server can leave one out but not lie.
 //!
 //! - Invite links and join requests (M3, D-0071): `POST /v1/groups/links`, `/links/revoke`,
 //!   `/links/open`, `/join`, `/requests`, `/requests/list`, `/requests/decline` (`PROTOCOL.md`
@@ -598,7 +601,12 @@ impl Groups {
         if !Self::may_read(m, &row.roster, &device) {
             return Outcome::NotFound;
         }
-        state_blob(&row, &[]).await
+        let dir = m.path.directory();
+        let accounts: Vec<(DeviceId, AccountId)> = devices_of(&row.roster)
+            .into_iter()
+            .filter_map(|d| dir.listed_account(&d).map(|a| (d, a)))
+            .collect();
+        state_blob(&row, &[], Some(&accounts)).await
     }
 
     /// `POST /v1/groups/ds` (D-0075): `version u8 (1)`. 200 with the delivery service's
@@ -992,11 +1000,24 @@ impl Groups {
 
 /// `epoch u64 | info_len u32 | GroupInfo | tree_len u32 | ratchet tree | meta_v u64 | meta_len
 /// u32 | meta`, after `prefix`.
-async fn state_blob(row: &songbird_accounts::groups::GroupRow, prefix: &[u8]) -> Outcome {
+async fn state_blob(
+    row: &songbird_accounts::groups::GroupRow,
+    prefix: &[u8],
+    accounts: Option<&[(DeviceId, AccountId)]>,
+) -> Outcome {
     let Ok(record) = Record::decode(&row.state) else {
         return Outcome::Unavailable;
     };
     let (meta_v, meta, prefix) = (row.meta_v, row.meta.clone(), prefix.to_vec());
+    let accounts: Option<Vec<u8>> = accounts.map(|list| {
+        let mut b = Vec::with_capacity(2 + list.len() * 32);
+        b.extend_from_slice(&u16::try_from(list.len()).unwrap_or(u16::MAX).to_be_bytes());
+        for (d, a) in list.iter().take(usize::from(u16::MAX)) {
+            b.extend_from_slice(d.as_bytes());
+            b.extend_from_slice(a.as_bytes());
+        }
+        b
+    });
     let built = tokio::task::spawn_blocking(move || {
         let g = Group::load(record)?;
         let tree = g.ratchet_tree()?;
@@ -1009,6 +1030,9 @@ async fn state_blob(row: &songbird_accounts::groups::GroupRow, prefix: &[u8]) ->
             out.extend_from_slice(part);
         }
         put_meta(&mut out, meta_v, &meta);
+        if let Some(a) = &accounts {
+            out.extend_from_slice(a);
+        }
         Ok::<_, GroupError>(out)
     })
     .await;
@@ -1232,7 +1256,8 @@ impl Groups {
         }
         let mut prefix = vec![OPEN_JOIN];
         prefix.extend_from_slice(&o.group);
-        state_blob(&o.row, &prefix).await
+        // Not a member yet: no accounts.
+        state_blob(&o.row, &prefix, None).await
     }
 
     /// `POST /v1/groups/join`: `version | handle [16] | auth [32] | bundle` (an external commit

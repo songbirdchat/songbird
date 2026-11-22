@@ -23,19 +23,38 @@
 //!   devices and seals for them.
 
 pub mod account;
+pub mod applog;
+pub mod avatar;
 pub mod backup;
+pub mod biometric;
+pub mod callkit;
+pub mod calls;
+pub mod chat;
+pub mod chat_state;
+pub mod crash;
+pub mod group_sync;
+pub mod icon;
 pub mod link;
 pub mod lock;
 pub mod nudge;
+pub mod packs;
+pub mod passkeys;
 pub mod plans;
 pub mod presence;
 pub mod profile;
+pub mod push;
 pub mod records;
+pub mod rules;
 pub mod supervision;
+pub mod tunnel;
+pub mod usage;
+pub mod username;
+pub mod vault;
 pub mod wire;
 mod ws;
 
-use nsh_core::{platform::HttpRequest, prelude::*, storage::Storage, time::unix_ms};
+use self::vault::Storage;
+use nsh_core::{platform::HttpRequest, prelude::*, time::unix_ms};
 use serde_json::Value;
 
 pub use ws::{connect, disconnect};
@@ -67,6 +86,21 @@ impl Default for Endpoint {
                 ws_addr: format!("ws.{domain}:443"),
                 ws_name: format!("ws.{domain}"),
                 billing: format!("https://billing.{domain}"),
+            };
+        }
+        // A preview build may name a development backend on the local network at build time
+        // (`SONGBIRD_DEV_SERVER=192.168.1.49`, the address `scripts/dev-app-backend.sh` serves
+        // on): a phone reaches it from its first run, before sign-up. Release builds ignore it.
+        if let Some(host) = option_env!("SONGBIRD_DEV_SERVER")
+            .filter(|h| !h.is_empty())
+            .filter(|_| crate::PREVIEW_BUILD)
+        {
+            return Self {
+                api: format!("http://{host}:8443"),
+                api_name: "api.localhost".into(),
+                ws_addr: format!("{host}:9201"),
+                ws_name: "localhost".into(),
+                billing: format!("http://{host}:8445"),
             };
         }
         Self {
@@ -115,9 +149,8 @@ pub fn live() -> Signal<Live> {
     global::<Live>()
 }
 
-// mock: the keys belong in the Secure Enclave / Android Keystore through
-// app-core (A0 "On-device security"); NSH's app storage stands in so the
-// account survives a restart during development.
+// The device's keys and seeds are sealed under the platform's secure store by the vault
+// (`vault::Storage`, D-0172).
 const K_ENABLED: &str = "sb.live";
 const K_ENDPOINT: &str = "sb.endpoint";
 const K_IDENTITY: &str = "sb.identity_seed";
@@ -149,7 +182,8 @@ pub fn restore() {
         })
         .unwrap_or_default();
     live().set(Live {
-        enabled: Storage::get_item(K_ENABLED).is_some(),
+        // Always on for a real account; only the screenshot fixtures run without it.
+        enabled: !crate::store::demo() || Storage::get_item(K_ENABLED).is_some(),
         endpoint,
         account: Storage::get_item(K_ACCOUNT),
         device: Storage::get_item(K_DEVICE),
@@ -172,6 +206,10 @@ pub fn registered() -> bool {
 }
 
 pub fn set_enabled(on: bool) {
+    // A real account never runs on the sample data (D-0184): only the demo fixtures turn it off.
+    if !on && !crate::store::demo() {
+        return;
+    }
     if on {
         put(K_ENABLED, "1");
     } else {
@@ -194,9 +232,38 @@ pub fn set_endpoint(endpoint: Endpoint) {
     live().update(|l| l.endpoint = endpoint);
 }
 
-/// Forgets this device's account locally (the server keeps it).
+/// Erases what this device keeps of a deleted account: the encrypted message
+/// store, its key, the photo and the account's local keys.
+pub fn erase_local() {
+    if let Some(d) = data_dir() {
+        for f in [
+            "songbird-core.db",
+            "songbird-core.db-wal",
+            "songbird-core.db-shm",
+            "songbird-avatar.img",
+        ] {
+            let _ = std::fs::remove_file(d.join(f));
+        }
+    }
+    for k in [
+        "sb.core.db_key",
+        "sb.core.device_identity",
+        "sb.avatar",
+        "sb.username_link",
+        "sb.profile_key",
+        "sb.profile_version",
+    ] {
+        Storage::remove_item(k);
+    }
+    rules::forget();
+}
+
+/// Forgets this device's account locally (the server keeps it), with its messages on this
+/// device (D-0182): the next account here starts with its own store.
 pub fn forget() {
     disconnect();
+    chat::stop();
+    chat::erase_store();
     for k in [K_IDENTITY, K_DEVICE_SEED, K_ACCOUNT, K_DEVICE, K_USERNAME] {
         Storage::remove_item(k);
     }
@@ -233,12 +300,12 @@ impl std::fmt::Display for Problem {
     }
 }
 
-fn problem(s: impl Into<String>) -> Problem {
+pub(crate) fn problem(s: impl Into<String>) -> Problem {
     Problem(s.into())
 }
 
 /// The plain-language meaning of an api answer.
-fn explain(status: u16, body: &[u8]) -> Problem {
+pub(crate) fn explain(status: u16, body: &[u8]) -> Problem {
     let word = serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|v| v["error"].as_str().map(str::to_owned))
@@ -288,8 +355,38 @@ fn endpoint() -> Endpoint {
 }
 
 async fn send(request: HttpRequest) -> Result<(u16, Vec<u8>), Problem> {
+    let lane = usage::lane_of(&request.url);
+    // The request's line, headers and body, roughly as they go out.
+    let body = match &request.body {
+        nsh_core::platform::HttpBody::Bytes(b) => b.len(),
+        _ => 0,
+    };
+    let out = body + request.url.len() + 200;
+    // Songbird's own hosts go through the proxy when one is set (D-0164), never around it.
+    if let Some(t) = tunnel::for_url(&request.url) {
+        let t = t?;
+        let body = match request.body {
+            nsh_core::platform::HttpBody::Bytes(b) => b,
+            nsh_core::platform::HttpBody::Empty => Vec::new(),
+            _ => return Err(problem("This request can't go through the proxy.")),
+        };
+        let r = tunnel::through(
+            t,
+            request.method,
+            request.url,
+            request.headers,
+            body,
+            request.follow_redirects,
+        )
+        .await?;
+        usage::count(lane, out, r.body.len() + 200);
+        return Ok((r.status, r.body));
+    }
     match fetch(request).await {
-        Ok(r) => Ok((r.status(), r.body)),
+        Ok(r) => {
+            usage::count(lane, out, r.body.len() + 200);
+            Ok((r.status(), r.body))
+        }
         Err(e) => Err(problem(format!(
             "Can't reach the server ({e:?}). Check the address in Server connection."
         ))),
@@ -337,7 +434,47 @@ pub(crate) async fn signed(
     send(req).await
 }
 
-fn ok_json(status: u16, body: &[u8]) -> Result<Value, Problem> {
+/// A request signed by this device whose body the signature does not cover
+/// (attachment uploads, PROTOCOL §7.2: the client's own ciphertext, held
+/// only to its length).
+pub(crate) async fn signed_upload(
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> Result<(u16, Vec<u8>), Problem> {
+    let ep = endpoint();
+    let (device, seed) =
+        device_key().ok_or_else(|| problem("This device isn't registered yet."))?;
+    let key = wire::ed25519(&seed).ok_or_else(|| problem("This device's key is damaged."))?;
+    let (auth, _) = wire::sign_request(
+        &key,
+        &device,
+        &ep.api_name,
+        method,
+        path,
+        unix_ms() as u64,
+        None,
+    );
+    let req = HttpRequest::new(method, format!("{}{path}", ep.api))
+        .header("authorization", auth)
+        .header("content-type", "application/octet-stream")
+        .header("content-length", body.len().to_string())
+        .body(body);
+    send(req).await
+}
+
+/// An unsigned request to an api path (downloads and their confirmations
+/// carry no account, PROTOCOL §7.3). Redirects are followed.
+pub(crate) async fn unsigned(method: &str, path: &str) -> Result<(u16, Vec<u8>), Problem> {
+    let url = if path.starts_with("http") {
+        path.to_owned()
+    } else {
+        format!("{}{path}", endpoint().api)
+    };
+    send(HttpRequest::new(method, url)).await
+}
+
+pub(crate) fn ok_json(status: u16, body: &[u8]) -> Result<Value, Problem> {
     if (200..300).contains(&status) {
         Ok(serde_json::from_slice(body).unwrap_or(Value::Null))
     } else {
@@ -475,6 +612,96 @@ pub async fn devices() -> Result<Vec<RemoteDevice>, Problem> {
         .unwrap_or_default())
 }
 
+thread_local! {
+    /// Real device IDs (hex) by their UI ID.
+    static DEVICE_HEX: std::cell::RefCell<std::collections::HashMap<u64, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+const K_DEVICE_NAMES: &str = "sb.device_names";
+
+fn device_names() -> serde_json::Map<String, Value> {
+    Storage::get_item(K_DEVICE_NAMES)
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+/// Names this device gave the account's devices (a local label).
+pub fn rename_device(id: u64, name: &str) {
+    let Some(hex) = DEVICE_HEX.with_borrow(|m| m.get(&id).cloned()) else {
+        return;
+    };
+    let mut names = device_names();
+    names.insert(hex, Value::String(name.into()));
+    put(K_DEVICE_NAMES, &Value::Object(names).to_string());
+}
+
+/// Fills the Linked devices page from the server's list (`GET /v1/devices`).
+pub fn refresh_device_list(s: crate::store::Store) {
+    if !registered() {
+        return;
+    }
+    run(async move {
+        let list = devices().await?;
+        let names = device_names();
+        let mut out = Vec::with_capacity(list.len());
+        // This device first, as the page expects.
+        let mut sorted = list;
+        sorted.sort_by_key(|d| !d.this_device);
+        for d in sorted {
+            let bytes: [u8; 16] = wire::unhex(&d.id)
+                .and_then(|b| b.try_into().ok())
+                .unwrap_or([0; 16]);
+            let id = chat::ui_id(&bytes);
+            DEVICE_HEX.with_borrow_mut(|m| m.insert(id, d.id.clone()));
+            let label = names.get(&d.id).and_then(Value::as_str).map_or_else(
+                || {
+                    if d.this_device {
+                        "This device".to_string()
+                    } else if d.primary {
+                        "Main phone".to_string()
+                    } else {
+                        format!("Linked device {}", &d.id[..6])
+                    }
+                },
+                str::to_owned,
+            );
+            out.push(crate::store::Device {
+                id,
+                name: label,
+                kind: if d.primary {
+                    crate::store::DeviceKind::Phone
+                } else {
+                    crate::store::DeviceKind::Desktop
+                },
+                last_active: if d.pending {
+                    "Waiting for your main phone".into()
+                } else if d.this_device {
+                    "Active now".into()
+                } else {
+                    "Linked".into()
+                },
+                this_device: d.this_device,
+            });
+        }
+        s.devices.set(out);
+        Ok(())
+    });
+}
+
+/// Logs a device out (`DELETE` through the signed device list, `link::remove`).
+pub fn remove_device(s: crate::store::Store, id: u64) {
+    let Some(hex) = DEVICE_HEX.with_borrow(|m| m.get(&id).cloned()) else {
+        return;
+    };
+    run(async move {
+        link::remove(&hex).await?;
+        refresh_device_list(s);
+        Ok(())
+    });
+}
+
 /// `GET /v1/invites`: how many codes the account may create.
 pub async fn invite_allowance() -> Result<(u64, bool), Problem> {
     let (status, body) = signed("GET", "/v1/invites", None, false).await?;
@@ -555,6 +782,7 @@ pub async fn delete_account() -> Result<(), Problem> {
     let (status, body) = signed("DELETE", "/v1/account", None, false).await?;
     if (200..300).contains(&status) {
         forget();
+        erase_local();
         Ok(())
     } else {
         Err(explain(status, &body))

@@ -31,14 +31,26 @@ songbird-backup-format = { path = "../../crates/backup-format" }
 songbird-backup-storage = { path = "../../crates/backup-storage" }
 # Plans (Prompt 11): anonymous tokens for the vault and plans (D-0128, D-0130).
 songbird-tokens = { path = "../../crates/tokens" }
+# app-core (A2, D-0136 to D-0139): sessions, the SQLCipher store and the message pipeline.
+songbird-app-core = { path = "../../crates/app-core" }
 async-trait = "0.1"
 tokio = { version = "1.54.1", default-features = false, features = ["net", "sync"] }
 zeroize = "1.9.1"
 aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-sys"] }
+# Call media (D-0151, D-0152): LiveKit over a pinned libwebrtc, end-to-end encrypted per
+# sender. Builds need `eval "$(scripts/fetch-libwebrtc.sh <platform>)"` first.
+songbird-calls-media = { path = "../calls-media" }
+# Voice notes (D-0161): the microphone through cpal, 16 kHz mono WAV.
+songbird-recorder = { path = "../recorder" }
+# The device's own services (D-0172): the secure store, biometrics, screen protection, …
+songbird-device = { path = "../device" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # The camera (D-0110): one interface over each platform's camera; all `unsafe` lives there.
 songbird-camera = { path = "../camera" }
 # Real QR codes (D-0110): the link code, invites, safety numbers. No `image`/`svg`: no deps.
 qrcode = { version = "0.14.1", default-features = false }
+# Quiet hours in the child's local time (D-0166): the system's zone through iana-time-zone.
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nsh-platform-linux = { version = "0.6.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
@@ -57,3 +69,5 @@ nsh-platform-windows = { version = "0.6.0", default-features = false, features =
 # The real engine, headless, for tests of the reactive wiring (NSH testing guide).
 nsh-engine = { version = "0.6.0", default-features = false }
 nsh-testing = { version = "0.6.0", default-features = false }
+# Building `Content` in the backup tests.
+prost = { version = "0.14.5", default-features = false, features = ["std"] }

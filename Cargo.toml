@@ -28,6 +28,8 @@ members = [
     "crates/backup-storage",
     "crates/entitlements",
     "crates/tokens",
+    "crates/app-core",
+    "crates/aws-lc-ext",
     "services/delivery",
     "services/api",
     "services/push",
@@ -37,6 +39,7 @@ members = [
     "services/proxy",
     "tools/loadgen",
     "tools/admin",
+    "tools/maps-import",
     "tests/e2e",
     "tests/groups",
     "xtask",
@@ -82,6 +85,8 @@ songbird-backup-format = { path = "crates/backup-format" }
 songbird-backup-storage = { path = "crates/backup-storage" }
 songbird-entitlements = { path = "crates/entitlements" }
 songbird-tokens = { path = "crates/tokens" }
+songbird-app-core = { path = "crates/app-core" }
+songbird-aws-lc-ext = { path = "crates/aws-lc-ext" }
 songbird-calls = { path = "services/calls" }
 
 anyhow = "1.0.104"
@@ -151,6 +156,15 @@ curve25519-dalek = { version = "=5.0.0", default-features = false }
 # only the 12-byte-nonce ChaCha20-Poly1305. RustCrypto, MIT OR Apache-2.0, already in the lock
 # through OpenMLS's crypto provider and exempted in cargo-vet; no default features.
 chacha20poly1305 = { version = "=0.10.1", default-features = false }
+
+# app-core's on-device store (A2, D-0137): SQLCipher through rusqlite's bundled build. No
+# vendored OpenSSL: CommonCrypto on Apple, a libcrypto (AWS-LC) linked at build time elsewhere;
+# the `openssl` crates stay banned. MIT.
+rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher"] }
+
+# Map tiles import (D-0142): MBTiles store tiles gzipped; the operator tool inflates them so
+# clients need no inflater. Pure Rust (miniz_oxide). MIT OR Apache-2.0. Tools only.
+flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 
 # Test-only
 proptest = "1.12.0"

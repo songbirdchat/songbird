@@ -272,7 +272,8 @@ fn reaction_sheet(picking: Signal<Option<usize>>) -> nsh_base::SheetElement {
     app_sheet(open, "Choose a reaction", content)
 }
 
-/// Export a chat (mock): pick one, get an encrypted-at-rest file.
+/// Export a chat: pick one, get its messages on this device as a text file (the messages this
+/// device holds; the file is the user's, outside Songbird's protection).
 fn export_sheet(open: Signal<bool>) -> nsh_base::SheetElement {
     let s = store();
     let chats = s.inbox();
@@ -284,13 +285,13 @@ fn export_sheet(open: Signal<bool>) -> nsh_base::SheetElement {
             .child(
                 scroll().max_h(px(360.0)).child(
                     group_with_inset(chats.into_iter().take(12).map(|chat| {
-                        let title = chat.title.clone();
+                        let id = chat.id;
                         Row::new(chat.title.clone())
                             .leading(avatar(chat.title.clone(), chat.seed, 36.0))
                             .on_press(move || {
                                 open.set(false);
-                                // mock: app-core writes the chat as a text file with its media.
-                                toast(format!("Exported \"{title}\""));
+                                let text = store().export_text(id);
+                                save_file("songbird-chat.txt", text.into_bytes());
                             })
                             .build()
                     }), INSET_AVATAR)

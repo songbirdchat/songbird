@@ -298,7 +298,8 @@ fn sink_of(id: u64) -> Option<Sink> {
 /// # Safety
 ///
 /// `buffer` is a direct `ByteBuffer` Java keeps alive and unchanged for the current call.
-unsafe fn direct<'a>(env: &JNIEnv<'_>, buffer: &JByteBuffer<'_>) -> Option<&'a [u8]> { // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+unsafe fn direct<'a>(env: &JNIEnv<'_>, buffer: &JByteBuffer<'_>) -> Option<&'a [u8]> {
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
     let ptr = env.get_direct_buffer_address(buffer).ok()?;
     let len = env.get_direct_buffer_capacity(buffer).ok()?;
     if ptr.is_null() {
@@ -416,7 +417,9 @@ pub extern "system" fn Java_chat_songbird_camera_CameraBridge_nativeFrame(
         return;
     };
     // SAFETY: CameraX's planes, direct buffers Java keeps open until this call returns.
-    let Some(y) = (unsafe { direct(&env, &y) }) else { // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let Some(y) = (unsafe { direct(&env, &y) }) else {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         return;
     };
     let rotation = match rotation {
@@ -450,7 +453,9 @@ pub extern "system" fn Java_chat_songbird_camera_CameraBridge_nativeFrame(
         return;
     }
     // SAFETY: as above.
-    let (Some(u), Some(v)) = (unsafe { direct(&env, &u) }, unsafe { direct(&env, &v) }) else { // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let (Some(u), Some(v)) = (unsafe { direct(&env, &u) }, unsafe { direct(&env, &v) }) else {
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
         return;
     };
     let Some(pixels) = crate::frame::nv12_from_yuv(y, ys, u, v, uvs, uvp, wu, hu) else {
@@ -488,4 +493,42 @@ pub extern "system" fn Java_chat_songbird_camera_CameraBridge_nativePhoto(
             .and_then(|_| env.convert_byte_array(&jpeg_bytes).ok())
     };
     photo_done(id, bytes);
+}
+
+// ---------------------------------------------------------------- call video (D-0183)
+
+/// A frame of a call's video for `CameraBridge.videoFrame`: the pixels as a direct buffer,
+/// copied into the feed's bitmap before the call returns.
+pub(crate) fn video_frame(feed: u64, width: u32, height: u32, rgba: &[u8]) {
+    let (Ok(feed), Ok(w), Ok(h)) = (
+        i64::try_from(feed),
+        i32::try_from(width),
+        i32::try_from(height),
+    ) else {
+        return;
+    };
+    let ptr = rgba.as_ptr().cast_mut();
+    let len = rgba.len();
+    call_void("videoFrame", "(JIILjava/nio/ByteBuffer;)V", |env| {
+        // SAFETY: the buffer views `rgba`, which outlives this call; Java only reads it, and
+        // copies it into a bitmap before returning.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        let buf = unsafe { env.new_direct_byte_buffer(ptr, len) }.ok()?;
+        Some(vec![
+            JValueOwned::Long(feed),
+            JValueOwned::Int(w),
+            JValueOwned::Int(h),
+            JValueOwned::Object(buf.into()),
+        ])
+    });
+}
+
+/// `CameraBridge.videoClear(feed)`.
+pub(crate) fn video_clear(feed: u64) {
+    let Ok(feed) = i64::try_from(feed) else {
+        return;
+    };
+    call_void("videoClear", "(J)V", |_| {
+        Some(vec![JValueOwned::Long(feed)])
+    });
 }

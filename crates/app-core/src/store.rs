@@ -1,0 +1,2002 @@
+//! The on-device store (A2, D-0136, D-0137): `SQLCipher`, the whole file encrypted.
+//!
+//! - **Key**: 32 random bytes, kept wrapped by the Secure Enclave or Android Keystore by the
+//!   platform host and handed in as a raw key (`PRAGMA key = "x'…'"`), so `SQLCipher` runs no
+//!   password KDF. Apple builds use `CommonCrypto` for the page cipher; other platforms link a
+//!   `libcrypto` at build time (AWS-LC, the same library aws-lc-rs wraps; D-0137). The `openssl`
+//!   crates stay banned (`deny.toml`).
+//! - **Schema**: versioned by `PRAGMA user_version`, migrated forward in one transaction per step.
+//! - **What is stored**: this device's identity, prekeys and sessions (their own encodings, which
+//!   zero their secrets in memory); the accounts and devices met, with the account identity key
+//!   pinned on first sight and the highest device-list version seen (PROTOCOL §4.6: never roll
+//!   back); chats; messages as their encoded `Content` with the columns lists need; outgoing
+//!   status per recipient account; the outbox of sends not yet accepted; a full-text index
+//!   (FTS5, inside the encrypted file).
+//! - **Status only moves forward** (sending → sent → delivered → read → played), except a failed
+//!   send that is retried.
+
+use std::path::Path;
+
+use rusqlite::{Connection, OptionalExtension, params};
+use zeroize::Zeroizing;
+
+use crate::crypto::X25519Pair;
+use crate::session::{Local, Prekeys, Session, Sessions};
+use crate::{Error, Result};
+
+/// A call link this device made (PROTOCOL §8.4): the link is its root; the admin token lets
+/// this device skip the lobby, see who waits, and revoke it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StoredCallLink {
+    /// The link's root (in the link's fragment).
+    pub root: Zeroizing<[u8; 32]>,
+    /// The admin token.
+    pub admin: Zeroizing<[u8; 32]>,
+    /// Its name, shown to people who join.
+    pub name: String,
+    /// A video call (else audio).
+    pub video: bool,
+    /// Whether new people wait in a lobby.
+    pub lobby: bool,
+    /// When the server forgets it.
+    pub expires_ms: u64,
+}
+
+impl std::fmt::Debug for StoredCallLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredCallLink")
+            .field("name", &self.name)
+            .field("lobby", &self.lobby)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The secret that marks a view-once message opened.
+fn viewed_key(author: &[u8; 16], id: &[u8; 16]) -> String {
+    use std::fmt::Write as _;
+    let mut key = String::from("viewed.");
+    for b in author.iter().chain(id) {
+        let _ = write!(key, "{b:02x}");
+    }
+    key
+}
+
+/// The schema version this code writes.
+pub const SCHEMA: i64 = 8;
+
+/// Outgoing message status, as the UI shows it (`crates/content`'s levels, plus the local ones).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Status {
+    /// The send failed; the user may retry.
+    Failed = -1,
+    /// Not yet accepted by the server.
+    Sending = 0,
+    /// Stored by the server (one tick).
+    Sent = 1,
+    /// Delivered to a recipient device (two ticks).
+    Delivered = 2,
+    /// Read.
+    Read = 3,
+    /// Played (voice notes).
+    Played = 4,
+}
+
+impl Status {
+    /// As stored.
+    #[must_use]
+    pub fn as_i64(self) -> i64 {
+        match self {
+            Self::Failed => -1,
+            Self::Sending => 0,
+            Self::Sent => 1,
+            Self::Delivered => 2,
+            Self::Read => 3,
+            Self::Played => 4,
+        }
+    }
+
+    fn from_i64(v: i64) -> Self {
+        match v {
+            -1 => Self::Failed,
+            1 => Self::Sent,
+            2 => Self::Delivered,
+            3 => Self::Read,
+            4 => Self::Played,
+            _ => Self::Sending,
+        }
+    }
+
+    /// Whether `self` may become `next`.
+    #[must_use]
+    pub fn may_become(self, next: Self) -> bool {
+        next > self || (self == Self::Failed && next == Self::Sending)
+    }
+}
+
+/// One recipient's receipts for a message this account sent (Message info).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptTimes {
+    /// Who the receipts came from.
+    pub account: [u8; 16],
+    /// The highest level they reached.
+    pub level: Status,
+    /// When it was first delivered to one of their devices (ms), when known.
+    pub delivered_ms: Option<u64>,
+    /// When they read it, when known.
+    pub read_ms: Option<u64>,
+    /// When they played it (voice notes), when known.
+    pub played_ms: Option<u64>,
+}
+
+/// A chat as the list shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatRow {
+    /// The chat: the peer's account for 1:1, the group ID for groups.
+    pub id: [u8; 16],
+    /// Whether it is a group.
+    pub group: bool,
+    /// Time of the last message (ms).
+    pub last_ms: u64,
+    /// Preview of the last message.
+    pub preview: String,
+    /// Unread count.
+    pub unread: u32,
+}
+
+/// A stored message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageRow {
+    /// Chat.
+    pub chat: [u8; 16],
+    /// Author account.
+    pub author: [u8; 16],
+    /// Message ID.
+    pub id: [u8; 16],
+    /// Sender's clock (ms).
+    pub sent_ms: u64,
+    /// When this device stored it (ms).
+    pub stored_ms: u64,
+    /// The text, for lists and search (empty for non-text kinds).
+    pub text: String,
+    /// The encoded `Content`.
+    pub content: Vec<u8>,
+    /// Outgoing status (incoming messages: `Delivered`, then `Read` once read here).
+    pub status: Status,
+}
+
+/// An address and its sessions, as read back.
+type Grouped = Option<(([u8; 16], [u8; 16]), Vec<Session>)>;
+/// A kept franking proof: the stamp, the franking key, the content as received.
+pub type Frank = (Vec<u8>, Vec<u8>, Vec<u8>);
+/// An installed pack as kept: (id, pack key, the manifest's encoding).
+pub type StoredPack = ([u8; 16], Zeroizing<[u8; 32]>, Vec<u8>);
+/// A file kept on this device (decrypted, in this store).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptFile {
+    pub chat: [u8; 16],
+    pub author: [u8; 16],
+    pub id: [u8; 16],
+    pub idx: u32,
+    pub bytes: u64,
+    pub stored_ms: u64,
+    /// The message's encoded `Content` (its attachment pointers name and type the file).
+    pub content: Vec<u8>,
+}
+
+/// A message in a chat: (chat, author, id).
+pub type ChatMessage = ([u8; 16], [u8; 16], [u8; 16]);
+/// A pinned message: (author, id, pinned until, ms).
+pub type PinRow = ([u8; 16], [u8; 16], u64);
+/// The vote that counts in a closed poll: (voter, counter).
+pub type VoteHead = ([u8; 16], u64);
+/// A poll vote: (voter, counter, options).
+pub type VoteRow = ([u8; 16], u64, Vec<u32>);
+/// An outbox entry: idempotency key, chat, message ID, content.
+pub type OutboxEntry = ([u8; 16], [u8; 16], [u8; 16], Vec<u8>);
+
+/// The store.
+#[derive(Debug)]
+pub struct Store {
+    db: Connection,
+}
+
+fn hex(b: &[u8]) -> String {
+    use std::fmt::Write as _;
+    b.iter()
+        .fold(String::with_capacity(b.len() * 2), |mut s, x| {
+            let _ = write!(s, "{x:02x}");
+            s
+        })
+}
+
+fn db<T>(r: rusqlite::Result<T>) -> Result<T> {
+    r.map_err(|_| Error::Storage)
+}
+
+fn arr16(v: &[u8]) -> Result<[u8; 16]> {
+    v.try_into().map_err(|_| Error::Storage)
+}
+
+fn ms(v: i64) -> u64 {
+    u64::try_from(v).unwrap_or(0)
+}
+
+fn sql_ms(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+impl Store {
+    /// Opens (or creates) the store at `path` with its 32-byte key.
+    pub fn open(path: &Path, key: &[u8; 32]) -> Result<Self> {
+        Self::init(db(Connection::open(path))?, key)
+    }
+
+    /// An in-memory store (tests, and a locked app's empty view).
+    pub fn memory(key: &[u8; 32]) -> Result<Self> {
+        Self::init(db(Connection::open_in_memory())?, key)
+    }
+
+    fn init(db: Connection, key: &[u8; 32]) -> Result<Self> {
+        let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex(key)));
+        db.execute_batch(&pragma).map_err(|_| Error::Storage)?;
+        // A wrong key fails on the first read, not at `PRAGMA key`.
+        db.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+            .map_err(|_| Error::Locked)?;
+        db.execute_batch(
+            "PRAGMA cipher_memory_security = ON; PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA secure_delete = ON;",
+        )
+        .map_err(|_| Error::Storage)?;
+        let mut s = Self { db };
+        s.migrate()?;
+        Ok(s)
+    }
+
+    fn migrate(&mut self) -> Result<()> {
+        let v: i64 = db(self.db.query_row("PRAGMA user_version", [], |r| r.get(0)))?;
+        if v > SCHEMA {
+            return Err(Error::Storage);
+        }
+        if v < 1 {
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
+                 CREATE TABLE sessions (account BLOB NOT NULL, device BLOB NOT NULL, idx INTEGER NOT NULL,
+                     record BLOB NOT NULL, PRIMARY KEY (account, device, idx));
+                 CREATE TABLE accounts (account BLOB PRIMARY KEY, identity_key BLOB NOT NULL,
+                     verified INTEGER NOT NULL DEFAULT 0, list_version INTEGER NOT NULL DEFAULT 0,
+                     profile_key BLOB);
+                 CREATE TABLE devices (account BLOB NOT NULL, device BLOB NOT NULL, identity_key BLOB NOT NULL,
+                     PRIMARY KEY (account, device));
+                 CREATE TABLE chats (id BLOB PRIMARY KEY, is_group INTEGER NOT NULL, last_ms INTEGER NOT NULL,
+                     preview TEXT NOT NULL, unread INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE messages (rowid INTEGER PRIMARY KEY, chat BLOB NOT NULL, author BLOB NOT NULL,
+                     id BLOB NOT NULL, sent_ms INTEGER NOT NULL, stored_ms INTEGER NOT NULL, text TEXT NOT NULL,
+                     content BLOB NOT NULL, status INTEGER NOT NULL, UNIQUE (author, id));
+                 CREATE INDEX messages_by_chat ON messages (chat, sent_ms, rowid);
+                 CREATE TABLE receipts (author BLOB NOT NULL, id BLOB NOT NULL, account BLOB NOT NULL,
+                     level INTEGER NOT NULL, ms INTEGER NOT NULL, PRIMARY KEY (author, id, account));
+                 CREATE TABLE outbox (idem BLOB PRIMARY KEY, created_ms INTEGER NOT NULL, chat BLOB NOT NULL,
+                     message BLOB NOT NULL, content BLOB NOT NULL);
+                 CREATE VIRTUAL TABLE search USING fts5(text, content='messages', content_rowid='rowid',
+                     tokenize='unicode61 remove_diacritics 2');
+                 CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+                     INSERT INTO search(rowid, text) VALUES (new.rowid, new.text); END;
+                 CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+                     INSERT INTO search(search, rowid, text) VALUES ('delete', old.rowid, old.text); END;
+                 CREATE TRIGGER messages_au AFTER UPDATE OF text ON messages BEGIN
+                     INSERT INTO search(search, rowid, text) VALUES ('delete', old.rowid, old.text);
+                     INSERT INTO search(rowid, text) VALUES (new.rowid, new.text); END;
+                 PRAGMA user_version = 1;",
+            ))?;
+            db(tx.commit())?;
+        }
+        if v < 2 {
+            // Attachments' plaintext, inside the encrypted file like everything else (D-0141).
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "CREATE TABLE files (author BLOB NOT NULL, id BLOB NOT NULL, idx INTEGER NOT NULL,
+                     bytes BLOB NOT NULL, PRIMARY KEY (author, id, idx));
+                 PRAGMA user_version = 2;",
+            ))?;
+            db(tx.commit())?;
+        }
+        if v < 3 {
+            // Reactions: one per reactor and message, the newest counter wins (PROTOCOL §5.5).
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "CREATE TABLE reactions (author BLOB NOT NULL, id BLOB NOT NULL, reactor BLOB NOT NULL,
+                     emoji TEXT NOT NULL, counter INTEGER NOT NULL, PRIMARY KEY (author, id, reactor));
+                 PRAGMA user_version = 3;",
+            ))?;
+            db(tx.commit())?;
+        }
+        if v < 4 {
+            // Blocks (PROTOCOL §5.11) and the proof each received message can be reported with
+            // (§5.14: the stamp, the franking key and the content exactly as received).
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "ALTER TABLE accounts ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0;
+                 CREATE TABLE franks (rowid INTEGER PRIMARY KEY, author BLOB NOT NULL, id BLOB NOT NULL,
+                     stamp BLOB NOT NULL, franking_key BLOB NOT NULL, content BLOB NOT NULL,
+                     UNIQUE (author, id));
+                 PRAGMA user_version = 4;",
+            ))?;
+            db(tx.commit())?;
+        }
+        self.migrate_later(v)
+    }
+
+    /// Schema steps 5 and later (call links, chat state, packs, requests and receipt times).
+    fn migrate_later(&mut self, v: i64) -> Result<()> {
+        if v < 5 {
+            // Call links this device made (PROTOCOL §8.4, §8.7): the root (the link itself) and
+            // the admin token, which only this store holds.
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "CREATE TABLE call_links (root BLOB PRIMARY KEY, admin BLOB NOT NULL,
+                     name TEXT NOT NULL, video INTEGER NOT NULL, lobby INTEGER NOT NULL,
+                     expires_ms INTEGER NOT NULL);
+                 PRAGMA user_version = 5;",
+            ))?;
+            db(tx.commit())?;
+        }
+        if v < 6 {
+            // Disappearing messages (a time each message goes), each chat's timer, pins and poll
+            // votes (PROTOCOL §5.4, §5.8, §5.9).
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "ALTER TABLE messages ADD COLUMN expires_ms INTEGER NOT NULL DEFAULT 0;
+                 CREATE INDEX messages_by_expiry ON messages (expires_ms) WHERE expires_ms > 0;
+                 CREATE TABLE chat_timers (chat BLOB PRIMARY KEY, timer_s INTEGER NOT NULL);
+                 CREATE TABLE pins (chat BLOB NOT NULL, author BLOB NOT NULL, id BLOB NOT NULL,
+                     until_ms INTEGER NOT NULL, PRIMARY KEY (chat, author, id));
+                 CREATE TABLE poll_votes (author BLOB NOT NULL, id BLOB NOT NULL, voter BLOB NOT NULL,
+                     counter INTEGER NOT NULL, options BLOB NOT NULL, PRIMARY KEY (author, id, voter));
+                 CREATE TABLE poll_closes (author BLOB NOT NULL, id BLOB NOT NULL, heads BLOB NOT NULL,
+                     PRIMARY KEY (author, id));
+                 PRAGMA user_version = 6;",
+            ))?;
+            db(tx.commit())?;
+        }
+        if v < 7 {
+            // Installed packs (PROTOCOL §7.4): the pack key, the opened manifest and every asset,
+            // kept encrypted here like everything else.
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "CREATE TABLE packs (id BLOB PRIMARY KEY, key BLOB NOT NULL, manifest BLOB NOT NULL,
+                     position INTEGER NOT NULL);
+                 CREATE TABLE pack_items (id BLOB NOT NULL, object INTEGER NOT NULL, bytes BLOB NOT NULL,
+                     PRIMARY KEY (id, object));
+                 PRAGMA user_version = 7;",
+            ))?;
+            db(tx.commit())?;
+        }
+        if v < 8 {
+            // Message requests (PROTOCOL §5.10, D-0184): whether this account accepted talking
+            // with another (wrote to it, accepted its request, or another of its devices did).
+            // Every account known before this step was treated as accepted, so it stays so.
+            // And each receipt level's own time, for Message info (only the newest was kept).
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "ALTER TABLE accounts ADD COLUMN accepted INTEGER NOT NULL DEFAULT 0;
+                 UPDATE accounts SET accepted = 1;
+                 ALTER TABLE receipts ADD COLUMN delivered_ms INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE receipts ADD COLUMN read_ms INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE receipts ADD COLUMN played_ms INTEGER NOT NULL DEFAULT 0;
+                 UPDATE receipts SET delivered_ms = ms WHERE level = 2;
+                 UPDATE receipts SET read_ms = ms WHERE level = 3;
+                 UPDATE receipts SET played_ms = ms WHERE level = 4;
+                 PRAGMA user_version = 8;",
+            ))?;
+            db(tx.commit())?;
+        }
+        Ok(())
+    }
+
+    /// Keeps an installed pack (its key, its manifest's encoding and every asset); installing
+    /// it again replaces it.
+    pub fn put_pack(
+        &mut self,
+        id: &[u8; 16],
+        key: &[u8; 32],
+        manifest: &[u8],
+        items: &[(u32, Vec<u8>)],
+    ) -> Result<()> {
+        let tx = db(self.db.transaction())?;
+        let position: i64 = db(tx.query_row(
+            "SELECT COALESCE(MAX(position), 0) + 1 FROM packs",
+            [],
+            |r| r.get(0),
+        ))?;
+        db(tx.execute("DELETE FROM pack_items WHERE id = ?1", [&id[..]]))?;
+        db(tx.execute(
+            "INSERT INTO packs (id, key, manifest, position) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (id) DO UPDATE SET key = ?2, manifest = ?3",
+            params![&id[..], &key[..], manifest, position],
+        ))?;
+        for (object, bytes) in items {
+            db(tx.execute(
+                "INSERT INTO pack_items (id, object, bytes) VALUES (?1, ?2, ?3)",
+                params![&id[..], i64::from(*object), bytes],
+            ))?;
+        }
+        db(tx.commit())
+    }
+
+    /// Installed packs in their order: (id, key, manifest encoding).
+    pub fn packs(&self) -> Result<Vec<StoredPack>> {
+        let mut st = db(self
+            .db
+            .prepare("SELECT id, key, manifest FROM packs ORDER BY position"))?;
+        let rows = db(st.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        }))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, key, manifest) = db(row)?;
+            if let (Ok(id), Ok(key)) = (<[u8; 16]>::try_from(id), <[u8; 32]>::try_from(key)) {
+                out.push((id, Zeroizing::new(key), manifest));
+            }
+        }
+        Ok(out)
+    }
+
+    /// One asset of an installed pack.
+    pub fn pack_item(&self, id: &[u8; 16], object: u32) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let b: Option<Vec<u8>> = db(self
+            .db
+            .query_row(
+                "SELECT bytes FROM pack_items WHERE id = ?1 AND object = ?2",
+                params![&id[..], i64::from(object)],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(b.map(Zeroizing::new))
+    }
+
+    /// Removes an installed pack and its assets.
+    pub fn remove_pack(&self, id: &[u8; 16]) -> Result<()> {
+        db(self
+            .db
+            .execute("DELETE FROM pack_items WHERE id = ?1", [&id[..]]))?;
+        db(self
+            .db
+            .execute("DELETE FROM packs WHERE id = ?1", [&id[..]]))
+        .map(|_| ())
+    }
+
+    /// Moves an installed pack one place up or down.
+    pub fn move_pack(&mut self, id: &[u8; 16], up: bool) -> Result<()> {
+        let order: Vec<Vec<u8>> = {
+            let mut st = db(self.db.prepare("SELECT id FROM packs ORDER BY position"))?;
+            let rows = db(st.query_map([], |r| r.get::<_, Vec<u8>>(0)))?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(|_| Error::Storage)?
+        };
+        let Some(i) = order.iter().position(|x| x.as_slice() == id.as_slice()) else {
+            return Ok(());
+        };
+        let j = if up {
+            i.checked_sub(1)
+        } else {
+            Some(i + 1).filter(|j| *j < order.len())
+        };
+        let Some(j) = j else { return Ok(()) };
+        let mut order = order;
+        order.swap(i, j);
+        let tx = db(self.db.transaction())?;
+        for (n, x) in order.iter().enumerate() {
+            db(tx.execute(
+                "UPDATE packs SET position = ?2 WHERE id = ?1",
+                params![x, i64::try_from(n).unwrap_or(i64::MAX)],
+            ))?;
+        }
+        db(tx.commit())
+    }
+
+    /// A chat's disappearing timer in seconds (0: off).
+    pub fn timer(&self, chat: &[u8; 16]) -> Result<u32> {
+        let t: Option<i64> = db(self
+            .db
+            .query_row(
+                "SELECT timer_s FROM chat_timers WHERE chat = ?1",
+                [&chat[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(t.and_then(|t| u32::try_from(t).ok()).unwrap_or(0))
+    }
+
+    /// Sets a chat's disappearing timer.
+    pub fn set_timer(&self, chat: &[u8; 16], secs: u32) -> Result<()> {
+        db(self.db.execute(
+            "INSERT INTO chat_timers (chat, timer_s) VALUES (?1, ?2)
+             ON CONFLICT (chat) DO UPDATE SET timer_s = ?2",
+            params![&chat[..], i64::from(secs)],
+        ))
+        .map(|_| ())
+    }
+
+    /// Deletes every message whose time is up (with its files, reactions, votes and pins).
+    /// Answers them: (chat, author, id).
+    pub fn purge_expired(&mut self, now_ms: u64) -> Result<Vec<ChatMessage>> {
+        let gone: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = {
+            let mut st = db(self.db.prepare(
+                "SELECT chat, author, id FROM messages WHERE expires_ms > 0 AND expires_ms <= ?1",
+            ))?;
+            let rows =
+                db(st.query_map([sql_ms(now_ms)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))))?;
+            rows.collect::<std::result::Result<_, _>>()
+                .map_err(|_| Error::Storage)?
+        };
+        let tx = db(self.db.transaction())?;
+        let mut out = Vec::with_capacity(gone.len());
+        for (chat, author, id) in gone {
+            for table in ["files", "reactions", "poll_votes", "poll_closes", "franks"] {
+                db(tx.execute(
+                    &format!("DELETE FROM {table} WHERE author = ?1 AND id = ?2"),
+                    params![author, id],
+                ))?;
+            }
+            db(tx.execute(
+                "DELETE FROM pins WHERE author = ?1 AND id = ?2",
+                params![author, id],
+            ))?;
+            db(tx.execute(
+                "DELETE FROM messages WHERE author = ?1 AND id = ?2",
+                params![author, id],
+            ))?;
+            if let (Ok(c), Ok(a), Ok(i)) = (
+                <[u8; 16]>::try_from(chat.as_slice()),
+                <[u8; 16]>::try_from(author.as_slice()),
+                <[u8; 16]>::try_from(id.as_slice()),
+            ) {
+                out.push((c, a, i));
+            }
+        }
+        db(tx.commit())?;
+        Ok(out)
+    }
+
+    /// Pins a message in a chat until `until_ms`, or unpins it (`until_ms` 0).
+    pub fn set_pin(
+        &self,
+        chat: &[u8; 16],
+        author: &[u8; 16],
+        id: &[u8; 16],
+        until_ms: u64,
+    ) -> Result<()> {
+        if until_ms == 0 {
+            db(self.db.execute(
+                "DELETE FROM pins WHERE chat = ?1 AND author = ?2 AND id = ?3",
+                params![&chat[..], &author[..], &id[..]],
+            ))?;
+        } else {
+            db(self.db.execute(
+                "INSERT INTO pins (chat, author, id, until_ms) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (chat, author, id) DO UPDATE SET until_ms = ?4",
+                params![&chat[..], &author[..], &id[..], sql_ms(until_ms)],
+            ))?;
+        }
+        Ok(())
+    }
+
+    /// A chat's pinned messages still pinned at `now_ms`: (author, id, until).
+    pub fn pins(&self, chat: &[u8; 16], now_ms: u64) -> Result<Vec<PinRow>> {
+        let mut st = db(self.db.prepare(
+            "SELECT author, id, until_ms FROM pins WHERE chat = ?1 AND until_ms > ?2 ORDER BY until_ms",
+        ))?;
+        let rows = db(st.query_map(params![&chat[..], sql_ms(now_ms)], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        }))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (a, i, u) = db(row)?;
+            if let (Ok(a), Ok(i)) = (<[u8; 16]>::try_from(a), <[u8; 16]>::try_from(i)) {
+                out.push((a, i, u64::try_from(u).unwrap_or(0)));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Records a vote if it is the voter's newest (higher counter). Answers whether it counted.
+    pub fn put_vote(
+        &self,
+        author: &[u8; 16],
+        id: &[u8; 16],
+        voter: &[u8; 16],
+        counter: u64,
+        options: &[u32],
+    ) -> Result<bool> {
+        let opts: Vec<u8> = options.iter().flat_map(|o| o.to_be_bytes()).collect();
+        let n = db(self.db.execute(
+            "INSERT INTO poll_votes (author, id, voter, counter, options) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (author, id, voter) DO UPDATE SET counter = ?4, options = ?5 WHERE counter < ?4",
+            params![&author[..], &id[..], &voter[..], sql_ms(counter), opts],
+        ))?;
+        Ok(n > 0)
+    }
+
+    /// A poll's votes: (voter, counter, options).
+    pub fn votes(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<Vec<VoteRow>> {
+        let mut st = db(self.db.prepare(
+            "SELECT voter, counter, options FROM poll_votes WHERE author = ?1 AND id = ?2",
+        ))?;
+        let rows = db(st.query_map(params![&author[..], &id[..]], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        }))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (v, c, o) = db(row)?;
+            if let Ok(v) = <[u8; 16]>::try_from(v) {
+                let opts = o
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_be_bytes(*b))
+                    .collect();
+                out.push((v, u64::try_from(c).unwrap_or(0), opts));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Closes a poll with the votes that count: (voter, counter) heads. Answers false if it was
+    /// already closed.
+    pub fn close_poll(
+        &self,
+        author: &[u8; 16],
+        id: &[u8; 16],
+        heads: &[([u8; 16], u64)],
+    ) -> Result<bool> {
+        let mut b = Vec::with_capacity(heads.len() * 24);
+        for (v, c) in heads {
+            b.extend_from_slice(v);
+            b.extend_from_slice(&c.to_be_bytes());
+        }
+        let n = db(self.db.execute(
+            "INSERT OR IGNORE INTO poll_closes (author, id, heads) VALUES (?1, ?2, ?3)",
+            params![&author[..], &id[..], b],
+        ))?;
+        Ok(n > 0)
+    }
+
+    /// A closed poll's heads (voter, counter); `None` while open.
+    pub fn poll_heads(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<Option<Vec<VoteHead>>> {
+        let b: Option<Vec<u8>> = db(self
+            .db
+            .query_row(
+                "SELECT heads FROM poll_closes WHERE author = ?1 AND id = ?2",
+                params![&author[..], &id[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(b.map(|b| {
+            b.as_chunks::<24>()
+                .0
+                .iter()
+                .filter_map(|c| {
+                    let (v, n) = c.split_first_chunk::<16>()?;
+                    Some((*v, u64::from_be_bytes(n.try_into().ok()?)))
+                })
+                .collect()
+        }))
+    }
+
+    /// Keeps a call link this device made.
+    pub fn put_call_link(&self, link: &StoredCallLink) -> Result<()> {
+        db(self.db.execute(
+            "INSERT OR REPLACE INTO call_links (root, admin, name, video, lobby, expires_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                &link.root[..],
+                &link.admin[..],
+                link.name,
+                i64::from(link.video),
+                i64::from(link.lobby),
+                sql_ms(link.expires_ms)
+            ],
+        ))
+        .map(|_| ())
+    }
+
+    /// The call links this device made, newest last; expired ones are forgotten.
+    pub fn call_links(&self, now_ms: u64) -> Result<Vec<StoredCallLink>> {
+        db(self.db.execute(
+            "DELETE FROM call_links WHERE expires_ms <= ?1",
+            params![sql_ms(now_ms)],
+        ))?;
+        let mut st = db(self.db.prepare(
+            "SELECT root, admin, name, video, lobby, expires_ms FROM call_links ORDER BY rowid",
+        ))?;
+        let rows = db(st.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        }))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (root, admin, name, video, lobby, expires) = db(row)?;
+            let (Ok(root), Ok(admin)) = (<[u8; 32]>::try_from(root), <[u8; 32]>::try_from(admin))
+            else {
+                continue;
+            };
+            out.push(StoredCallLink {
+                root: Zeroizing::new(root),
+                admin: Zeroizing::new(admin),
+                name,
+                video: video != 0,
+                lobby: lobby != 0,
+                expires_ms: u64::try_from(expires).unwrap_or(0),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Forgets a call link (revoked).
+    pub fn delete_call_link(&self, root: &[u8; 32]) -> Result<()> {
+        db(self
+            .db
+            .execute("DELETE FROM call_links WHERE root = ?1", params![&root[..]]))
+        .map(|_| ())
+    }
+
+    /// Blocks or unblocks an account here (the server is told by the messenger).
+    pub fn set_blocked(&self, account: &[u8; 16], blocked: bool) -> Result<()> {
+        db(self.db.execute(
+            "INSERT INTO accounts (account, identity_key, blocked) VALUES (?1, x'', ?2)
+             ON CONFLICT (account) DO UPDATE SET blocked = ?2",
+            params![&account[..], i64::from(blocked)],
+        ))
+        .map(|_| ())
+    }
+
+    /// Marks `account` as accepted: this account wrote to it, accepted its message request, or
+    /// another of this account's devices did (PROTOCOL §5.10). Its messages are no longer a
+    /// request.
+    pub fn set_accepted(&self, account: &[u8; 16]) -> Result<()> {
+        db(self.db.execute(
+            "INSERT INTO accounts (account, identity_key, accepted) VALUES (?1, x'', 1)
+             ON CONFLICT (account) DO UPDATE SET accepted = 1",
+            [&account[..]],
+        ))
+        .map(|_| ())
+    }
+
+    /// Whether this account accepted talking with `account` (see [`Self::set_accepted`]).
+    pub fn is_accepted(&self, account: &[u8; 16]) -> Result<bool> {
+        let v: Option<i64> = db(self
+            .db
+            .query_row(
+                "SELECT accepted FROM accounts WHERE account = ?1",
+                [&account[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(v == Some(1))
+    }
+
+    /// Deletes a chat from this device: its messages with their files, reactions, receipts,
+    /// report proofs, pins, polls and timer, and anything of it still waiting to be sent. The
+    /// other people in it are not told; a new message starts it again.
+    pub fn delete_chat(&mut self, chat: &[u8; 16]) -> Result<()> {
+        self.empty_chat(chat, false)
+    }
+
+    /// Clears a chat on this device: everything [`Self::delete_chat`] removes, but the chat
+    /// stays in the list, empty.
+    pub fn clear_chat(&mut self, chat: &[u8; 16]) -> Result<()> {
+        self.empty_chat(chat, true)
+    }
+
+    fn empty_chat(&mut self, chat: &[u8; 16], keep: bool) -> Result<()> {
+        let tx = db(self.db.transaction())?;
+        for table in [
+            "files",
+            "reactions",
+            "receipts",
+            "franks",
+            "poll_votes",
+            "poll_closes",
+        ] {
+            db(tx.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE (author, id) IN (SELECT author, id FROM messages WHERE chat = ?1)"
+                ),
+                [&chat[..]],
+            ))?;
+        }
+        for table in ["messages", "pins", "outbox"] {
+            db(tx.execute(&format!("DELETE FROM {table} WHERE chat = ?1"), [&chat[..]]))?;
+        }
+        if keep {
+            db(tx.execute(
+                "UPDATE chats SET preview = '', unread = 0 WHERE id = ?1",
+                [&chat[..]],
+            ))?;
+        } else {
+            db(tx.execute("DELETE FROM chat_timers WHERE chat = ?1", [&chat[..]]))?;
+            db(tx.execute("DELETE FROM chats WHERE id = ?1", [&chat[..]]))?;
+        }
+        db(tx.commit())
+    }
+
+    /// Deletes a message here (delete for everyone, disappearing, or delete for me) with what is
+    /// kept of it (files, reactions, receipts, its report proof, poll votes, a pin), and from the
+    /// outbox if still waiting.
+    pub fn delete_message(&mut self, author: &[u8; 16], id: &[u8; 16]) -> Result<()> {
+        let tx = db(self.db.transaction())?;
+        let chat: Option<Vec<u8>> = db(tx
+            .query_row(
+                "SELECT chat FROM messages WHERE author = ?1 AND id = ?2",
+                params![&author[..], &id[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        for table in [
+            "files",
+            "reactions",
+            "receipts",
+            "franks",
+            "poll_votes",
+            "poll_closes",
+            "pins",
+            "messages",
+        ] {
+            db(tx.execute(
+                &format!("DELETE FROM {table} WHERE author = ?1 AND id = ?2"),
+                params![&author[..], &id[..]],
+            ))?;
+        }
+        db(tx.execute("DELETE FROM outbox WHERE message = ?1", [&id[..]]))?;
+        // The list's preview never keeps a deleted message's text.
+        if let Some(chat) = chat {
+            db(tx.execute(
+                "UPDATE chats SET preview = COALESCE((SELECT text FROM messages WHERE chat = ?1
+                     ORDER BY sent_ms DESC, rowid DESC LIMIT 1), '') WHERE id = ?1",
+                [&chat],
+            ))?;
+        }
+        db(tx.commit())
+    }
+
+    /// Whether this account blocked `account`.
+    pub fn is_blocked(&self, account: &[u8; 16]) -> Result<bool> {
+        let v: Option<i64> = db(self
+            .db
+            .query_row(
+                "SELECT blocked FROM accounts WHERE account = ?1",
+                [&account[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(v == Some(1))
+    }
+
+    /// Contacts this account shares its profile key with: accounts whose profile key it holds,
+    /// not blocked.
+    pub fn contacts(&self) -> Result<Vec<[u8; 16]>> {
+        let mut st = db(self.db.prepare(
+            "SELECT account FROM accounts WHERE profile_key IS NOT NULL AND blocked = 0",
+        ))?;
+        let rows = db(st.query_map([], |r| r.get::<_, Vec<u8>>(0)))?;
+        rows.map(|r| arr16(&db(r)?)).collect()
+    }
+
+    /// Keeps what reporting a received message needs.
+    pub fn put_frank(
+        &self,
+        author: &[u8; 16],
+        id: &[u8; 16],
+        stamp: &[u8],
+        franking_key: &[u8; 32],
+        content: &[u8],
+    ) -> Result<()> {
+        db(self.db.execute(
+            "INSERT OR IGNORE INTO franks (author, id, stamp, franking_key, content) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![&author[..], &id[..], stamp, &franking_key[..], content],
+        ))
+        .map(|_| ())
+    }
+
+    /// The newest `n` reportable messages from `author`: (stamp, franking key, content).
+    pub fn franks(&self, author: &[u8; 16], n: u32) -> Result<Vec<Frank>> {
+        let mut st = db(self.db.prepare(
+            "SELECT stamp, franking_key, content FROM franks WHERE author = ?1 ORDER BY rowid DESC LIMIT ?2",
+        ))?;
+        let rows = db(st.query_map(params![&author[..], i64::from(n)], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        }))?;
+        rows.map(db).collect()
+    }
+
+    /// The report proofs of the newest `n` messages in `chat` not sent by `me`, with their
+    /// senders (a group's reports, §5.14).
+    pub fn franks_in(
+        &self,
+        chat: &[u8; 16],
+        me: &[u8; 16],
+        n: u32,
+    ) -> Result<Vec<([u8; 16], Frank)>> {
+        let mut st = db(self.db.prepare(
+            "SELECT f.author, f.stamp, f.franking_key, f.content FROM franks f
+             JOIN messages m ON m.author = f.author AND m.id = f.id
+             WHERE m.chat = ?1 AND f.author != ?2 ORDER BY f.rowid DESC LIMIT ?3",
+        ))?;
+        let rows = db(
+            st.query_map(params![&chat[..], &me[..], i64::from(n)], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            }),
+        )?;
+        rows.map(|r| {
+            let (a, stamp, fk, content) = db(r)?;
+            Ok((arr16(&a)?, (stamp, fk, content)))
+        })
+        .collect()
+    }
+
+    /// Records `reactor`'s reaction to a message (empty `emoji`: removed), if `counter` is newer
+    /// than the one held. Answers whether it changed.
+    pub fn react(
+        &self,
+        author: &[u8; 16],
+        id: &[u8; 16],
+        reactor: &[u8; 16],
+        emoji: &str,
+        counter: u64,
+    ) -> Result<bool> {
+        let n = db(self.db.execute(
+            "INSERT INTO reactions (author, id, reactor, emoji, counter) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (author, id, reactor) DO UPDATE SET emoji = ?4, counter = ?5 WHERE counter < ?5",
+            params![&author[..], &id[..], &reactor[..], emoji, sql_ms(counter)],
+        ))?;
+        Ok(n > 0)
+    }
+
+    /// A message's reactions: (reactor, emoji), removed ones left out.
+    pub fn reactions(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<Vec<([u8; 16], String)>> {
+        let mut st = db(self.db.prepare(
+            "SELECT reactor, emoji FROM reactions WHERE author = ?1 AND id = ?2 AND emoji != '' ORDER BY counter",
+        ))?;
+        let rows = db(st.query_map(params![&author[..], &id[..]], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, String>(1)?))
+        }))?;
+        rows.map(|r| {
+            let (a, e) = db(r)?;
+            Ok((arr16(&a)?, e))
+        })
+        .collect()
+    }
+
+    /// Deletes a message's content for everyone: the row stays as "deleted", with no text, no
+    /// content, no files and no reactions.
+    pub fn mark_deleted(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<()> {
+        db(self.db.execute(
+            "DELETE FROM files WHERE author = ?1 AND id = ?2",
+            params![&author[..], &id[..]],
+        ))?;
+        db(self.db.execute(
+            "DELETE FROM reactions WHERE author = ?1 AND id = ?2",
+            params![&author[..], &id[..]],
+        ))?;
+        db(self.db.execute(
+            "UPDATE messages SET text = '', content = x'' WHERE author = ?1 AND id = ?2",
+            params![&author[..], &id[..]],
+        ))
+        .map(|_| ())
+    }
+
+    /// Every file kept here: (chat, author, id, index, bytes, stored at, the message's content).
+    pub fn file_index(&self) -> Result<Vec<KeptFile>> {
+        let mut st = db(self.db.prepare(
+            "SELECT m.chat, f.author, f.id, f.idx, length(f.bytes), m.stored_ms, m.content
+             FROM files f JOIN messages m ON m.author = f.author AND m.id = f.id",
+        ))?;
+        let rows = db(st.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Vec<u8>>(6)?,
+            ))
+        }))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (c, a, i, idx, len, at, content) = db(row)?;
+            if let (Ok(c), Ok(a), Ok(i)) = (
+                <[u8; 16]>::try_from(c),
+                <[u8; 16]>::try_from(a),
+                <[u8; 16]>::try_from(i),
+            ) {
+                out.push(KeptFile {
+                    chat: c,
+                    author: a,
+                    id: i,
+                    idx: u32::try_from(idx).unwrap_or(0),
+                    bytes: u64::try_from(len).unwrap_or(0),
+                    stored_ms: u64::try_from(at).unwrap_or(0),
+                    content,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Deletes a message's kept files (a view-once message after it was shown).
+    pub fn drop_files(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<()> {
+        db(self.db.execute(
+            "DELETE FROM files WHERE author = ?1 AND id = ?2",
+            params![&author[..], &id[..]],
+        ))
+        .map(|_| ())
+    }
+
+    /// Records that a view-once message was opened (or is the sender's own).
+    pub fn mark_viewed(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<()> {
+        let key = viewed_key(author, id);
+        self.put_secret(&key, &[1])
+    }
+
+    /// Whether a view-once message was opened here.
+    pub fn viewed(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<bool> {
+        let key = viewed_key(author, id);
+        Ok(self.secret(&key)?.is_some())
+    }
+
+    /// Keeps an attachment's plaintext (a message's `idx`-th file).
+    pub fn put_file(&self, author: &[u8; 16], id: &[u8; 16], idx: u32, bytes: &[u8]) -> Result<()> {
+        db(self.db.execute(
+            "INSERT OR REPLACE INTO files (author, id, idx, bytes) VALUES (?1, ?2, ?3, ?4)",
+            params![&author[..], &id[..], i64::from(idx), bytes],
+        ))
+        .map(|_| ())
+    }
+
+    /// An attachment's plaintext, if this device has it.
+    pub fn file(
+        &self,
+        author: &[u8; 16],
+        id: &[u8; 16],
+        idx: u32,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        db(self
+            .db
+            .query_row(
+                "SELECT bytes FROM files WHERE author = ?1 AND id = ?2 AND idx = ?3",
+                params![&author[..], &id[..], i64::from(idx)],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional())
+        .map(|v| v.map(Zeroizing::new))
+    }
+
+    /// The connection (for `crate::backup`).
+    pub(crate) fn db_ref(&self) -> &Connection {
+        &self.db
+    }
+
+    fn put_meta(&self, key: &str, value: &[u8]) -> Result<()> {
+        db(self.db.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2",
+            params![key, value],
+        ))
+        .map(|_| ())
+    }
+
+    fn meta(&self, key: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        db(self
+            .db
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+                r.get::<_, Vec<u8>>(0)
+            })
+            .optional())
+        .map(|v| v.map(Zeroizing::new))
+    }
+
+    /// Saves this device's identity.
+    pub fn save_local(&self, l: &Local) -> Result<()> {
+        let mut v = Zeroizing::new(Vec::with_capacity(64));
+        v.extend_from_slice(&l.account);
+        v.extend_from_slice(&l.device);
+        v.extend_from_slice(l.identity.secret());
+        self.put_meta("local", &v)
+    }
+
+    /// This device's identity, if registered.
+    pub fn local(&self) -> Result<Option<Local>> {
+        let Some(v) = self.meta("local")? else {
+            return Ok(None);
+        };
+        let mut r = crate::crypto::Reader::new(&v);
+        let account = r.array()?;
+        let device = r.array()?;
+        let secret = Zeroizing::new(r.array::<32>()?);
+        r.finish()?;
+        Ok(Some(Local {
+            account,
+            device,
+            identity: X25519Pair::from_secret(&secret)?,
+        }))
+    }
+
+    /// Saves the prekeys.
+    pub fn save_prekeys(&self, p: &Prekeys) -> Result<()> {
+        self.put_meta("prekeys", &p.encode()?)
+    }
+
+    /// The prekeys (empty before the first upload).
+    pub fn prekeys(&self) -> Result<Prekeys> {
+        match self.meta("prekeys")? {
+            Some(v) => Prekeys::decode(&v),
+            None => Ok(Prekeys::default()),
+        }
+    }
+
+    /// A small secret or value under `key` (the profile key, the storage key, …).
+    pub fn put_secret(&self, key: &str, value: &[u8]) -> Result<()> {
+        self.put_meta(&format!("s.{key}"), value)
+    }
+
+    /// Reads what [`Self::put_secret`] stored.
+    pub fn secret(&self, key: &str) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        self.meta(&format!("s.{key}"))
+    }
+
+    /// Saves every session with one device (newest first).
+    pub fn save_sessions(
+        &mut self,
+        sessions: &Sessions,
+        addr: &([u8; 16], [u8; 16]),
+    ) -> Result<()> {
+        let tx = db(self.db.transaction())?;
+        db(tx.execute(
+            "DELETE FROM sessions WHERE account = ?1 AND device = ?2",
+            params![&addr.0[..], &addr.1[..]],
+        ))?;
+        for (i, s) in sessions.get(addr).unwrap_or(&[]).iter().enumerate() {
+            db(tx.execute(
+                "INSERT INTO sessions (account, device, idx, record) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    &addr.0[..],
+                    &addr.1[..],
+                    i64::try_from(i).unwrap_or(0),
+                    &s.encode()?[..]
+                ],
+            ))?;
+        }
+        db(tx.commit())
+    }
+
+    /// Every session.
+    pub fn sessions(&self) -> Result<Sessions> {
+        let mut st = db(self.db.prepare(
+            "SELECT account, device, record FROM sessions ORDER BY account, device, idx",
+        ))?;
+        let rows = db(st.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                Zeroizing::new(r.get::<_, Vec<u8>>(2)?),
+            ))
+        }))?;
+        let mut out = Sessions::default();
+        let mut cur: Grouped = None;
+        for row in rows {
+            let (account, device, rec) = db(row)?;
+            let addr = (arr16(&account)?, arr16(&device)?);
+            let s = Session::decode(&rec)?;
+            match &mut cur {
+                Some((k, v)) if *k == addr => v.push(s),
+                _ => {
+                    if let Some((k, v)) = cur.take() {
+                        out.put(k, v);
+                    }
+                    cur = Some((addr, vec![s]));
+                }
+            }
+        }
+        if let Some((k, v)) = cur {
+            out.put(k, v);
+        }
+        Ok(out)
+    }
+
+    /// Pins an account's identity key on first sight. Answers whether the stored key equals
+    /// `key` (false: the account's identity changed, the UI warns and verification is reset).
+    pub fn pin_account(&self, account: &[u8; 16], key: &[u8; 32]) -> Result<bool> {
+        let cur: Option<Vec<u8>> = db(self
+            .db
+            .query_row(
+                "SELECT identity_key FROM accounts WHERE account = ?1",
+                [&account[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        match cur {
+            None => {
+                db(self.db.execute(
+                    "INSERT INTO accounts (account, identity_key) VALUES (?1, ?2)",
+                    params![&account[..], &key[..]],
+                ))?;
+                Ok(true)
+            }
+            // A row made by a block before any key was seen: pin now.
+            Some(k) if k.is_empty() => {
+                db(self.db.execute(
+                    "UPDATE accounts SET identity_key = ?2 WHERE account = ?1",
+                    params![&account[..], &key[..]],
+                ))?;
+                Ok(true)
+            }
+            Some(k) => Ok(crate::crypto::ct_eq(&k, key)),
+        }
+    }
+
+    /// Replaces a changed identity key after the user accepted the change; unverifies.
+    pub fn accept_identity(&self, account: &[u8; 16], key: &[u8; 32]) -> Result<()> {
+        db(self.db.execute(
+            "UPDATE accounts SET identity_key = ?2, verified = 0, list_version = 0 WHERE account = ?1",
+            params![&account[..], &key[..]],
+        ))?;
+        db(self
+            .db
+            .execute("DELETE FROM devices WHERE account = ?1", [&account[..]]))
+        .map(|_| ())
+    }
+
+    /// The pinned identity key of an account.
+    pub fn account_key(&self, account: &[u8; 16]) -> Result<Option<[u8; 32]>> {
+        let v: Option<Vec<u8>> = db(self
+            .db
+            .query_row(
+                "SELECT identity_key FROM accounts WHERE account = ?1",
+                [&account[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        v.filter(|k| !k.is_empty())
+            .map(|k| k.as_slice().try_into().map_err(|_| Error::Storage))
+            .transpose()
+    }
+
+    /// Whether an account is marked verified.
+    pub fn is_verified(&self, account: &[u8; 16]) -> Result<bool> {
+        let v: Option<i64> = db(self
+            .db
+            .query_row(
+                "SELECT verified FROM accounts WHERE account = ?1",
+                [&account[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(v == Some(1))
+    }
+
+    /// Marks an account verified (safety numbers compared) or not.
+    pub fn set_verified(&self, account: &[u8; 16], verified: bool) -> Result<()> {
+        db(self.db.execute(
+            "UPDATE accounts SET verified = ?2 WHERE account = ?1",
+            params![&account[..], i64::from(verified)],
+        ))
+        .map(|_| ())
+    }
+
+    /// Records an account's verified device list, refusing a version not higher than the highest
+    /// seen (a server cannot roll back to a removed device). Answers the removed devices.
+    pub fn set_devices(
+        &self,
+        account: &[u8; 16],
+        version: u64,
+        devices: &[([u8; 16], [u8; 32])],
+    ) -> Result<Vec<[u8; 16]>> {
+        let cur: Option<i64> = db(self
+            .db
+            .query_row(
+                "SELECT list_version FROM accounts WHERE account = ?1",
+                [&account[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        let Some(cur) = cur else {
+            return Err(Error::Verify);
+        };
+        if sql_ms(version) <= cur && cur != 0 {
+            return if sql_ms(version) == cur {
+                Ok(Vec::new())
+            } else {
+                Err(Error::Verify)
+            };
+        }
+        let mut st = db(self
+            .db
+            .prepare("SELECT device FROM devices WHERE account = ?1"))?;
+        let old: Vec<[u8; 16]> = db(st.query_map([&account[..]], |r| r.get::<_, Vec<u8>>(0)))?
+            .filter_map(|r| r.ok().and_then(|v| v.as_slice().try_into().ok()))
+            .collect();
+        let removed: Vec<[u8; 16]> = old
+            .into_iter()
+            .filter(|d| !devices.iter().any(|(n, _)| n == d))
+            .collect();
+        db(self
+            .db
+            .execute("DELETE FROM devices WHERE account = ?1", [&account[..]]))?;
+        for (d, k) in devices {
+            db(self.db.execute(
+                "INSERT INTO devices (account, device, identity_key) VALUES (?1, ?2, ?3)",
+                params![&account[..], &d[..], &k[..]],
+            ))?;
+        }
+        db(self.db.execute(
+            "UPDATE accounts SET list_version = ?2 WHERE account = ?1",
+            params![&account[..], sql_ms(version)],
+        ))?;
+        Ok(removed)
+    }
+
+    /// An account's devices with their identity keys, from its last verified list.
+    pub fn devices(&self, account: &[u8; 16]) -> Result<Vec<([u8; 16], [u8; 32])>> {
+        let mut st = db(self.db.prepare(
+            "SELECT device, identity_key FROM devices WHERE account = ?1 ORDER BY device",
+        ))?;
+        let rows = db(st.query_map([&account[..]], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+        }))?;
+        rows.map(|r| {
+            let (d, k) = db(r)?;
+            Ok((
+                arr16(&d)?,
+                k.as_slice().try_into().map_err(|_| Error::Storage)?,
+            ))
+        })
+        .collect()
+    }
+
+    /// Stores a contact's profile key (from their messages).
+    pub fn set_profile_key(&self, account: &[u8; 16], key: &[u8; 32]) -> Result<()> {
+        db(self.db.execute(
+            "UPDATE accounts SET profile_key = ?2 WHERE account = ?1",
+            params![&account[..], &key[..]],
+        ))
+        .map(|_| ())
+    }
+
+    /// A contact's profile key.
+    pub fn profile_key(&self, account: &[u8; 16]) -> Result<Option<Zeroizing<[u8; 32]>>> {
+        let v: Option<Option<Vec<u8>>> = db(self
+            .db
+            .query_row(
+                "SELECT profile_key FROM accounts WHERE account = ?1",
+                [&account[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        Ok(v.flatten()
+            .and_then(|k| <[u8; 32]>::try_from(k.as_slice()).ok())
+            .map(Zeroizing::new))
+    }
+
+    /// Stores a message once: a repeat of (author, id) is dropped (PROTOCOL §5.1). Answers
+    /// whether it was new. Updates the chat's preview and, for incoming ones, its unread count.
+    pub fn insert_message(&mut self, m: &MessageRow, incoming: bool) -> Result<bool> {
+        let tx = db(self.db.transaction())?;
+        // A disappearing message goes `expire_timer_s` after it is stored here (PROTOCOL §5.9).
+        let timer =
+            <songbird_content::schema::Content as prost::Message>::decode(m.content.as_slice())
+                .ok()
+                .and_then(|c| match c.body {
+                    Some(songbird_content::schema::content::Body::Data(d)) => {
+                        Some(d.expire_timer_s)
+                    }
+                    _ => None,
+                })
+                .unwrap_or(0);
+        let expires = if timer == 0 {
+            0
+        } else {
+            m.stored_ms.saturating_add(u64::from(timer) * 1000)
+        };
+        let n = db(tx.execute(
+            "INSERT OR IGNORE INTO messages (chat, author, id, sent_ms, stored_ms, text, content, status, expires_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![&m.chat[..], &m.author[..], &m.id[..], sql_ms(m.sent_ms), sql_ms(m.stored_ms), m.text, m.content, m.status.as_i64(), sql_ms(expires)],
+        ))?;
+        if n == 1 {
+            db(tx.execute(
+                "INSERT INTO chats (id, is_group, last_ms, preview, unread) VALUES (?1, 0, ?2, ?3, ?4)
+                 ON CONFLICT (id) DO UPDATE SET last_ms = max(last_ms, ?2),
+                   preview = CASE WHEN ?2 >= last_ms THEN ?3 ELSE preview END, unread = unread + ?4",
+                params![&m.chat[..], sql_ms(m.sent_ms), m.text, i64::from(incoming)],
+            ))?;
+        }
+        db(tx.commit())?;
+        Ok(n == 1)
+    }
+
+    /// Marks a chat a group (before its first message).
+    pub fn ensure_group_chat(&self, id: &[u8; 16]) -> Result<()> {
+        db(self.db.execute(
+            "INSERT INTO chats (id, is_group, last_ms, preview, unread) VALUES (?1, 1, 0, '', 0)
+             ON CONFLICT (id) DO UPDATE SET is_group = 1",
+            [&id[..]],
+        ))
+        .map(|_| ())
+    }
+
+    /// Moves a message's status forward (never back, except a retried failure). Answers whether
+    /// it changed.
+    pub fn advance(&self, author: &[u8; 16], id: &[u8; 16], next: Status) -> Result<bool> {
+        let cur: Option<i64> = db(self
+            .db
+            .query_row(
+                "SELECT status FROM messages WHERE author = ?1 AND id = ?2",
+                params![&author[..], &id[..]],
+                |r| r.get(0),
+            )
+            .optional())?;
+        let Some(cur) = cur else { return Ok(false) };
+        if !Status::from_i64(cur).may_become(next) {
+            return Ok(false);
+        }
+        db(self.db.execute(
+            "UPDATE messages SET status = ?3 WHERE author = ?1 AND id = ?2",
+            params![&author[..], &id[..], next.as_i64()],
+        ))?;
+        Ok(true)
+    }
+
+    /// The receipts for one of this account's messages, per recipient, with each level's time.
+    pub fn receipt_times(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<Vec<ReceiptTimes>> {
+        let mut st = db(self.db.prepare(
+            "SELECT account, level, delivered_ms, read_ms, played_ms FROM receipts
+             WHERE author = ?1 AND id = ?2 ORDER BY level DESC, ms",
+        ))?;
+        let rows = db(st.query_map(params![&author[..], &id[..]], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        }))?;
+        let known = |v: i64| (v > 0).then(|| ms(v));
+        rows.map(|r| {
+            let (account, level, d, rd, p) = db(r)?;
+            Ok(ReceiptTimes {
+                account: arr16(&account)?,
+                level: Status::from_i64(level),
+                delivered_ms: known(d),
+                read_ms: known(rd),
+                played_ms: known(p),
+            })
+        })
+        .collect()
+    }
+
+    /// Records a receipt from `account` for one of our messages. The message's status becomes the
+    /// lowest level every one of the `audience` recipient accounts has reached; one that has not
+    /// answered counts as `Sent` (1:1: an audience of one).
+    pub fn receipt(
+        &self,
+        author: &[u8; 16],
+        id: &[u8; 16],
+        account: &[u8; 16],
+        level: Status,
+        at_ms: u64,
+        audience: usize,
+    ) -> Result<()> {
+        db(self.db.execute(
+            "INSERT INTO receipts (author, id, account, level, ms, delivered_ms, read_ms, played_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5,
+                     CASE WHEN ?4 >= 2 THEN ?5 ELSE 0 END,
+                     CASE WHEN ?4 >= 3 THEN ?5 ELSE 0 END,
+                     CASE WHEN ?4 >= 4 THEN ?5 ELSE 0 END)
+             ON CONFLICT (author, id, account) DO UPDATE SET level = max(level, ?4),
+                 ms = CASE WHEN ?4 > level THEN ?5 ELSE ms END,
+                 delivered_ms = CASE WHEN ?4 >= 2 AND delivered_ms = 0 THEN ?5 ELSE delivered_ms END,
+                 read_ms = CASE WHEN ?4 >= 3 AND read_ms = 0 THEN ?5 ELSE read_ms END,
+                 played_ms = CASE WHEN ?4 >= 4 AND played_ms = 0 THEN ?5 ELSE played_ms END",
+            params![&author[..], &id[..], &account[..], level.as_i64(), sql_ms(at_ms)],
+        ))?;
+        let (n, min): (i64, Option<i64>) = db(self.db.query_row(
+            "SELECT count(*), min(level) FROM receipts WHERE author = ?1 AND id = ?2",
+            params![&author[..], &id[..]],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ))?;
+        if let Some(m) = min
+            && usize::try_from(n).unwrap_or(0) >= audience
+        {
+            self.advance(author, id, Status::from_i64(m))?;
+        }
+        Ok(())
+    }
+
+    /// Edits a message's text (the newest edit wins; `crates/content` decides which).
+    pub fn set_text(&self, author: &[u8; 16], id: &[u8; 16], text: &str) -> Result<()> {
+        db(self.db.execute(
+            "UPDATE messages SET text = ?3 WHERE author = ?1 AND id = ?2",
+            params![&author[..], &id[..], text],
+        ))
+        .map(|_| ())
+    }
+
+    /// The chat list, newest first.
+    pub fn chats(&self) -> Result<Vec<ChatRow>> {
+        let mut st = db(self.db.prepare(
+            "SELECT id, is_group, last_ms, preview, unread FROM chats ORDER BY last_ms DESC",
+        ))?;
+        let rows = db(st.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        }))?;
+        rows.map(|r| {
+            let (id, g, last, preview, unread) = db(r)?;
+            Ok(ChatRow {
+                id: arr16(&id)?,
+                group: g == 1,
+                last_ms: ms(last),
+                preview,
+                unread: u32::try_from(unread).unwrap_or(0),
+            })
+        })
+        .collect()
+    }
+
+    /// Marks a chat read: unread to zero; answers the incoming messages to send read receipts for.
+    pub fn mark_read(&self, chat: &[u8; 16], me: &[u8; 16]) -> Result<Vec<([u8; 16], [u8; 16])>> {
+        db(self
+            .db
+            .execute("UPDATE chats SET unread = 0 WHERE id = ?1", [&chat[..]]))?;
+        let mut st = db(self.db.prepare(
+            "SELECT author, id FROM messages WHERE chat = ?1 AND author != ?2 AND status < 3",
+        ))?;
+        let out: Vec<_> = db(st.query_map(params![&chat[..], &me[..]], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+        }))?
+        .filter_map(|r| {
+            r.ok()
+                .and_then(|(a, i)| Some((arr16(&a).ok()?, arr16(&i).ok()?)))
+        })
+        .collect();
+        db(self.db.execute(
+            "UPDATE messages SET status = 3 WHERE chat = ?1 AND author != ?2 AND status < 3",
+            params![&chat[..], &me[..]],
+        ))?;
+        Ok(out)
+    }
+
+    /// A page of a chat's messages, oldest first, before `before_ms` (or the newest page).
+    pub fn messages(
+        &self,
+        chat: &[u8; 16],
+        before_ms: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<MessageRow>> {
+        let mut st = db(self.db.prepare(
+            "SELECT chat, author, id, sent_ms, stored_ms, text, content, status FROM messages
+             WHERE chat = ?1 AND sent_ms < ?2 ORDER BY sent_ms DESC, rowid DESC LIMIT ?3",
+        ))?;
+        let rows = db(st.query_map(
+            params![
+                &chat[..],
+                sql_ms(before_ms.unwrap_or(u64::MAX >> 1)),
+                i64::from(limit)
+            ],
+            row_message,
+        ))?;
+        let mut v: Vec<MessageRow> = rows.map(|r| db(r)?).collect::<Result<_>>()?;
+        v.reverse();
+        Ok(v)
+    }
+
+    /// One message.
+    pub fn message(&self, author: &[u8; 16], id: &[u8; 16]) -> Result<Option<MessageRow>> {
+        let r = db(self
+            .db
+            .query_row(
+                "SELECT chat, author, id, sent_ms, stored_ms, text, content, status FROM messages WHERE author = ?1 AND id = ?2",
+                params![&author[..], &id[..]],
+                row_message,
+            )
+            .optional())?;
+        r.transpose()
+    }
+
+    /// Full-text search over every chat, newest first.
+    pub fn search(&self, query: &str, limit: u32) -> Result<Vec<MessageRow>> {
+        // Each word as a quoted prefix term, so user input is never FTS syntax.
+        let q: String = query
+            .split_whitespace()
+            .take(16)
+            .map(|w| format!("\"{}\"*", w.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut st = db(self.db.prepare(
+            "SELECT m.chat, m.author, m.id, m.sent_ms, m.stored_ms, m.text, m.content, m.status
+             FROM search JOIN messages m ON m.rowid = search.rowid WHERE search MATCH ?1
+             ORDER BY m.sent_ms DESC LIMIT ?2",
+        ))?;
+        let rows = db(st.query_map(params![q, i64::from(limit)], row_message))?;
+        rows.map(|r| db(r)?).collect()
+    }
+
+    /// Queues an accepted-but-unsent message (survives a restart; resent with the same key).
+    pub fn outbox_put(
+        &self,
+        idem: &[u8; 16],
+        chat: &[u8; 16],
+        message: &[u8; 16],
+        content: &[u8],
+        now_ms: u64,
+    ) -> Result<()> {
+        db(self.db.execute(
+            "INSERT OR IGNORE INTO outbox (idem, created_ms, chat, message, content) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![&idem[..], sql_ms(now_ms), &chat[..], &message[..], content],
+        ))
+        .map(|_| ())
+    }
+
+    /// The outbox, oldest first: (idempotency key, chat, message id, content).
+    pub fn outbox(&self) -> Result<Vec<OutboxEntry>> {
+        let mut st = db(self
+            .db
+            .prepare("SELECT idem, chat, message, content FROM outbox ORDER BY created_ms"))?;
+        let rows = db(st.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+            ))
+        }))?;
+        rows.map(|r| {
+            let (i, c, m, b) = db(r)?;
+            Ok((arr16(&i)?, arr16(&c)?, arr16(&m)?, b))
+        })
+        .collect()
+    }
+
+    /// Removes an outbox entry (accepted, or given up).
+    pub fn outbox_done(&self, idem: &[u8; 16]) -> Result<()> {
+        db(self
+            .db
+            .execute("DELETE FROM outbox WHERE idem = ?1", [&idem[..]]))
+        .map(|_| ())
+    }
+}
+
+pub(crate) fn row_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<MessageRow>> {
+    let chat: Vec<u8> = r.get(0)?;
+    let author: Vec<u8> = r.get(1)?;
+    let id: Vec<u8> = r.get(2)?;
+    let sent: i64 = r.get(3)?;
+    let stored: i64 = r.get(4)?;
+    let text: String = r.get(5)?;
+    let content: Vec<u8> = r.get(6)?;
+    let status: i64 = r.get(7)?;
+    Ok((|| {
+        Ok(MessageRow {
+            chat: arr16(&chat)?,
+            author: arr16(&author)?,
+            id: arr16(&id)?,
+            sent_ms: ms(sent),
+            stored_ms: ms(stored),
+            text,
+            content,
+            status: Status::from_i64(status),
+        })
+    })())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing, reason = "tests")]
+
+    use super::*;
+
+    fn msg(chat: u8, author: u8, id: u8, sent: u64, text: &str) -> MessageRow {
+        MessageRow {
+            chat: [chat; 16],
+            author: [author; 16],
+            id: [id; 16],
+            sent_ms: sent,
+            stored_ms: sent,
+            text: text.into(),
+            content: vec![1, 2, 3],
+            status: Status::Sending,
+        }
+    }
+
+    #[test]
+    fn the_file_is_encrypted_and_a_wrong_key_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        {
+            let mut s = Store::open(&path, &[7; 32]).unwrap();
+            s.insert_message(&msg(1, 2, 3, 10, "a very findable secret phrase"), true)
+                .unwrap();
+        }
+        let raw = std::fs::read(&path).unwrap();
+        assert!(!raw.windows(6).any(|w| w == b"secret"));
+        assert!(!raw.starts_with(b"SQLite format 3"));
+        assert_eq!(Store::open(&path, &[8; 32]).unwrap_err(), Error::Locked);
+        let s = Store::open(&path, &[7; 32]).unwrap();
+        assert_eq!(s.search("findable", 10).unwrap().len(), 1);
+        drop(s);
+    }
+
+    #[test]
+    fn requests_are_accepted_once_written_to_and_old_accounts_stay_accepted() {
+        let mut s = Store::memory(&[1; 32]).unwrap();
+        let (stranger, friend) = ([5; 16], [6; 16]);
+        assert!(!s.is_accepted(&stranger).unwrap());
+        // A key pinned on first sight does not accept anyone.
+        s.pin_account(&stranger, &[9; 32]).unwrap();
+        assert!(!s.is_accepted(&stranger).unwrap());
+        s.set_accepted(&stranger).unwrap();
+        assert!(s.is_accepted(&stranger).unwrap());
+        // ...and keeps the pinned key.
+        assert!(s.pin_account(&stranger, &[9; 32]).unwrap());
+        // A store from before schema 8: every account it knew counts as accepted.
+        s.pin_account(&friend, &[8; 32]).unwrap();
+        s.db.execute_batch(
+            "UPDATE accounts SET accepted = 0;
+             ALTER TABLE accounts DROP COLUMN accepted;
+             ALTER TABLE receipts DROP COLUMN delivered_ms;
+             ALTER TABLE receipts DROP COLUMN read_ms;
+             ALTER TABLE receipts DROP COLUMN played_ms;
+             INSERT INTO receipts (author, id, account, level, ms) VALUES (x'01', x'02', x'03', 3, 77);
+             PRAGMA user_version = 7;",
+        )
+        .unwrap();
+        s.migrate().unwrap();
+        assert!(s.is_accepted(&friend).unwrap() && s.is_accepted(&stranger).unwrap());
+        let n: i64 =
+            s.db.query_row("SELECT read_ms FROM receipts WHERE ms = 77", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 77);
+    }
+
+    #[test]
+    fn receipt_times_keep_each_level() {
+        let mut s = Store::memory(&[1; 32]).unwrap();
+        let m = msg(1, 2, 3, 10, "hello");
+        s.insert_message(&m, false).unwrap();
+        let bob = [4; 16];
+        s.receipt(&m.author, &m.id, &bob, Status::Delivered, 100, 1)
+            .unwrap();
+        s.receipt(&m.author, &m.id, &bob, Status::Read, 200, 1)
+            .unwrap();
+        // A late, lower receipt changes nothing.
+        s.receipt(&m.author, &m.id, &bob, Status::Delivered, 300, 1)
+            .unwrap();
+        let t = s.receipt_times(&m.author, &m.id).unwrap();
+        assert_eq!(
+            t,
+            vec![ReceiptTimes {
+                account: bob,
+                level: Status::Read,
+                delivered_ms: Some(100),
+                read_ms: Some(200),
+                played_ms: None,
+            }]
+        );
+        // Read first (its delivery never told): delivered then too.
+        let carol = [5; 16];
+        s.receipt(&m.author, &m.id, &carol, Status::Read, 400, 2)
+            .unwrap();
+        let c = s
+            .receipt_times(&m.author, &m.id)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.account == carol)
+            .unwrap();
+        assert_eq!((c.delivered_ms, c.read_ms), (Some(400), Some(400)));
+    }
+
+    #[test]
+    fn deleting_a_chat_leaves_the_others() {
+        let mut s = Store::memory(&[1; 32]).unwrap();
+        let gone = msg(1, 9, 1, 10, "from a stranger");
+        let kept = msg(2, 8, 2, 11, "from a friend");
+        s.insert_message(&gone, true).unwrap();
+        s.insert_message(&kept, true).unwrap();
+        s.receipt(&gone.author, &gone.id, &[3; 16], Status::Read, 5, 1)
+            .unwrap();
+        s.clear_chat(&[1; 16]).unwrap();
+        assert_eq!(s.chats().unwrap().len(), 2);
+        assert!(s.message(&gone.author, &gone.id).unwrap().is_none());
+        s.delete_chat(&[1; 16]).unwrap();
+        let chats = s.chats().unwrap();
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].id, [2; 16]);
+        assert!(s.message(&gone.author, &gone.id).unwrap().is_none());
+        assert!(s.message(&kept.author, &kept.id).unwrap().is_some());
+        assert_eq!(s.receipt_times(&gone.author, &gone.id).unwrap(), Vec::new());
+        s.delete_message(&kept.author, &kept.id).unwrap();
+        assert!(s.message(&kept.author, &kept.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn messages_are_stored_once_and_status_only_moves_forward() {
+        let mut s = Store::memory(&[1; 32]).unwrap();
+        let m = msg(1, 2, 3, 10, "hello");
+        assert!(s.insert_message(&m, false).unwrap());
+        assert!(!s.insert_message(&m, false).unwrap());
+        assert!(s.advance(&m.author, &m.id, Status::Sent).unwrap());
+        assert!(s.advance(&m.author, &m.id, Status::Read).unwrap());
+        assert!(!s.advance(&m.author, &m.id, Status::Delivered).unwrap());
+        assert_eq!(
+            s.message(&m.author, &m.id).unwrap().unwrap().status,
+            Status::Read
+        );
+        let f = msg(1, 2, 4, 11, "x");
+        s.insert_message(&f, false).unwrap();
+        assert!(s.advance(&f.author, &f.id, Status::Failed).is_ok());
+        assert!(!s.advance(&f.author, &f.id, Status::Failed).unwrap());
+    }
+
+    #[test]
+    fn chats_pages_search_and_read_marks() {
+        let mut s = Store::memory(&[1; 32]).unwrap();
+        for i in 0..5u8 {
+            s.insert_message(
+                &msg(1, 9, i, u64::from(i) * 10, &format!("hello number {i}")),
+                true,
+            )
+            .unwrap();
+        }
+        s.insert_message(&msg(2, 8, 50, 1, "Bună ziua"), true)
+            .unwrap();
+        let chats = s.chats().unwrap();
+        assert_eq!(chats.len(), 2);
+        assert_eq!(chats[0].unread, 5);
+        assert_eq!(chats[0].preview, "hello number 4");
+        let page = s.messages(&[1; 16], Some(30), 2).unwrap();
+        assert_eq!(page.iter().map(|m| m.id[0]).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(s.search("buna", 10).unwrap().len(), 1, "diacritics folded");
+        assert_eq!(
+            s.search("number \"", 10).unwrap().len(),
+            5,
+            "input is never FTS syntax"
+        );
+        s.set_text(&[9; 16], &[0; 16], "edited").unwrap();
+        assert_eq!(s.search("edited", 10).unwrap().len(), 1);
+        assert_eq!(s.mark_read(&[1; 16], &[0; 16]).unwrap().len(), 5);
+        assert_eq!(
+            s.chats()
+                .unwrap()
+                .iter()
+                .find(|c| c.id == [1; 16])
+                .unwrap()
+                .unread,
+            0
+        );
+    }
+
+    #[test]
+    fn receipts_take_the_lowest_level_of_every_recipient() {
+        let mut s = Store::memory(&[1; 32]).unwrap();
+        let m = msg(1, 2, 3, 10, "x");
+        s.insert_message(&m, false).unwrap();
+        s.advance(&m.author, &m.id, Status::Sent).unwrap();
+        s.receipt(&m.author, &m.id, &[5; 16], Status::Read, 1, 2)
+            .unwrap();
+        assert_eq!(
+            s.message(&m.author, &m.id).unwrap().unwrap().status,
+            Status::Sent
+        );
+        s.receipt(&m.author, &m.id, &[6; 16], Status::Delivered, 2, 2)
+            .unwrap();
+        assert_eq!(
+            s.message(&m.author, &m.id).unwrap().unwrap().status,
+            Status::Delivered
+        );
+        s.receipt(&m.author, &m.id, &[6; 16], Status::Read, 3, 2)
+            .unwrap();
+        assert_eq!(
+            s.message(&m.author, &m.id).unwrap().unwrap().status,
+            Status::Read
+        );
+    }
+
+    #[test]
+    fn identities_pin_and_device_lists_never_roll_back() {
+        let s = Store::memory(&[1; 32]).unwrap();
+        let a = [1u8; 16];
+        assert!(s.pin_account(&a, &[2; 32]).unwrap());
+        assert!(s.pin_account(&a, &[2; 32]).unwrap());
+        assert!(!s.pin_account(&a, &[3; 32]).unwrap());
+        s.set_devices(&a, 2, &[([4; 16], [5; 32]), ([6; 16], [7; 32])])
+            .unwrap();
+        assert_eq!(
+            s.set_devices(&a, 3, &[([4; 16], [5; 32])]).unwrap(),
+            vec![[6; 16]]
+        );
+        assert_eq!(s.set_devices(&a, 2, &[]).unwrap_err(), Error::Verify);
+        assert_eq!(s.devices(&a).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn keys_and_sessions_survive_a_reopen() {
+        let s = Store::memory(&[1; 32]).unwrap();
+        let local = Local {
+            account: [1; 16],
+            device: [2; 16],
+            identity: X25519Pair::generate().unwrap(),
+        };
+        s.save_local(&local).unwrap();
+        let mut p = Prekeys::default();
+        p.upload(&local, true, 3, 3).unwrap();
+        s.save_prekeys(&p).unwrap();
+        assert_eq!(
+            s.local().unwrap().unwrap().identity.public(),
+            local.identity.public()
+        );
+        assert_eq!(s.prekeys().unwrap().counts(), (3, 3));
+        assert_eq!(s.sessions().unwrap().addresses().count(), 0);
+        s.outbox_put(&[1; 16], &[2; 16], &[3; 16], b"c", 5).unwrap();
+        assert_eq!(s.outbox().unwrap().len(), 1);
+        s.outbox_done(&[1; 16]).unwrap();
+        assert_eq!(s.outbox().unwrap().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    #![allow(clippy::unwrap_used, reason = "tests")]
+    use super::*;
+
+    #[test]
+    fn a_block_before_any_key_does_not_fake_an_identity_change() {
+        let s = Store::memory(&[1; 32]).unwrap();
+        let a = [9u8; 16];
+        s.set_blocked(&a, true).unwrap();
+        assert!(s.is_blocked(&a).unwrap());
+        assert_eq!(s.account_key(&a).unwrap(), None);
+        assert!(s.pin_account(&a, &[3; 32]).unwrap());
+        assert!(s.pin_account(&a, &[3; 32]).unwrap());
+        assert!(s.is_blocked(&a).unwrap());
+        s.set_blocked(&a, false).unwrap();
+        assert!(!s.is_blocked(&a).unwrap());
+    }
+}

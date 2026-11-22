@@ -22,6 +22,16 @@ pub const MAX_LINKED: usize = 4;
 
 /// The safety-number screen for a contact, pushed.
 pub fn safety_number(contact: ContactId) {
+    if crate::backend::chat::owns(contact) {
+        // A real contact: the number comes from both accounts' identity keys (app-core).
+        crate::backend::chat::open_safety(contact);
+        return;
+    }
+    push_safety(contact);
+}
+
+/// Pushes the safety-number screen with what the store holds for `contact`.
+pub fn push_safety(contact: ContactId) {
     nav::push(format!("safety:{contact}"), move || {
         page("Safety number", safety_body(contact))
     });
@@ -111,6 +121,15 @@ fn safety_body(contact: ContactId) -> AnyElement {
                 .role(AccessibilityRole::Header),
         )
         .child(when(key_changed, move || banner(Tone::Info, Icon::Info, changed_note.clone())))
+        .child(when(
+            move || key_changed() && crate::backend::chat::owns(contact),
+            move || {
+                btn("Accept the new safety number", Variant::Secondary, BtnSize::Md, move || {
+                    crate::backend::chat::accept_identity(contact);
+                })
+                .into_element()
+            },
+        ))
         .child(
             card()
                 .gap_5()
@@ -223,8 +242,7 @@ fn scan_sheet(
                             }
                         },
                     );
-                    // mock: the demo camera of a preview build shows their code (app-core
-                    // compares fingerprints).
+                    // demo: a preview build's demo camera shows their code.
                     crate::camera::demo_shows(codes::safety_code(&number));
                     dynamic(move || {
                         let r = result.get();
@@ -331,6 +349,8 @@ fn devices_here(devices: Vec<Device>) -> Vec<Device> {
 
 fn devices_body() -> AnyElement {
     let s = store();
+    // The account's real devices, from the server's list.
+    crate::backend::refresh_device_list(s);
     let link_open = signal(false);
     let selected = signal(None::<Device>);
     let detail_open = signal(false);
@@ -434,7 +454,7 @@ fn link_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
                         }
                     },
                 );
-                // mock: the demo camera of a preview build shows a new device's code.
+                // The demo fixtures' camera shows a new device's code (nothing elsewhere).
                 crate::camera::demo_shows(codes::link_code(&[0x5B; 16], &[0xC3; 32]));
                 let pin_note = move || {
                     when(
@@ -471,10 +491,7 @@ fn link_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
                                     .child(
                                         btn("Link device", Variant::Primary, BtnSize::Md, move || {
                                             if !(crate::backend::is_live() && crate::backend::registered()) {
-                                                // mock: the preview's device list.
-                                                let name = s.link_scanned_device();
-                                                open.set(false);
-                                                toast(format!("{name} is linked"));
+                                                toast("Sign up on this device first, then link others to it.");
                                                 return;
                                             }
                                             linking.set(true);
@@ -651,15 +668,16 @@ mod camera_flow {
             .find(|t| t.starts_with("devices: "))
             .map(ToString::to_string);
         assert_eq!(before, after_scan, "nothing is linked before the press");
+        // This test device has no account: nothing is invented, and it says why.
         app.press("Link device")?;
-        app.wait_for_gone("Link a new device?", std::time::Duration::from_secs(2))?;
+        app.settle();
         let after = app
             .screen()
             .texts()
             .iter()
             .find(|t| t.starts_with("devices: "))
             .map(ToString::to_string);
-        assert_ne!(before, after, "linked after the press");
+        assert_eq!(before, after, "no device without an account");
         Ok(())
     }
 }

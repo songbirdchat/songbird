@@ -8,21 +8,23 @@
 //!
 //! What a backup holds today: the account (when registered: its ID, the account identity key's
 //! seed, the username and the record store's key), the profile, every synced and device-only
-//! setting, saved contacts, and the chats and messages of the store. mock: chats and messages are
-//! the in-memory mock's until app-core (A2); a message's content is its text (or its preview for
-//! other kinds), and a restored message comes back as text.
+//! setting and saved contacts; for a real account, every chat and message app-core keeps, as its
+//! `Content` protobuf, with the files this device has when "Include media" is on (D-0165: read on
+//! the backup's own thread from a second connection to app-core's store, and put back into it on
+//! restore). Chats only the app shows (the walkthrough's) are kept with their text.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use nsh_core::{prelude::*, storage::Storage};
+use super::vault::Storage;
+use nsh_core::prelude::*;
 use serde_json::Value;
 use songbird_backup_format::object::Seen;
 use songbird_backup_format::reader::{Backup, MemoryStaging};
 use songbird_backup_format::schema::{self, Platform, record::Body as Rec};
 use songbird_backup_format::{BackupKeys, OsRng, RecoveryKey};
-use songbird_backup_storage::http::{Http, HyperHttp, Request};
+use songbird_backup_storage::http::{Http, Request};
 use songbird_backup_storage::local::LocalStore;
 use songbird_backup_storage::run::{self, Options, RunError};
 use songbird_backup_storage::s3::{S3Config, S3Store};
@@ -43,8 +45,8 @@ const K_SEEN: &str = "sb.backup_seen";
 
 // ---------------------------------------------------------------- the recovery key
 
-/// This device's recovery key, made the first time it is asked for. mock: the device's
-/// keychain through app-core (A0) will hold it; NSH's app storage stands in.
+/// This device's recovery key, made the first time it is asked for; sealed under the
+/// platform's secure store by the vault (`vault::Storage`, D-0172).
 pub fn recovery_key() -> RecoveryKey {
     if let Some(k) = Storage::get_item(K_RECOVERY)
         .and_then(|h| wire::unhex(&h))
@@ -68,32 +70,201 @@ pub fn shown_key() -> String {
     recovery_key().display().to_string()
 }
 
-fn seen(keys: &BackupKeys) -> Option<Seen> {
+/// Where the rollback state of a backup at `dest` is kept: per destination, since each
+/// destination's backup has its own generations (D-0165).
+fn seen_key(keys: &BackupKeys, dest: BackupDestination) -> String {
+    format!("{}/{dest:?}", wire::hex(&keys.vault_id))
+}
+
+fn seen(keys: &BackupKeys, dest: BackupDestination) -> Option<Seen> {
     let v: Value = serde_json::from_str(&Storage::get_item(K_SEEN)?).ok()?;
-    let e = &v[wire::hex(&keys.vault_id)];
+    let e = &v[seen_key(keys, dest)];
     Some(Seen {
         generation: e["g"].as_u64()?,
         hash: wire::unhex(e["h"].as_str()?)?.try_into().ok()?,
     })
 }
 
-fn save_seen(keys: &BackupKeys, s: Seen) {
+fn save_seen(keys: &BackupKeys, dest: BackupDestination, s: Seen) {
     let mut v: Value = Storage::get_item(K_SEEN)
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_else(|| serde_json::json!({}));
-    v[wire::hex(&keys.vault_id)] = serde_json::json!({"g": s.generation, "h": wire::hex(&s.hash)});
+    v[seen_key(keys, dest)] = serde_json::json!({"g": s.generation, "h": wire::hex(&s.hash)});
     put(K_SEEN, &v.to_string());
 }
 
-fn forget_seen(keys: &BackupKeys) {
+fn forget_seen(keys: &BackupKeys, dest: BackupDestination) {
     if let Some(mut v) =
         Storage::get_item(K_SEEN).and_then(|t| serde_json::from_str::<Value>(&t).ok())
     {
         if let Some(o) = v.as_object_mut() {
-            o.remove(&wire::hex(&keys.vault_id));
+            o.remove(&seen_key(keys, dest));
         }
         put(K_SEEN, &v.to_string());
     }
+}
+
+// ---------------------------------------------------------------- the backup settings (D-0165)
+
+const K_CONFIG: &str = "sb.backup_config";
+
+/// "just now", "5 minutes ago", "3 hours ago", "2 days ago".
+#[must_use]
+pub fn ago(ms: u64) -> String {
+    let now = nsh_core::time::unix_ms() as u64;
+    let m = now.saturating_sub(ms) / 60_000;
+    match m {
+        0 => "just now".into(),
+        1 => "a minute ago".into(),
+        2..=59 => format!("{m} minutes ago"),
+        60..=119 => "an hour ago".into(),
+        120..=1439 => format!("{} hours ago", m / 60),
+        1440..=2879 => "yesterday".into(),
+        _ => format!("{} days ago", m / 1440),
+    }
+}
+
+fn dest_code(d: BackupDestination) -> String {
+    format!("{d:?}")
+}
+
+fn dest_from(code: &str) -> Option<BackupDestination> {
+    use BackupDestination::*;
+    [
+        SongbirdServers,
+        EncryptedFile,
+        ICloudDrive,
+        GoogleDrive,
+        OneDrive,
+        Dropbox,
+        Nextcloud,
+        S3,
+    ]
+    .into_iter()
+    .find(|d| dest_code(*d) == code)
+}
+
+/// Saves the backup settings on this device: on or off, where, how often, media, the second
+/// copy, the last backup's time and size, and the destination's sign-in. Device-only (each
+/// device backs up its own way); the passwords sit with this device's other secrets (the
+/// recovery key, the store key) and move to the keychain with them.
+fn save_config(s: Store) {
+    let x = s.settings.get_untracked();
+    let b = s.backup_extra().get_untracked();
+    let v = serde_json::json!({
+        "on": x.backup_on,
+        "dest": dest_code(x.backup_destination),
+        "media": x.backup_include_media,
+        "size": x.backup_size,
+        "freq": match b.frequency {
+            crate::store::ext_onboarding::Frequency::Daily => "d",
+            crate::store::ext_onboarding::Frequency::Weekly => "w",
+            crate::store::ext_onboarding::Frequency::Monthly => "m",
+        },
+        "second": b.second.map(dest_code),
+        "last": b.last_ms,
+        "nc": [b.nextcloud_url, b.nextcloud_user, b.nextcloud_password],
+        "s3": [b.s3_endpoint, b.s3_bucket, b.s3_region, b.s3_key, b.s3_secret],
+    });
+    put(K_CONFIG, &v.to_string());
+}
+
+fn load_config(s: Store) {
+    use crate::store::ext_onboarding::Frequency;
+    let Some(v) = Storage::get_item(K_CONFIG).and_then(|t| serde_json::from_str::<Value>(&t).ok())
+    else {
+        return;
+    };
+    let text = |v: &Value| v.as_str().unwrap_or_default().to_owned();
+    s.settings_update(|x| {
+        x.backup_on = v["on"].as_bool().unwrap_or(false);
+        if let Some(d) = v["dest"].as_str().and_then(dest_from) {
+            x.backup_destination = d;
+        }
+        x.backup_include_media = v["media"].as_bool().unwrap_or(true);
+        x.backup_size = text(&v["size"]);
+        x.backup_daily = v["freq"] == "d";
+    });
+    let last = v["last"].as_u64().unwrap_or(0);
+    s.settings_update(|x| x.backup_last = (last > 0).then(|| ago(last)));
+    s.backup_extra().update(|b| {
+        b.frequency = match v["freq"].as_str() {
+            Some("w") => Frequency::Weekly,
+            Some("m") => Frequency::Monthly,
+            _ => Frequency::Daily,
+        };
+        b.second = v["second"].as_str().and_then(dest_from);
+        b.last_ms = last;
+        b.nextcloud_url = text(&v["nc"][0]);
+        b.nextcloud_user = text(&v["nc"][1]);
+        b.nextcloud_password = text(&v["nc"][2]);
+        b.s3_endpoint = text(&v["s3"][0]);
+        b.s3_bucket = text(&v["s3"][1]);
+        b.s3_region = text(&v["s3"][2]);
+        b.s3_key = text(&v["s3"][3]);
+        b.s3_secret = text(&v["s3"][4]);
+    });
+}
+
+/// Runs a backup when one is due by the chosen frequency (and none is running).
+fn run_if_due(s: Store) {
+    let (on, ready) = s
+        .settings
+        .with_untracked(|x| (x.backup_on, available(x.backup_destination)));
+    let b = s.backup_extra().get_untracked();
+    let now = nsh_core::time::unix_ms() as u64;
+    if on
+        && ready
+        && b.running.is_none()
+        && now.saturating_sub(b.last_ms) >= b.frequency.period_ms()
+    {
+        s.back_up_now();
+    }
+    // Keeps "Last backup …" true as time passes.
+    if b.last_ms > 0 {
+        let label = Some(ago(b.last_ms));
+        if s.settings.with_untracked(|x| x.backup_last != label) {
+            s.settings_update(|x| x.backup_last = label);
+        }
+    }
+}
+
+/// Loads the backup settings, saves them as they change, and backs up on schedule: at start
+/// (a minute in, once the connection is up) and every ten minutes after. Called once at the
+/// root.
+pub fn install(s: Store) {
+    load_config(s);
+    let extra = s.backup_extra();
+    effect(move || {
+        s.settings.with(|x| {
+            (
+                x.backup_on,
+                x.backup_destination,
+                x.backup_include_media,
+                x.backup_size.clone(),
+            )
+        });
+        extra.with(|b| {
+            (
+                b.frequency,
+                b.second,
+                b.last_ms,
+                b.nextcloud_url.clone(),
+                b.nextcloud_user.clone(),
+                b.nextcloud_password.clone(),
+                b.s3_endpoint.clone(),
+                b.s3_bucket.clone(),
+                b.s3_region.clone(),
+                b.s3_key.clone(),
+                b.s3_secret.clone(),
+            )
+        });
+        untracked(|| save_config(s));
+    });
+    Owner::detached().run(|| {
+        set_timeout(std::time::Duration::from_secs(60), move || run_if_due(s));
+        set_interval(std::time::Duration::from_secs(600), move || run_if_due(s));
+    });
 }
 
 // ---------------------------------------------------------------- where backups go
@@ -102,7 +273,7 @@ fn forget_seen(keys: &BackupKeys) {
 /// device (the account's main phone), **blinded**, so the vault never learns the account. The
 /// token key is pinned the first time this process sees it; release builds ship it (A12).
 struct AppPasses {
-    http: Arc<HyperHttp>,
+    http: Arc<super::tunnel::AppHttp>,
     api: String,
     device: [u8; 16],
     seed: Zeroizing<[u8; 32]>,
@@ -267,10 +438,7 @@ impl AppPasses {
 /// Keeps vault day passes ahead when backups go to Songbird's servers (start-up only).
 pub async fn prefetch_passes() -> Result<(), Problem> {
     let (device, seed) = super::device_key().ok_or_else(|| problem("Not registered."))?;
-    let http = Arc::new(
-        HyperHttp::new(&[])
-            .map_err(|_| problem("This device couldn't start a secure connection."))?,
-    );
+    let http = Arc::new(super::tunnel::AppHttp::new()?);
     let ep = endpoint();
     AppPasses {
         http,
@@ -377,10 +545,7 @@ fn store_for(
     keys: &BackupKeys,
     write: bool,
 ) -> Result<Arc<dyn BackupStore>, Problem> {
-    let http = Arc::new(
-        HyperHttp::new(&[])
-            .map_err(|_| problem("This device couldn't start a secure connection."))?,
-    );
+    let http = Arc::new(super::tunnel::AppHttp::new()?);
     match dest {
         BackupDestination::SongbirdServers => {
             if !super::is_live() {
@@ -484,6 +649,12 @@ fn explain_store(e: &RunError) -> Problem {
 #[derive(Clone, Default)]
 pub struct Snapshot {
     records: Vec<Rec>,
+    /// app-core's store, read on the backup's thread (a real account's chats and messages).
+    core: Option<(PathBuf, Zeroizing<[u8; 32]>)>,
+    /// Real chats' list state: (chat, title, archived, pinned, muted until).
+    real: Vec<([u8; 16], String, bool, bool, u64)>,
+    /// Whether the files this device has go in too.
+    media: bool,
     /// Messages and chats, for the counts the screens show.
     pub messages: u32,
     pub chats: u32,
@@ -503,7 +674,11 @@ fn id16(n: u64) -> Vec<u8> {
     b
 }
 
+/// A UI ID from a backup's 16 bytes; `None` for app-core's (random) IDs.
 fn from16(b: &[u8]) -> Option<u64> {
+    if b.len() != 16 || b.get(..8)? != [0u8; 8] {
+        return None;
+    }
     let tail: [u8; 8] = b.get(8..16)?.try_into().ok()?;
     Some(u64::from_be_bytes(tail))
 }
@@ -567,8 +742,26 @@ pub fn snapshot(s: Store) -> Snapshot {
             ..schema::Contact::default()
         }));
     }
+    let core = if registered() {
+        super::chat::core_db(false)
+    } else {
+        None
+    };
     let chats = s.chats.get_untracked();
+    let mut real = Vec::new();
     for c in &chats {
+        if core.is_some()
+            && let Some(id) = super::chat::core_chat(c.id)
+        {
+            real.push((
+                id,
+                c.title.clone(),
+                c.archived,
+                c.pinned,
+                if c.muted { c.muted_until } else { 0 },
+            ));
+            continue;
+        }
         let kind = match c.kind {
             ChatKind::Direct(_) | ChatKind::WhatsApp(_) => schema::ChatKind::Direct,
             ChatKind::Group | ChatKind::Community => schema::ChatKind::Group,
@@ -580,13 +773,17 @@ pub fn snapshot(s: Store) -> Snapshot {
             title: c.title.clone(),
             archived: c.archived,
             pinned: c.pinned,
-            muted_until_ms: if c.muted { u64::MAX } else { 0 },
+            muted_until_ms: if c.muted { c.muted_until } else { 0 },
             ..schema::Chat::default()
         }));
     }
-    let mut messages: Vec<Message> = s
-        .messages
-        .with_untracked(|m| m.values().flatten().cloned().collect());
+    let mut messages: Vec<Message> = s.messages.with_untracked(|m| {
+        m.values()
+            .flatten()
+            .filter(|m| core.is_none() || !super::chat::owns(m.chat))
+            .cloned()
+            .collect()
+    });
     messages.sort_by_key(|m| (m.at, m.chat, m.id));
     let n = u32::try_from(messages.len()).unwrap_or(u32::MAX);
     for m in messages {
@@ -606,10 +803,19 @@ pub fn snapshot(s: Store) -> Snapshot {
             ..schema::Message::default()
         }));
     }
+    // The real messages a backup keeps, counted for the progress bar.
+    let kept = core
+        .as_ref()
+        .and_then(|(path, key)| songbird_app_core::store::Store::open(path, key).ok())
+        .and_then(|st| st.backup_count().ok())
+        .unwrap_or(0);
     Snapshot {
         records,
-        messages: n,
+        messages: n.saturating_add(kept),
         chats: u32::try_from(chats.len()).unwrap_or(u32::MAX),
+        core,
+        real,
+        media: s.settings.with_untracked(|x| x.backup_include_media),
     }
 }
 
@@ -617,6 +823,8 @@ pub fn snapshot(s: Store) -> Snapshot {
 #[derive(Clone, Default)]
 pub struct Restored {
     records: Vec<Rec>,
+    /// Media by reference (small and streamed), for app-core's files.
+    media: Arc<std::collections::HashMap<[u8; 32], Zeroizing<Vec<u8>>>>,
     pub messages: u32,
     pub chats: u32,
 }
@@ -707,7 +915,7 @@ pub fn apply(s: Store, r: &Restored) {
                     chat,
                     from: from16(&m.sender),
                     body: Body::Text(String::from_utf8_lossy(&m.content).into_owned()),
-                    at: i64::try_from(m.sent_ms / 60_000).unwrap_or(0),
+                    at: crate::store::minutes_of_ms(m.sent_ms),
                     status: Tick::Read,
                     reply_to: None,
                     reactions: vec![],
@@ -735,9 +943,269 @@ fn write_all(
     snap: Snapshot,
     done: &AtomicU32,
 ) -> Result<(), songbird_backup_format::Error> {
-    for (i, r) in snap.records.into_iter().enumerate() {
+    let mut n = 0u32;
+    let mut count = || {
+        n = n.saturating_add(1);
+        done.store(n, Ordering::Relaxed);
+    };
+    // Messages come after every chat (the canonical order): the app's own first, then app-core's.
+    let (head, tail): (Vec<Rec>, Vec<Rec>) = snap
+        .records
+        .into_iter()
+        .partition(|r| !matches!(r, Rec::Message(_)));
+    for r in head {
         w.record(r)?;
-        done.store(u32::try_from(i + 1).unwrap_or(u32::MAX), Ordering::Relaxed);
+        count();
+    }
+    let core = snap.core.as_ref().map(|(path, key)| {
+        songbird_app_core::store::Store::open(path, key)
+            .map_err(|_| songbird_backup_format::Error::Store("messages".into()))
+    });
+    let core = core.transpose()?;
+    if let Some(st) = &core {
+        let chats = st
+            .backup_chats()
+            .map_err(|_| songbird_backup_format::Error::Store("chats".into()))?;
+        for (id, group) in chats {
+            let state = snap.real.iter().find(|r| r.0 == id);
+            w.record(Rec::Chat(schema::Chat {
+                chat_id: id.to_vec(),
+                kind: if group {
+                    schema::ChatKind::Group
+                } else {
+                    schema::ChatKind::Direct
+                }
+                .into(),
+                title: state.map(|r| r.1.clone()).unwrap_or_default(),
+                archived: state.is_some_and(|r| r.2),
+                pinned: state.is_some_and(|r| r.3),
+                muted_until_ms: state.map_or(0, |r| r.4),
+                ..schema::Chat::default()
+            }))?;
+            count();
+        }
+    }
+    for r in tail {
+        w.record(r)?;
+        count();
+    }
+    if let Some(st) = &core {
+        let mut failed = None;
+        let r = st.backup_messages(|k| {
+            let mut refs = Vec::new();
+            if snap.media {
+                let pointers = songbird_app_core::messenger::attachments_of(&k.row.content);
+                for idx in &k.files {
+                    let Ok(Some(bytes)) = st.file(&k.row.author, &k.row.id, *idx) else {
+                        continue;
+                    };
+                    let p = usize::try_from(*idx).ok().and_then(|i| pointers.get(i));
+                    let meta = schema::Media {
+                        mime: p.map(|p| p.content_type.clone()).unwrap_or_default(),
+                        file_name: p.map(|p| p.file_name.clone()).unwrap_or_default(),
+                        width: p.map_or(0, |p| p.width),
+                        height: p.map_or(0, |p| p.height),
+                        duration_ms: p.map_or(0, |p| p.duration_ms),
+                        ..schema::Media::default()
+                    };
+                    match w.media(meta, &mut bytes.as_slice()) {
+                        Ok(r) => refs.push(r.to_vec()),
+                        Err(e) => {
+                            failed = Some(e);
+                            return Err(songbird_app_core::Error::Storage);
+                        }
+                    }
+                }
+            }
+            let rec = Rec::Message(schema::Message {
+                chat_id: k.row.chat.to_vec(),
+                message_id: k.row.id.to_vec(),
+                sender: k.row.author.to_vec(),
+                sent_ms: k.row.sent_ms,
+                received_ms: k.row.stored_ms,
+                content: k.row.content,
+                media: refs,
+                status: core_status(k.row.status).into(),
+                starred: false,
+            });
+            if let Err(e) = w.record(rec) {
+                failed = Some(e);
+                return Err(songbird_app_core::Error::Storage);
+            }
+            count();
+            Ok(())
+        });
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        r.map_err(|_| songbird_backup_format::Error::Store("messages".into()))?;
+    }
+    Ok(())
+}
+
+fn core_status(s: songbird_app_core::store::Status) -> schema::MessageStatus {
+    use songbird_app_core::store::Status as S;
+    match s {
+        S::Failed => schema::MessageStatus::Failed,
+        S::Sending => schema::MessageStatus::Unknown,
+        S::Sent => schema::MessageStatus::Sent,
+        S::Delivered => schema::MessageStatus::Delivered,
+        S::Read | S::Played => schema::MessageStatus::Read,
+    }
+}
+
+fn status_of(s: i32) -> songbird_app_core::store::Status {
+    use songbird_app_core::store::Status as S;
+    match schema::MessageStatus::try_from(s) {
+        Ok(schema::MessageStatus::Sent) => S::Sent,
+        Ok(schema::MessageStatus::Delivered | schema::MessageStatus::Received) => S::Delivered,
+        Ok(schema::MessageStatus::Read) => S::Read,
+        // A send that never finished is put back failed, so the user can see and retry it.
+        _ => S::Failed,
+    }
+}
+
+/// Every media file of a verified backup, by reference.
+fn media_of(
+    b: &Backup<'_>,
+) -> Result<std::collections::HashMap<[u8; 32], Zeroizing<Vec<u8>>>, songbird_backup_format::Error>
+{
+    use std::io::Read as _;
+    let mut out = std::collections::HashMap::new();
+    for blob in b.blobs() {
+        let (r, bytes) = blob?;
+        out.insert(r, Zeroizing::new(bytes.to_vec()));
+    }
+    for r in b.media_streams() {
+        if let Some(mut s) = b.media(&r) {
+            let mut v = Zeroizing::new(Vec::new());
+            s.read_to_end(&mut v)?;
+            s.finish()?;
+            out.insert(r, v);
+        }
+    }
+    Ok(out)
+}
+
+/// Writes restored chats, messages and their files into app-core's store.
+fn import_into(
+    st: &mut songbird_app_core::store::Store,
+    groups: &[([u8; 16], bool)],
+    messages: &[schema::Message],
+    media: &std::collections::HashMap<[u8; 32], Zeroizing<Vec<u8>>>,
+) -> songbird_app_core::Result<()> {
+    for (id, group) in groups {
+        st.restore_chat(id, *group)?;
+    }
+    for m in messages {
+        let (Ok(chat), Ok(author), Ok(id)) = (
+            <[u8; 16]>::try_from(m.chat_id.as_slice()),
+            <[u8; 16]>::try_from(m.sender.as_slice()),
+            <[u8; 16]>::try_from(m.message_id.as_slice()),
+        ) else {
+            continue;
+        };
+        // One message the format refuses (a timer, view-once) is skipped, not fatal.
+        match st.restore_message(
+            &chat,
+            &author,
+            &m.content,
+            m.received_ms,
+            status_of(m.status),
+        ) {
+            Ok(_) | Err(songbird_app_core::Error::Malformed) => {}
+            Err(e) => return Err(e),
+        }
+        for (idx, r) in m.media.iter().enumerate() {
+            let (Ok(r), Ok(idx)) = (<[u8; 32]>::try_from(r.as_slice()), u32::try_from(idx)) else {
+                continue;
+            };
+            if let Some(bytes) = media.get(&r) {
+                st.put_file(&author, &id, idx, bytes)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Puts a restored real account's chats, messages and files back into app-core's store (on
+/// this device's own key; a new device's store is made here), then shows them. Chats the
+/// backup kept for the app alone are [`apply`]'s.
+pub async fn import_core(s: Store, r: &Restored) -> Result<(), Problem> {
+    let real_chats: Vec<schema::Chat> = r
+        .records
+        .iter()
+        .filter_map(|x| match x {
+            Rec::Chat(c) if from16(&c.chat_id).is_none() => Some(c.clone()),
+            _ => None,
+        })
+        .collect();
+    let real_messages: Vec<schema::Message> = r
+        .records
+        .iter()
+        .filter_map(|x| match x {
+            Rec::Message(m) if from16(&m.chat_id).is_none() => Some(m.clone()),
+            _ => None,
+        })
+        .collect();
+    if real_chats.is_empty() && real_messages.is_empty() {
+        return Ok(());
+    }
+    let (path, key) = super::chat::core_db(true)
+        .ok_or_else(|| problem("This device has no place to keep messages."))?;
+    let media = Arc::clone(&r.media);
+    let groups_restored: Vec<([u8; 16], bool)> = real_chats
+        .iter()
+        .filter_map(|c| {
+            let id: [u8; 16] = c.chat_id.as_slice().try_into().ok()?;
+            Some((id, c.kind == i32::from(schema::ChatKind::Group)))
+        })
+        .collect();
+    // Held while writing: app-core doesn't open (and migrate) the same store meanwhile.
+    let lock = super::chat::core();
+    let held = lock.lock().await;
+    let groups: Vec<([u8; 16], bool)> = real_chats
+        .iter()
+        .filter_map(|c| {
+            let id: [u8; 16] = c.chat_id.as_slice().try_into().ok()?;
+            Some((id, c.kind == i32::from(schema::ChatKind::Group)))
+        })
+        .collect();
+    background(async move {
+        tokio::task::spawn_blocking(move || {
+            let mut st = songbird_app_core::store::Store::open(&path, &key)?;
+            import_into(&mut st, &groups, &real_messages, &media)?;
+            Ok::<_, songbird_app_core::Error>(())
+        })
+        .await
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .ok_or_else(|| problem("The restore stopped. Try again."))?
+    .map_err(|_| problem("Your messages couldn't be written on this device."))?;
+    drop(held);
+    super::chat::reload_all(s).await;
+    // The restored groups: this device joins them by external commit (D-0167).
+    for (id, group) in &groups_restored {
+        if *group {
+            super::group_sync::mark(s, id, true);
+        }
+    }
+    super::group_sync::join_missing(s);
+    // The list state the backup kept, on chats this device shows.
+    for c in &real_chats {
+        let Ok(id) = <[u8; 16]>::try_from(c.chat_id.as_slice()) else {
+            continue;
+        };
+        if let Some(ui) = super::chat::ui_chat(s, &id) {
+            s.edit_chat(ui, |x| {
+                x.archived = c.archived;
+                x.pinned = c.pinned;
+                x.muted = c.muted_until_ms > 0;
+                x.muted_until = c.muted_until_ms;
+            });
+        }
     }
     Ok(())
 }
@@ -762,21 +1230,20 @@ fn options() -> Options {
     }
 }
 
-/// Backs the snapshot up to `dest`; `done` counts records written. Returns `(new chunks,
-/// bytes uploaded)`.
+/// Backs the snapshot up to `dest`; `done` counts records written. Returns what it cost.
 pub async fn back_up(
     dest: BackupDestination,
     extra: BackupExtra,
     snap: Snapshot,
     done: Arc<AtomicU32>,
-) -> Result<(u64, u64), Problem> {
+) -> Result<songbird_backup_format::writer::Stats, Problem> {
     let key = recovery_key();
     let keys = Arc::new(
         key.derive()
             .map_err(|_| problem("The recovery key couldn't be read."))?,
     );
     let store = store_for(dest, &extra, &keys, true)?;
-    let previous = seen(&keys);
+    let previous = seen(&keys, dest);
     let opts = options();
     let k = Arc::clone(&keys);
     let result = background(async move {
@@ -786,8 +1253,8 @@ pub async fn back_up(
     .map_err(|_| problem("The backup stopped. Try again."))?;
     match result {
         Ok(d) => {
-            save_seen(&keys, d.seen);
-            Ok((d.stats.new_chunks, d.stats.new_bytes))
+            save_seen(&keys, dest, d.seen);
+            Ok(d.stats)
         }
         Err(e) => Err(explain_store(&e)),
     }
@@ -801,7 +1268,7 @@ pub async fn delete(dest: BackupDestination, extra: BackupExtra) -> Result<(), P
             .map_err(|_| problem("The recovery key couldn't be read."))?,
     );
     let store = store_for(dest, &extra, &keys, true)?;
-    forget_seen(&keys);
+    forget_seen(&keys, dest);
     background(async move { store.destroy().await })
         .await
         .map_err(|_| problem("Couldn't delete the backup. Try again."))?
@@ -820,7 +1287,7 @@ pub async fn fetch(
             .map_err(|_| problem("The recovery key couldn't be read."))?,
     );
     let store = store_for(dest, &extra, &keys, false)?;
-    let previous = seen(&keys);
+    let previous = seen(&keys, dest);
     let k = Arc::clone(&keys);
     let r = background(async move {
         let r = run::restore(store, Arc::clone(&k), previous, MemoryStaging::default(), 4).await?;
@@ -832,12 +1299,13 @@ pub async fn fetch(
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
-        Ok::<_, RunError>((records, r.opened.seen()))
+        let media = media_of(&b)?;
+        Ok::<_, RunError>((records, media, r.opened.seen()))
     })
     .await
     .map_err(|_| problem("The restore stopped. Try again."))?;
-    let (records, s) = r.map_err(|e| explain_store(&e))?;
-    save_seen(&keys, s);
+    let (records, media, s) = r.map_err(|e| explain_store(&e))?;
+    save_seen(&keys, dest, s);
     let messages = records
         .iter()
         .filter(|r| matches!(r, Rec::Message(_)))
@@ -845,6 +1313,7 @@ pub async fn fetch(
     let chats = records.iter().filter(|r| matches!(r, Rec::Chat(_))).count();
     Ok(Restored {
         records,
+        media: Arc::new(media),
         messages: u32::try_from(messages).unwrap_or(u32::MAX),
         chats: u32::try_from(chats).unwrap_or(u32::MAX),
     })
@@ -1012,7 +1481,11 @@ pub async fn transfer_listen() -> Result<(tokio::net::TcpListener, Code), Proble
 }
 
 /// What the new phone verified: the records and the old phone's `HELLO`.
-type Verified = (Vec<Rec>, Hello);
+type Verified = (
+    Vec<Rec>,
+    std::collections::HashMap<[u8; 32], Zeroizing<Vec<u8>>>,
+    Hello,
+);
 
 /// The new phone: waits for the old one; `codes` gets the 6-digit code to compare; then
 /// receives and verifies the backup, and returns it and the hand-over only once `confirmed`
@@ -1042,11 +1515,14 @@ pub async fn transfer_receive(
             else {
                 return false;
             };
-            let Ok(records) = Backup::new(&keys, &r.opened.manifest, &r.staging)
-                .records()
-                .map(|x| x.map(|r| r.body))
-                .collect::<Result<Vec<_>, _>>()
-            else {
+            let read = {
+                let b = Backup::new(&keys, &r.opened.manifest, &r.staging);
+                b.records()
+                    .map(|x| x.map(|r| r.body))
+                    .collect::<Result<Vec<_>, _>>()
+                    .and_then(|records| Ok((records, media_of(&b)?)))
+            };
+            let Ok((records, media)) = read else {
                 return false;
             };
             drop(r);
@@ -1055,7 +1531,7 @@ pub async fn transfer_receive(
                 return false;
             }
             *v2.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some((records.into_iter().flatten().collect(), h));
+                Some((records.into_iter().flatten().collect(), media, h));
             true
         })
         .await
@@ -1065,12 +1541,13 @@ pub async fn transfer_receive(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        got.map(|(records, _)| (records, hello)).ok_or("verify")
+        got.map(|(records, media, _)| (records, media, hello))
+            .ok_or("verify")
     })
     .await
     .map_err(|_| problem("The transfer stopped."))?
     .map_err(|_| problem("The transfer didn't finish, so nothing was changed on this phone."))?;
-    let (records, hello) = r;
+    let (records, media, hello) = r;
     let messages = records
         .iter()
         .filter(|r| matches!(r, Rec::Message(_)))
@@ -1079,6 +1556,7 @@ pub async fn transfer_receive(
     Ok((
         Restored {
             records,
+            media: Arc::new(media),
             messages: u32::try_from(messages).unwrap_or(u32::MAX),
             chats: u32::try_from(chats).unwrap_or(u32::MAX),
         },
@@ -1219,6 +1697,133 @@ mod tests {
 
     fn dir() -> PathBuf {
         DIR.lock().unwrap().clone().unwrap()
+    }
+
+    /// D-0165: a real account's chats, messages and files go into a backup from app-core's
+    /// store and come back into another store; disappearing and view-once messages don't, and
+    /// without "Include media" the files stay out.
+    #[test]
+    fn app_core_chats_and_media_round_trip_through_a_backup() {
+        use prost::Message as _;
+        use songbird_app_core::store::{Status, Store as CoreStore};
+        use songbird_content::schema::{
+            AttachmentPointer, Content, DataMessage, Message as Msg, Text, content, data_message,
+        };
+        let dir = test_folder("sb-core-backup");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.db");
+        let key = [3u8; 32];
+        let (chat, me) = ([7u8; 16], [8u8; 16]);
+        let msg = |id: u8, text: &str, timer: u32, photo: bool| {
+            Content {
+                required_version: 1,
+                message_id: vec![id; 16],
+                sent_at_ms: u64::from(id) * 1000,
+                body: Some(content::Body::Data(DataMessage {
+                    expire_timer_s: timer,
+                    kind: Some(data_message::Kind::Message(Msg {
+                        text: Some(Text {
+                            body: text.into(),
+                            ..Default::default()
+                        }),
+                        attachments: if photo {
+                            vec![AttachmentPointer {
+                                content_type: "image/png".into(),
+                                file_name: "p.png".into(),
+                                width: 4,
+                                height: 3,
+                                ..Default::default()
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }
+            .encode_to_vec()
+        };
+        {
+            let mut a = CoreStore::open(&path, &key).unwrap();
+            a.restore_chat(&chat, false).unwrap();
+            a.restore_message(&chat, &me, &msg(1, "hello", 0, false), 1, Status::Read)
+                .unwrap();
+            a.restore_message(&chat, &me, &msg(2, "look", 0, true), 2, Status::Read)
+                .unwrap();
+            a.put_file(&me, &[2; 16], 0, &[9u8; 3000]).unwrap();
+            // A disappearing message, stored as it arrives.
+            let c = msg(3, "gone soon", 60, false);
+            let row = songbird_app_core::store::MessageRow {
+                chat,
+                author: me,
+                id: [3; 16],
+                sent_ms: 3000,
+                stored_ms: 3,
+                text: "gone soon".into(),
+                content: c,
+                status: Status::Read,
+            };
+            a.insert_message(&row, false).unwrap();
+        }
+        let run_backup = |media: bool, folder: &std::path::Path| {
+            let keys = Arc::new(RecoveryKey::generate(&mut OsRng).unwrap().derive().unwrap());
+            let snap = Snapshot {
+                core: Some((path.clone(), Zeroizing::new(key))),
+                media,
+                ..Snapshot::default()
+            };
+            let store: Arc<dyn BackupStore> = Arc::new(LocalStore::new(folder));
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let done = Arc::new(AtomicU32::new(0));
+                run::backup(
+                    Arc::clone(&store),
+                    Arc::clone(&keys),
+                    None,
+                    options(),
+                    move |w| write_all(w, snap, &done),
+                )
+                .await
+                .unwrap();
+                let r = run::restore(store, Arc::clone(&keys), None, MemoryStaging::default(), 2)
+                    .await
+                    .unwrap();
+                let b = Backup::new(&keys, &r.opened.manifest, &r.staging);
+                let records: Vec<Rec> = b.records().map(|x| x.unwrap().body.unwrap()).collect();
+                (records, media_of(&b).unwrap())
+            })
+        };
+        let (records, media) = run_backup(true, &dir.join("with"));
+        let messages: Vec<schema::Message> = records
+            .iter()
+            .filter_map(|r| match r {
+                Rec::Message(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(messages.len(), 2, "the disappearing message stays out");
+        assert_eq!(messages[1].media.len(), 1);
+        assert_eq!(media.len(), 1);
+        let (_, without) = run_backup(false, &dir.join("without"));
+        assert!(without.is_empty(), "no media without Include media");
+
+        let mut b = CoreStore::open(&dir.join("b.db"), &[4u8; 32]).unwrap();
+        import_into(&mut b, &[(chat, false)], &messages, &media).unwrap();
+        let back = b.messages(&chat, None, 10).unwrap();
+        assert_eq!(
+            back.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            ["hello", "look"]
+        );
+        assert_eq!(
+            b.file(&me, &[2; 16], 0).unwrap().unwrap().as_slice(),
+            &[9u8; 3000][..]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Device A backs up to a folder; device B (another storage) wipes its chats and restores
@@ -1375,6 +1980,7 @@ mod tests {
             records,
             messages: 500,
             chats: 1,
+            ..Snapshot::default()
         };
         let (l, code) = transfer_listen().await.unwrap();
         let qr = code.to_qr().to_string();

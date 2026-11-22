@@ -111,7 +111,7 @@ pub(super) fn viewer_page(chat: ChatId, start: MsgId) -> Screen {
     on_key("right", move |_| go(1));
     on_key("plus", move |_| set_zoom(zoom.get_untracked() + 0.5));
     on_key("minus", move |_| set_zoom(zoom.get_untracked() - 0.5));
-    // mock: playback; the real player reports its position.
+    // The demo's stand-in playback (a real video's player keeps its own position).
     set_interval(Duration::from_millis(250), move || {
         if playing.get_untracked() {
             let secs = match s.message(chat, current.get_untracked()).map(|m| m.body) {
@@ -139,6 +139,11 @@ pub(super) fn viewer_page(chat: ChatId, start: MsgId) -> Screen {
     let has = move |delta: i32| step(&items.get(), current.get(), delta).is_some();
     let is_video =
         move || msg.with(|m| matches!(m.as_ref().map(|m| &m.body), Some(Body::Video { .. })));
+    // A real video plays in the platform's player with its own controls and position; only
+    // the demo's stand-in has the simulated scrubber (D-0184).
+    let demo_video = move || {
+        is_video() && !crate::backend::chat::is_media(current.get())
+    };
 
     let stage = view()
         .flex_1()
@@ -205,7 +210,7 @@ pub(super) fn viewer_page(chat: ChatId, start: MsgId) -> Screen {
                 .child(top_bar(s, msg, counter, zoom, set_zoom))
                 .child(stage)
                 .child(caption(msg))
-                .child(when(is_video, move || scrubber(msg, playing, position)))
+                .child(when(demo_video, move || scrubber(msg, playing, position)))
                 .child(action_bar(s, chat, msg, current, items, forward_open))
                 .child(app_sheet(
                     forward_open,
@@ -315,10 +320,20 @@ fn picture(
         ),
         _ => (1, 1, String::new(), false),
     };
-    // The same mock photo as the bubble and the media grid: the message's
-    // id is the seed, its own frame the shape.
+    // A real message shows its own photo (or plays its video); a demo one the same
+    // illustration as its bubble.
+    let real = crate::backend::chat::is_media(m.id);
     let (pw, ph) = (w.max(1), h.max(1));
-    let src = crate::ui::portrait::photo(&alt, m.id, pw, ph);
+    let src = if real {
+        crate::backend::chat::load_photo(m.id);
+        crate::backend::chat::media_src(m.id).unwrap_or_else(|| ImageSrc::from(""))
+    } else {
+        crate::ui::portrait::message_photo(&alt, m.id, pw, ph)
+    };
+    let playing_url = signal(None::<String>);
+    if real && video {
+        crate::backend::chat::media_file(m.id, move |url| playing_url.set(Some(url)));
+    }
     let fade = animated_value(if motion::reduced() { 1.0 } else { 0.0 });
     fade.timing(1.0, motion::BASE, Easing::EaseOut);
     let size = move || {
@@ -345,14 +360,33 @@ fn picture(
         } else {
             format!("Photo: {alt}")
         })
-        .child(
+        .child((!(real && video)).then(|| {
             image(src)
                 .absolute()
                 .inset_0()
                 .object_fit(ResizeMode::Cover)
-                .accessibility_elements_hidden(true),
-        )
-        .child(video.then(|| {
+                .accessibility_elements_hidden(true)
+        }))
+        // A real video plays in the platform's player, with its own controls.
+        .child((real && video).then(|| {
+            view().absolute().inset_0().child(dynamic(move || {
+                let url = playing_url.get();
+                untracked(move || match url {
+                    Some(u) => nsh_core::element::video(u)
+                        .controls(true)
+                        .absolute()
+                        .inset_0()
+                        .into_element(),
+                    None => view()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .child(crate::ui::muted("Loading…"))
+                        .into_element(),
+                })
+            }))
+        }))
+        .child((video && !real).then(|| {
             view().flex_1().items_center().justify_center().child(
                 press_surface(Press::OnDark, move || playing.update(|p| *p = !*p))
                     .accessibility_label(move || {
@@ -394,7 +428,7 @@ fn caption(msg: Memo<Option<Message>>) -> View {
     )
 }
 
-/// Mock scrubber: play or pause, position and length.
+/// The demo video's scrubber: play or pause, position and length.
 fn scrubber(msg: Memo<Option<Message>>, playing: Signal<bool>, position: Signal<f32>) -> View {
     let secs = move || match msg.with(|m| m.as_ref().map(|m| m.body.clone())) {
         Some(Body::Video { secs, .. }) => secs,
@@ -522,8 +556,13 @@ fn action_bar(
                         Icon::Download,
                         || "Save".into(),
                         move || {
-                            // mock: app-core exports the decrypted file to the photo library.
-                            toast("Saved to your photos");
+                            // The decrypted file, to the library (D-0174).
+                            if !crate::backend::chat::save_to_library(
+                                current.get_untracked(),
+                                false,
+                            ) {
+                                toast("This photo is a sample: there's no file to save.");
+                            }
                         },
                     )
                     .disabled(move || blocked().is_some()),

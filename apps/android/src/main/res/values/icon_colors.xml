@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The grounds of Songbird's app icons (D-0179), from theme.json. -->
+<resources>
+    <color name="icon_ground_songbird">#4B3FA8</color>
+    <color name="icon_ground_night">#13111F</color>
+    <color name="icon_ground_paper">#FFFFFF</color>
+    <color name="icon_ground_lavender">#ECE9FA</color>
+</resources>

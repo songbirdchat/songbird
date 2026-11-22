@@ -37,6 +37,8 @@ DEFINE FIELD IF NOT EXISTS rec ON akdval TYPE bytes;
 DEFINE INDEX IF NOT EXISTS akdval_label ON akdval FIELDS label;
 DEFINE TABLE IF NOT EXISTS akdhead SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS epoch ON akdhead TYPE int;
+DEFINE TABLE IF NOT EXISTS akdroot SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS root ON akdroot TYPE bytes;
 ";
 
 /// akd's storage on SurrealDB.
@@ -74,6 +76,54 @@ impl SurrealStore {
     pub async fn connect(db: std::sync::Arc<Db>) -> Result<Self, StorageError> {
         db.exec(SCHEMA, Vec::new()).await.map_err(other)?;
         Ok(Self { db })
+    }
+
+    /// Records epoch `epoch`'s root (D-0171): devices audit between heads with every root in
+    /// between. Writing it again is harmless (a root never changes).
+    ///
+    /// # Errors
+    /// The database refused.
+    pub async fn put_root(&self, epoch: u64, root: &[u8; 32]) -> Result<(), StorageError> {
+        self.db
+            .exec(
+                "UPSERT akdroot:[$e] SET root = $r RETURN NONE;",
+                vec![("e".to_owned(), int(epoch)), ("r".to_owned(), bytes(root))],
+            )
+            .await
+            .map_err(other)
+    }
+
+    /// The roots of epochs `from..=to`, in order; `None` if any is missing.
+    ///
+    /// # Errors
+    /// The database refused.
+    pub async fn roots(&self, from: u64, to: u64) -> Result<Option<Vec<[u8; 32]>>, StorageError> {
+        let v = self
+            .db
+            .query1(
+                "SELECT VALUE [meta::id(id)[0], root] FROM akdroot
+                 WHERE meta::id(id)[0] >= $f AND meta::id(id)[0] <= $t;",
+                vec![("f".to_owned(), int(from)), ("t".to_owned(), int(to))],
+            )
+            .await
+            .map_err(other)?;
+        let mut by: std::collections::BTreeMap<u64, [u8; 32]> = std::collections::BTreeMap::new();
+        for r in v.into_array().unwrap_or_default() {
+            let mut a = r.into_array().unwrap_or_default().into_iter();
+            let (Some(e), Some(root)) = (a.next(), a.next()) else {
+                continue;
+            };
+            let (Some(e), Some(root)) = (
+                e.as_i64().and_then(|e| u64::try_from(e).ok()),
+                root.as_bytes()
+                    .and_then(|b| <[u8; 32]>::try_from(b.as_ref()).ok()),
+            ) else {
+                continue;
+            };
+            by.insert(e, root);
+        }
+        let want = usize::try_from(to.saturating_sub(from) + 1).unwrap_or(usize::MAX);
+        Ok((by.len() == want).then(|| by.into_values().collect()))
     }
 
     async fn get_bin(&self, st: StorageType, bin: &[u8]) -> Result<DbRecord, StorageError> {

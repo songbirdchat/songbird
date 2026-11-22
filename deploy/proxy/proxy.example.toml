@@ -19,6 +19,11 @@ address = "chat.songbird.example:443"
 sni = "api.songbird.example"
 address = "api.songbird.example:443"
 
+# Plans and payments (a service of its own, never told the account).
+[[upstream]]
+sni = "billing.songbird.example"
+address = "billing.songbird.example:443"
+
 [limits]
 max_connections = 10000
 handshake_timeout_secs = 10

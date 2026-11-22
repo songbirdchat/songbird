@@ -665,6 +665,18 @@ pub fn app_sheet(
     title: impl Into<SharedString>,
     content: impl IntoElement + 'static,
 ) -> nsh_base::SheetElement {
+    app_sheet_then(open, title, content, || {})
+}
+
+/// [`app_sheet`], calling `closed` each time the sheet has gone (its exit finished, whoever
+/// closed it): where a choice in it opens another sheet or a system picker, which can't show
+/// while this one is still leaving (found on an iPhone, D-0183).
+pub fn app_sheet_then(
+    open: Signal<bool>,
+    title: impl Into<SharedString>,
+    content: impl IntoElement + 'static,
+    closed: impl Fn() + 'static,
+) -> nsh_base::SheetElement {
     let title: SharedString = title.into();
     let content = std::cell::RefCell::new(Some(content.into_element()));
     let sp = spec();
@@ -699,10 +711,10 @@ pub fn app_sheet(
                     .pointer_events(PointerEvents::BoxNone)
             })
         })
-        .on_open_change(move |e: &SheetEvent| {
-            if let SheetEvent::OpenChange(next, _) = e {
-                open.set(*next);
-            }
+        .on_open_change(move |e: &SheetEvent| match e {
+            SheetEvent::OpenChange(next, _) => open.set(*next),
+            SheetEvent::Close => closed(),
+            _ => {}
         })
         .child({
             view()
@@ -842,11 +854,16 @@ pub fn toast(message: impl Into<SharedString>) {
         message: Some(message),
         serial,
     });
-    set_timeout(Duration::from_millis(2600), move || {
-        state.update(|s| {
-            if s.serial == serial {
-                s.message = None;
-            }
+    // Detached: a timer belongs to the owner it is made under, and a screen that toasts as it
+    // closes (onboarding's "Welcome to Songbird") would take the hiding with it, leaving the
+    // toast up for good (found on an iPhone, D-0183).
+    Owner::detached().run(|| {
+        set_timeout(Duration::from_millis(2600), move || {
+            state.update(|s| {
+                if s.serial == serial {
+                    s.message = None;
+                }
+            });
         });
     });
 }
@@ -960,4 +977,51 @@ pub fn toast_layer() -> View {
                         .text_color(move || c::background()),
                 ),
         )
+}
+
+/// Hands `text` to the system's share sheet (iOS, Android, macOS; NSH
+/// `share`). Where the platform has none (Windows, Linux), it is copied
+/// instead and the toast says so.
+pub fn share_text(text: impl Into<String>) {
+    let text = text.into();
+    Owner::detached().run(|| {
+        spawn(async move {
+            let request = nsh_core::share::ShareRequest::new().text(text.clone());
+            if !matches!(nsh_core::prelude::share(request).await, Ok(_)) {
+                set_clipboard(text);
+                toast("Copied. Paste it into any app to share it.");
+            }
+        })
+    });
+}
+
+/// Asks where to save `bytes` (the system's save dialog) and writes them
+/// there. On platforms without a save dialog the file goes to the app's
+/// documents folder and the toast says where.
+pub fn save_file(suggested: impl Into<String>, bytes: Vec<u8>) {
+    let suggested = suggested.into();
+    Owner::detached().run(|| {
+        spawn(async move {
+            let dialog = nsh_core::file_dialog::SaveDialog::new().file_name(suggested.clone());
+            let path = match nsh_core::prelude::pick_save_path(dialog).await {
+                Ok(Some(p)) => p,
+                Ok(None) => return,
+                Err(_) => match data_dir() {
+                    Some(d) => d.join(&suggested),
+                    None => {
+                        toast("This device has no place to save files.");
+                        return;
+                    }
+                },
+            };
+            match std::fs::write(&path, &bytes) {
+                Ok(()) => toast(format!(
+                    "Saved {}",
+                    path.file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+                )),
+                Err(_) => toast("The file couldn't be saved there."),
+            }
+        })
+    });
 }

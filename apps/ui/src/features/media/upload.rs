@@ -2,8 +2,6 @@
 //! runs, Resume after the network drops. For the chat's attachment
 //! bubbles and anything else that uploads (pack links here).
 
-use std::time::Duration;
-
 use nsh_core::{element::ImageSrc, prelude::*};
 
 use crate::ui::*;
@@ -134,21 +132,6 @@ pub fn upload_progress(
         )
 }
 
-/// Mock: drives an upload as app-core's resumable transfer will, a step
-/// every 200ms; pauses while the store says the device is offline.
-pub fn simulate_upload(state: Signal<Upload>, offline: impl Fn() -> bool + 'static) {
-    set_interval(Duration::from_millis(200), move || {
-        let now = state.get_untracked();
-        let next = if offline() {
-            now.network_lost()
-        } else {
-            now.advance(0.06)
-        };
-        if next != now {
-            state.set(next);
-        }
-    });
-}
 
 #[cfg(test)]
 mod tests {

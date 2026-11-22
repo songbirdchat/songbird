@@ -14,6 +14,7 @@
 //! | `GET /v1/devices` | a device | Its account's devices, the pending ones with their confirmation tags |
 //! | `PUT /v1/devices/list` | a device | A list signed by the account identity key |
 //! | `POST /v1/devices/list/fetch` | a device | An account's signed list |
+//! | `POST /v1/devices/identity` | a device | An account's identity key (D-0138) |
 //! | `DELETE /v1/devices/self` | a linked device | Removes itself |
 //!
 //! # Provisioning channel
@@ -1036,6 +1037,43 @@ impl Devices {
         };
         match registry.device_list(&account).await {
             Ok(Some((b, _))) => Outcome::Blob(b),
+            Ok(None) => Outcome::NotFound,
+            Err(_) => Outcome::Unavailable,
+        }
+    }
+
+    /// `POST /v1/devices/identity`: an account's identity key (A2, D-0138), the key that signs
+    /// its device list. A public key the server already holds (threat model §1); the client
+    /// pins it on first sight and proves it with a key-transparency lookup (§4.9). Spends the
+    /// list-fetch budget, as the list and its key are fetched together.
+    pub async fn fetch_identity(
+        &self,
+        registry: &Registry,
+        hot: &ValkeyConn,
+        requester: &AccountId,
+        body: &[u8],
+    ) -> Outcome {
+        let s = &self.settings;
+        if let Err(o) = self
+            .throttle(
+                hot,
+                "f",
+                requester.as_bytes(),
+                s.list_fetches_per_hour,
+                s.list_fetch_burst,
+            )
+            .await
+        {
+            return o;
+        }
+        let Ok(req) = serde_json::from_slice::<ListFetchBody>(body) else {
+            return Outcome::Malformed("request");
+        };
+        let Some(account) = parse16(&req.account).map(AccountId::from_bytes) else {
+            return Outcome::Malformed("account");
+        };
+        match registry.account_identity(&account).await {
+            Ok(Some(k)) => Outcome::Json(serde_json::json!({ "identity_key": hex::encode(k) })),
             Ok(None) => Outcome::NotFound,
             Err(_) => Outcome::Unavailable,
         }

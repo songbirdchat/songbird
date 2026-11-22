@@ -11,6 +11,16 @@ ignore = [
     # use X-Wing and Ed25519 only. The fix (0.7.6) needs elliptic-curve 0.14 upstream.
     # Review by 2027-02-16, or at the next OpenMLS provider upgrade, whichever comes first.
     { id = "RUSTSEC-2026-0387", reason = "test harness only (D-0068); review by 2027-02-16" },
+    # D-0185 (owner-approved): SQLite before 3.54 can return stale page-cache memory when it opens
+    # a database with a crafted sibling `-wal` file of another page size. Built here: rusqlite
+    # 0.37's bundled SQLCipher in app-core's on-device store (D-0137) and in the maps import tool.
+    # Exposure needs a less trusted party to write both files: the app opens only its own
+    # database inside its sandbox, and the maps tool opens read-only the tiles our own pipeline
+    # produced. The fix (rusqlite 0.41+, SQLCipher 4.20 with SQLite 3.54.1) cannot resolve:
+    # OpenMLS 0.9.2, the latest release, pins its optional SQLite storage to rusqlite 0.37 and the
+    # `links = "sqlite3"` rule allows one copy. Upgrade with the next OpenMLS release; review by
+    # 2027-02-22.
+    { id = "RUSTSEC-2026-0459", reason = "own sandboxed files only; blocked on OpenMLS (D-0185); review by 2027-02-22" },
 ]
 unmaintained = "workspace"
 yanked = "deny"
@@ -41,6 +51,9 @@ exceptions = [
     # D-0117: the camera's pure-Rust JPEG encoder for desktop stills; its acknowledgement is on
     # the app's licences page.
     { allow = ["IJG"], crate = "jpeg-encoder" },
+    # D-0151: flate2's pure-Rust zlib backend, which LiveKit's SDK selects (call media,
+    # apps/calls-media); acknowledged on the app's licences page.
+    { allow = ["Zlib"], crate = "zlib-rs" },
 ]
 
 [licenses.private]

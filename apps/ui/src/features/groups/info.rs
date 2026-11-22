@@ -441,7 +441,7 @@ fn member_row(
             .contact(id)
             .map(|c| {
                 if c.about.is_empty() {
-                    format!("@{}", c.username)
+                    handle(&c.username)
                 } else {
                     c.about
                 }
@@ -618,7 +618,7 @@ fn person_header(contact: &Contact, role: Role) -> View {
                         }))
                         .child(role_tag(role)),
                 )
-                .child(muted(format!("@{}", contact.username))),
+                .child(muted(handle(&contact.username))),
         )
 }
 
@@ -652,10 +652,7 @@ fn edit_sheet(s: Store, chat: ChatId, open: Signal<bool>) -> View {
                     return;
                 }
                 let desc = about.get_untracked().trim().to_string();
-                s.update_chat(chat, |c| {
-                    c.title = title;
-                    c.about = desc;
-                });
+                s.set_group_info(chat, title, desc);
                 s.push_message(
                     chat,
                     None,
@@ -732,7 +729,7 @@ fn add_sheet(s: Store, chat: ChatId, open: Signal<bool>) -> View {
         )
 }
 
-/// Off, 24 hours, 7 days, 90 days.
+/// Off, 24 hours, 7 days, 4 weeks.
 fn timer_sheet(s: Store, chat: ChatId, ch: Memo<Option<Chat>>, open: Signal<bool>) -> View {
     let allowed = move || ch.with(|c| c.as_ref().is_some_and(can_edit_info));
     let current = move || ch.with(|c| c.as_ref().and_then(|c| c.disappearing));
@@ -765,7 +762,7 @@ fn timer_sheet(s: Store, chat: ChatId, ch: Memo<Option<Chat>>, open: Signal<bool
             option(None, "Off"),
             option(Some(Disappear::Day), "24 hours"),
             option(Some(Disappear::Week), "7 days"),
-            option(Some(Disappear::Quarter), "90 days"),
+            option(Some(Disappear::FourWeeks), "4 weeks"),
         ]))
         .child(
             view().style_when(allowed, |st| st.hidden()).child(footnote(move || {
@@ -820,7 +817,6 @@ fn report(s: Store, chat: ChatId) {
         "Report",
         move || {
             s.report(chat);
-            toast("Reported. Thank you.");
         },
     );
 }
@@ -1091,7 +1087,7 @@ fn media_tile(_s: Store, chat: ChatId, m: crate::store::Message) -> AnyElement {
         ),
         _ => (String::new(), false, 1, 1),
     };
-    let src = crate::ui::portrait::photo(&alt, id, w, h);
+    let src = crate::ui::portrait::message_photo(&alt, id, w, h);
     let side = if wide() { 112.0 } else { 116.0 };
     press_surface(Press::Tile, move || media::open_viewer(chat, id))
         .accessibility_label(if video {
@@ -1251,5 +1247,14 @@ mod tests {
         assert!(!can_act_on(Some(Role::Admin), Role::Owner));
         assert!(!can_act_on(Some(Role::Member), Role::Member));
         assert!(!can_act_on(None, Role::Member));
+    }
+}
+
+/// "@name", or nothing for a contact whose username this account never learned.
+fn handle(username: &str) -> String {
+    if username.is_empty() {
+        String::new()
+    } else {
+        format!("@{username}")
     }
 }

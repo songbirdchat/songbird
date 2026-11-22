@@ -71,6 +71,17 @@ allowance = 5
 secret = { file = "$(secret usernames)" }
 [api.keys]
 secret = { file = "$(secret keys)" }
+# Profiles (names, access keys for first messages), synced settings and message requests
+# (D-0183): without them the app's first messages are refused.
+[api.profiles]
+secret = { file = "$(secret profiles)" }
+[api.storage]
+secret = { file = "$(secret storage)" }
+# Attachment downloads (signed media URLs): without it every download answers 503.
+[api.media]
+secret = { file = "$(secret media)" }
+[api.requests]
+secret = { file = "$(secret requests)" }
 TOML
 
 cat > "$dir/delivery.toml" <<TOML
@@ -85,6 +96,12 @@ filter = "info"
 [delivery]
 listen = "127.0.0.1:9201"
 server_name = "localhost"
+franking_key = { file = "$(secret franking)" }
+[delivery.requests]
+secret = { file = "$(secret requests)" }
+[delivery.requests.valkey]
+addr = "127.0.0.1:47379"
+pass = { env = "VALKEY_HOT_PASSWORD" }
 [delivery.registry]
 poll_ms = 1000
 [delivery.registry.surrealdb]

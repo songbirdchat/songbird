@@ -481,6 +481,9 @@ fn cells(
 pub fn flow_layout(content: impl IntoElement, actions: impl IntoElement) -> View {
     view()
         .flex_1()
+        // The step's actions ride on the keyboard's edge while it shows: under it, a step had no
+        // way on but dismissing the keyboard first (found on an iPhone, D-0183).
+        .pb_keyboard()
         .child(
             scroll()
                 .flex_1()

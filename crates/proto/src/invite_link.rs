@@ -50,7 +50,7 @@ impl std::fmt::Debug for InviteLink {
     }
 }
 
-fn encode(b: &[u8]) -> String {
+pub(crate) fn encode(b: &[u8]) -> String {
     let mut out = String::with_capacity(b.len().div_ceil(3) * 4);
     for chunk in b.chunks(3) {
         let n = chunk
@@ -65,7 +65,7 @@ fn encode(b: &[u8]) -> String {
     out
 }
 
-fn decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode(s: &str) -> Option<Vec<u8>> {
     let val = |c: u8| {
         B64.iter()
             .position(|&a| a == c)

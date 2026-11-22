@@ -27,12 +27,14 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod call_link;
 pub mod close;
 pub mod control;
 pub mod devices;
 pub mod envelope;
 pub mod ephemeral;
 pub mod frame;
+pub mod group_link;
 pub mod invite_link;
 pub mod keys;
 pub mod media;
@@ -43,6 +45,7 @@ pub mod report;
 pub mod storage;
 pub mod supervision;
 pub mod system;
+pub mod username_link;
 pub mod vault;
 
 pub use close::CloseCode;

@@ -14,6 +14,7 @@ pub mod camera;
 pub mod features;
 pub mod nav;
 pub mod shell;
+pub mod sounds;
 pub mod store;
 pub mod theming;
 pub mod ui;
@@ -70,6 +71,8 @@ fn camera_components_macos(components: &nsh_platform_macos::Components) {
 #[native_components(ios)]
 fn camera_components_ios(components: &nsh_platform_ios::Components) {
     songbird_camera::apple::register(components);
+    // Call video drawn natively (D-0183).
+    songbird_camera::video::register(components);
 }
 
 /// The camera's live preview on Windows (Media Foundation frames drawn with Direct2D).
@@ -88,14 +91,30 @@ fn camera_components_linux(components: &nsh_platform_linux::Components) {
 /// or the app, and the layers over everything (calls, toasts).
 #[component]
 pub fn App() -> impl IntoElement {
+    // The app's log for support requests (phones have no `main` to install it; D-0184).
+    backend::applog::init();
+    // A panic leaves a scrubbed report on this device (sent only if allowed; D-0170).
+    backend::crash::install();
     let s = Store::new();
     store::install(s);
     // Settings saved on this device, and the encrypted records synced from
     // the account's other devices (Prompt 9); before the connection, which
     // reads the proxy setting.
     backend::records::restore(s);
+    backend::chat_state::install(s);
+    // The backup settings, saved on this device, and backups on their schedule (D-0165).
+    backend::backup::install(s);
+    // A supervised child's rules, kept fresh (D-0166).
+    backend::rules::install();
+    // Screenshots, recordings and the app switcher (D-0173).
+    features::cover::install(s);
+    // A status whose real expiry passed while the app was closed goes now.
+    s.schedule_status_expiry();
     camera::install_for_app();
     backend::restore();
+    backend::avatar::restore(
+        crate::store::try_store().map_or(42, |s| s.me.with_untracked(|m| m.seed)),
+    );
     backend::records::periodic(s);
     // Prompt 9, M6: the encrypted profile follows the user's edits, and
     // presence follows the app's lifecycle and the privacy settings.
@@ -128,6 +147,7 @@ pub fn App() -> impl IntoElement {
         )
         .child(features::desktop::jump::layer())
         .child(features::lock::layer())
+        .child(features::cover::layer(s))
         .child(features::calls::call_layer())
         .child(ui::toast_layer())
 }

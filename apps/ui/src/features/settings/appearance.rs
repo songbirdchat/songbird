@@ -1,11 +1,12 @@
 //! Appearance: the theme (switches the app's tokens live through
 //! `theming.rs`), the app icon (Plus), text size and motion notes.
 
-use nsh_core::prelude::*;
+use nsh_core::{element::ImageSrc, prelude::*};
 
 use super::{links, section};
 use crate::{
-    store::{Plan, ThemeChoice, store},
+    backend::icon as app_icons_sys,
+    store::{Plan, Store, ThemeChoice, store},
     ui::*,
 };
 
@@ -13,14 +14,13 @@ pub fn appearance() {
     super::push("Appearance", content);
 }
 
-/// The app icons: the feather on four grounds drawn from tokens.
-const ICONS: [&str; 4] = ["Songbird", "Night", "Paper", "Lavender"];
+/// The app icons: the feather on four grounds drawn from tokens, as the real icons are
+/// (`assets/icon`, D-0179).
+const ICONS: [&str; 4] = app_icons_sys::NAMES;
 
 fn content() -> AnyElement {
     let s = store();
     let settings = s.settings;
-    let ext = s.ext();
-    let plus = move || settings.with(|x| x.plan != Plan::Free);
     view()
         .child(section_title("Theme"))
         // A list of choices, not a segmented control: four labels with
@@ -42,6 +42,36 @@ fn content() -> AnyElement {
         )
         .role(AccessibilityRole::Radiogroup)
         .label("Theme"))
+        // Linux has no app icon an app may change (D-0179): the choice isn't offered there.
+        .children(app_icons_sys::supported().then(|| app_icons(s)))
+        .child(section(
+            "Display",
+            vec![
+                Row::new("Text size")
+                    .icon(Icon::Sliders)
+                    .subtitle("Songbird follows your device's text size. Change it in your device's settings.")
+                    .build(),
+                Row::new("Reduce motion")
+                    .icon(Icon::Zap)
+                    .subtitle(if motion::reduced() {
+                        "On in your device's settings: Songbird keeps movement to fades."
+                    } else {
+                        "Songbird follows your device's reduce motion setting."
+                    })
+                    .build(),
+            ],
+        ))
+        .into_element()
+}
+
+/// The app icon choice: the main icon for everyone, the others with Plus. The system changes
+/// the icon (iOS confirms it with its own alert); the tile shows the new one once it has.
+fn app_icons(s: Store) -> View {
+    let settings = s.settings;
+    let ext = s.ext();
+    let plus = move || settings.with(|x| x.plan != Plan::Free);
+    let changing = signal(false);
+    view()
         // The Plus tag sits right after the title it qualifies.
         .child(
             view()
@@ -77,9 +107,20 @@ fn content() -> AnyElement {
                                 if i > 0 && !plus() {
                                     toast("App icons come with Songbird Plus");
                                     links::subscription();
-                                } else {
-                                    // mock: the platform's alternate-icon API.
-                                    s.ext_update(|x| x.app_icon = i);
+                                } else if !changing.get_untracked()
+                                    && ext.with_untracked(|x| x.app_icon != i)
+                                {
+                                    changing.set(true);
+                                    crate::backend::run(async move {
+                                        let ok = app_icons_sys::apply(i).await;
+                                        changing.set(false);
+                                        if ok {
+                                            s.ext_update(|x| x.app_icon = i);
+                                        } else {
+                                            toast("Your device didn't change Songbird's icon. Try again.");
+                                        }
+                                        Ok(())
+                                    });
                                 }
                             },
                             view()
@@ -107,49 +148,33 @@ fn content() -> AnyElement {
                 }))
                 .child(when(move || !plus(), || {
                     muted("Choose another icon with Songbird Plus.").w_full()
+                }))
+                .child(when(move || plus() && app_icons_sys::while_running(), || {
+                    muted(if cfg!(target_os = "macos") {
+                        "Shows in the Dock while Songbird is open."
+                    } else {
+                        "Shows on the taskbar while Songbird is open."
+                    })
+                    .w_full()
                 })),
         )
-        .child(section(
-            "Display",
-            vec![
-                Row::new("Text size")
-                    .icon(Icon::Sliders)
-                    .subtitle("Songbird follows your device's text size. Change it in your device's settings.")
-                    .build(),
-                Row::new("Reduce motion")
-                    .icon(Icon::Zap)
-                    .subtitle(if motion::reduced() {
-                        "On in your device's settings: Songbird keeps movement to fades."
-                    } else {
-                        "Songbird follows your device's reduce motion setting."
-                    })
-                    .build(),
-            ],
-        ))
-        .into_element()
 }
 
-/// A small app-icon drawing: the feather on a token ground.
+/// The app icon itself, small: its SVG master (`assets/icon`), the picture the system shows.
 fn app_icon(i: u8) -> View {
+    const MASTERS: [&str; 4] = [
+        include_str!("../../../assets/icon/songbird.svg"),
+        include_str!("../../../assets/icon/night.svg"),
+        include_str!("../../../assets/icon/paper.svg"),
+        include_str!("../../../assets/icon/lavender.svg"),
+    ];
+    let master = MASTERS[usize::from(i).min(MASTERS.len() - 1)];
     view()
         .size(px(44.0))
         .rounded(move || radius::control())
-        .items_center()
-        .justify_center()
-        .accessibility_elements_hidden(true)
-        .bg(move || match i {
-            1 => c::call_bg(),
-            2 => c::card(),
-            3 => c::accent(),
-            _ => c::primary(),
-        })
+        .overflow_hidden()
         .border_1()
         .border_color(move || c::border())
-        .text_color(move || match i {
-            1 => c::on_call(),
-            2 => c::foreground(),
-            3 => c::primary(),
-            _ => c::on_primary(),
-        })
-        .child(icon(Icon::Feather, 24.0))
+        .accessibility_elements_hidden(true)
+        .child(svg(ImageSrc::svg_markup(master)).size(px(44.0)))
 }

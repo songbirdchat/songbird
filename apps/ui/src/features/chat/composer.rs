@@ -204,7 +204,6 @@ fn request_bar(cv: Conv) -> AnyElement {
                 })))
                 .child(view().flex_1().child(btn("Report", Variant::Outline, BtnSize::Md, move || {
                     s.report(chat);
-                    toast("Reported. Thank you.");
                 })))
                 .child(view().flex_1().child(btn("Accept", Variant::Primary, BtnSize::Md, move || {
                     s.accept_request(chat);
@@ -635,8 +634,39 @@ fn send_button(cv: Conv) -> View {
         .child(button)
 }
 
+thread_local! {
+    /// The microphone's recording, while one goes on in a real chat.
+    static RECORDER: std::cell::RefCell<Option<songbird_recorder::Recorder>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn start_recording(cv: Conv, how: Rec) {
-    // mock: app-core records from the microphone (permission asked once).
+    // A real chat records from the microphone (the system asks the first time); a demo chat
+    // only counts.
+    if crate::backend::chat::owns(cv.chat) {
+        // Android asks for the microphone first (D-0176): answered at once when allowed;
+        // otherwise the system's dialog shows and the next press records.
+        let allowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let answer = allowed.clone();
+        songbird_device::audio::microphone(Box::new(move |ok| {
+            answer.store(ok, std::sync::atomic::Ordering::SeqCst);
+        }));
+        if !allowed.load(std::sync::atomic::Ordering::SeqCst) {
+            toast("Allow Songbird to use the microphone, then record again.");
+            return;
+        }
+        match songbird_recorder::Recorder::start() {
+            Ok(r) => RECORDER.with_borrow_mut(|x| *x = Some(r)),
+            Err(songbird_recorder::RecordError::NoMicrophone) => {
+                toast("No microphone to record with. Check that Songbird may use it.");
+                return;
+            }
+            Err(_) => {
+                toast("The microphone couldn't be opened.");
+                return;
+            }
+        }
+    }
     batch(|| {
         cv.rec_secs.set(0);
         cv.rec.set(Some(how));
@@ -646,6 +676,14 @@ fn start_recording(cv: Conv, how: Rec) {
 
 fn send_recording(cv: Conv) {
     let secs = cv.rec_secs.get_untracked().max(1);
+    if let Some(r) = RECORDER.with_borrow_mut(Option::take) {
+        cv.rec.set(None);
+        match r.finish() {
+            Some(rec) => crate::backend::chat::send_voice(cv.s, cv.chat, rec),
+            None => toast("Too short to send. Hold to record."),
+        }
+        return;
+    }
     cv.rec.set(None);
     cv.send_body(Body::Voice {
         secs,
@@ -656,9 +694,19 @@ fn send_recording(cv: Conv) {
 /// The recorder's clock, while recording.
 pub(crate) fn install_recorder(cv: Conv) {
     effect(move || {
+        // Recording ended without sending (deleted, slid away, the chat closed): discarded.
+        if cv.rec.get().is_none() {
+            RECORDER.with_borrow_mut(|x| *x = None);
+        }
         if cv.rec.get().is_some() {
             let clock = set_interval(Duration::from_secs(1), move || {
-                cv.rec_secs.update(|n| *n += 1)
+                cv.rec_secs.update(|n| *n += 1);
+                // The longest a note may be: sent as it is.
+                if RECORDER
+                    .with_borrow(|r| r.as_ref().is_some_and(songbird_recorder::Recorder::is_full))
+                {
+                    send_recording(cv);
+                }
             });
             cleanup(move || clock.cancel());
         }

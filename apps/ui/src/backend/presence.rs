@@ -12,10 +12,9 @@
 //! XOR of the recipients' access keys in `Unidentified-Access-Key`), and
 //! only while the account is live.
 //!
-//! mock: contacts' account IDs, devices and profile keys, and the sealed
-//! sender encryption of each payload, belong to app-core (A2). Until it
-//! exists [`peers`] is empty and [`seal`] seals nothing, so no batch is
-//! ever built and nothing leaves the device; no plaintext is ever sent.
+//! The contacts (their accounts, devices and access keys) and the sealed-sender encryption of
+//! each payload come from app-core (`Messenger::presence_peers`, `Messenger::seal_for`): only
+//! contacts who shared their profile key are addressed, and nothing leaves in the clear.
 
 use std::{
     cell::{Cell, RefCell},
@@ -39,28 +38,74 @@ pub struct Peer {
     pub access_key: [u8; 16],
 }
 
-/// The contacts with real accounts, devices and profile keys.
-///
-/// mock: app-core (A2) learns these from end-to-end sessions; the mock's
-/// contacts have none, so this is empty and presence reaches nobody.
+thread_local! {
+    /// The contacts presence reaches, as app-core last listed them.
+    static PEERS: RefCell<Vec<Peer>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The contacts presence reaches (who shared their profile key), as last read.
 pub fn peers(_store: Store) -> Vec<Peer> {
-    Vec::new()
+    PEERS.with_borrow(Clone::clone)
 }
 
-/// The peer behind one of the mock's contacts.
-///
-/// mock: none until app-core (A2) knows contacts' accounts and devices.
-pub fn peer_of(_store: Store, _contact: store::ContactId) -> Option<Peer> {
-    None
+/// Reads the reachable contacts from app-core again (when it opens, and when a chat with a new
+/// contact begins), and tells the presence rules who they are.
+pub fn refresh(s: Store) {
+    super::run(async move {
+        let got = {
+            let lock = super::chat::core();
+            let mut guard = lock.lock().await;
+            let Some(m) = guard.as_mut() else {
+                return Ok(());
+            };
+            m.presence_peers().await.unwrap_or_default()
+        };
+        let list: Vec<Peer> = got
+            .into_iter()
+            .map(|(account, devices, access_key)| Peer {
+                account,
+                devices,
+                access_key,
+            })
+            .collect();
+        let to: BTreeSet<[u8; 16]> = list.iter().map(|p| p.account).collect();
+        PEERS.with_borrow_mut(|p| *p = list);
+        LANE.with(|l| {
+            if let Some(lane) = l.borrow_mut().as_mut() {
+                lane.set_contacts(to);
+            }
+        });
+        pump(s);
+        Ok(())
+    });
 }
 
-/// Seals a presence for one device of a peer (sealed sender over the
-/// session with that device).
-///
-/// mock: needs app-core's sessions (A2); returns nothing, so nothing is
-/// sent rather than a plaintext.
-fn seal(_peer: &Peer, _device: &[u8; 16], _p: &Presence) -> Option<Vec<u8>> {
-    None
+/// A contact's presence arrived: shown on them, and answered once if they asked (§10.5).
+pub fn received(account: [u8; 16], p: &Presence) {
+    let Some(s) = store::try_store() else { return };
+    let contact = super::chat::ui_id(&account);
+    let shown = match songbird_content::presence::State::try_from(p.state) {
+        Ok(songbird_content::presence::State::Online) => store::Presence::Online,
+        Ok(songbird_content::presence::State::Away) => store::Presence::Away,
+        Ok(songbird_content::presence::State::Busy) => store::Presence::Busy,
+        _ if p.last_seen_ms > 0 => {
+            store::Presence::LastSeen(Some(crate::store::minutes_of_ms(p.last_seen_ms)))
+        }
+        _ => store::Presence::LastSeen(None),
+    };
+    s.contacts.update(|cs| {
+        if let Some(c) = cs.iter_mut().find(|c| c.id == contact) {
+            c.presence = shown;
+        }
+    });
+    let reply = LANE.with(|l| {
+        l.borrow_mut()
+            .as_mut()
+            .and_then(|lane| lane.presencer.received(account, p, now_ms()))
+    });
+    if let Some(out) = reply {
+        send(s, &out);
+    }
 }
 
 /// The user's choice as the presence rules see it.
@@ -95,7 +140,7 @@ pub fn audiences(s: &Settings, x: &SettingsExt) -> (Audience, Audience) {
 
 /// The presence rules with what the app last told them.
 pub struct Lane {
-    presencer: Presencer,
+    pub(crate) presencer: Presencer,
     audiences: (Audience, Audience),
 }
 
@@ -253,19 +298,45 @@ fn pump(s: Store) {
     }
 }
 
-/// `PUT /v1/ephemeral/sealed` with the batch for `out`, when live.
+/// `PUT /v1/ephemeral/sealed` with the batch for `out`, when live: each addressed device's
+/// payload sealed by app-core first.
 fn send(s: Store, out: &Outgoing) {
     if !(super::is_live() && super::registered()) {
         return;
     }
-    let Some((batch, key)) = batch(out, &peers(s), seal) else {
-        return;
-    };
-    let Ok(body) = batch.encode() else {
-        return;
-    };
+    let peers = peers(s);
+    let out = out.clone();
     let api = super::endpoint().api;
     spawn(async move {
+        let Ok(content) =
+            songbird_app_core::messenger::Messenger::<super::chat::AppNet>::presence_content(
+                &out.presence,
+            )
+        else {
+            return;
+        };
+        let mut sealed: std::collections::HashMap<([u8; 16], [u8; 16]), Vec<u8>> =
+            std::collections::HashMap::new();
+        {
+            let lock = super::chat::core();
+            let mut guard = lock.lock().await;
+            let Some(m) = guard.as_mut() else { return };
+            for p in peers.iter().filter(|p| out.to.contains(&p.account)) {
+                for d in &p.devices {
+                    if let Ok(b) = m.seal_for(&p.account, d, &content).await {
+                        sealed.insert((p.account, *d), b);
+                    }
+                }
+            }
+        }
+        let Some((batch, key)) = batch(&out, &peers, |p, d, _| {
+            sealed.get(&(p.account, *d)).cloned()
+        }) else {
+            return;
+        };
+        let Ok(body) = batch.encode() else {
+            return;
+        };
         let request = HttpRequest::new("PUT", format!("{api}/v1/ephemeral/sealed"))
             .header("unidentified-access-key", super::wire::hex(&key))
             .header("content-type", "application/octet-stream")
@@ -374,8 +445,6 @@ mod tests {
         assert_eq!(b.events.len(), 3);
         assert_eq!(key, [0xAA ^ 0x0F; 16]);
         assert!(b.encode().is_ok());
-        // What the app does today: nothing can be sealed, nothing is sent.
-        assert!(batch(&out, &peers, seal).is_none());
         assert!(batch(&out, &[], |_, _, _| Some(vec![1])).is_none());
     }
 }

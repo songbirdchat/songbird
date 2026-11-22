@@ -480,6 +480,14 @@ pub fn initials(name: &str) -> String {
 /// Decorative for screen readers: the row or header beside it names them.
 pub fn avatar(name: impl Into<SharedString>, seed: u64, size: f32) -> View {
     let name: SharedString = name.into();
+    if let Some(src) = crate::backend::avatar::photo(seed) {
+        return view()
+            .size(px(size))
+            .rounded_full()
+            .overflow_hidden()
+            .accessibility_elements_hidden(true)
+            .child(image(src).size(px(size)).object_fit(ResizeMode::Cover));
+    }
     avatar_of(
         name,
         seed,
@@ -1005,9 +1013,11 @@ pub fn empty_state(
     action: Option<AnyElement>,
 ) -> View {
     // Rhythm: the mark, then the words as one group (title and sentence 6
-    // apart), then the action set off by a section gap.
+    // apart), then the action set off by a section gap. It fills an empty screen from its own
+    // size (`flex_auto`): with `flex_1`'s zero basis it collapsed in a scrolling page, its words
+    // running over what followed (D-0183).
     view()
-        .flex_1()
+        .flex_auto()
         .items_center()
         .justify_center()
         .px_8()

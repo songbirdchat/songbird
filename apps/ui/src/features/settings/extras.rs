@@ -127,9 +127,14 @@ pub fn broadcasts() {
         let creating = signal(false);
         let name = signal(String::new());
         let chosen = signal(Vec::<ContactId>::new());
+        let sending = signal(None::<u64>);
+        let send_open = signal(false);
+        let draft = signal(String::new());
         let people = s.contacts.with_untracked(|cs| {
             cs.iter()
-                .filter(|c| !c.blocked && c.id < 16)
+                .filter(|c| {
+                    !c.blocked && (crate::store::demo() || crate::backend::chat::owns(c.id))
+                })
                 .map(|c| (c.id, c.name.clone()))
                 .collect::<Vec<_>>()
         });
@@ -148,6 +153,10 @@ pub fn broadcasts() {
                         Row::new(b.name.clone())
                             .icon(Icon::Megaphone)
                             .subtitle(names.join(", "))
+                            .on_press(move || {
+                                sending.set(Some(id));
+                                send_open.set(true);
+                            })
                             .trailing(
                                 icon_btn(Icon::Trash, format!("Delete {}", b.name), move || s.delete_broadcast(id))
                                     .text_color(move || c::destructive()),
@@ -164,6 +173,30 @@ pub fn broadcasts() {
                 BtnSize::Md,
                 move || creating.set(true),
             )))
+            .child(app_sheet(
+                send_open,
+                "Send to the list",
+                view()
+                    .gap_3()
+                    .px_4()
+                    .pb_4()
+                    .child(field("Message", draft).max_length(4_000))
+                    .child(
+                        btn("Send to each person", Variant::Primary, BtnSize::Lg, move || {
+                            let Some(id) = sending.get_untracked() else { return };
+                            let text = draft.get_untracked().trim().to_string();
+                            let (sent, skipped) = s.send_broadcast(id, &text);
+                            draft.set(String::new());
+                            sending.set(None);
+                            send_open.set(false);
+                            toast(match (sent, skipped) {
+                                (n, 0) => format!("Sent to {n} people"),
+                                (n, k) => format!("Sent to {n}; {k} haven't saved you as a contact"),
+                            });
+                        })
+                        .disabled(move || draft.with(|d| d.trim().is_empty())),
+                    ),
+            ))
             .child(app_sheet(
                 creating,
                 "New broadcast list",
@@ -436,13 +469,24 @@ pub fn parental() {
                 section(
                     "Supervising",
                     vec![
-                        Row::new(ext.with_untracked(|x| x.parental.child_name.clone()))
-                            .leading(avatar(ext.with_untracked(|x| x.parental.child_name.clone()), 7, 36.0))
+                        Row::new(child_name(ext))
+                            .leading(avatar(child_name(ext), 7, 36.0))
                             .subtitle("Linked in person · rules on")
                             .chevron()
                             .on_press(rules)
                             .build(),
                     ],
+                )
+            }))
+            .child(when(linked, || {
+                section(
+                    "Contacts",
+                    vec![Row::new("Approve a contact")
+                        .icon(Icon::QrCode)
+                        .subtitle("Scan the code on your child's phone.")
+                        .chevron()
+                        .on_press(approve_contact)
+                        .build()],
                 )
             }))
             .child(section(
@@ -454,13 +498,133 @@ pub fn parental() {
     });
 }
 
+/// The parent's phone approves one new contact for the child (D-0166): it scans the code the
+/// child's phone shows and shows eight digits made from the link secret, for the child to type.
+/// Nothing goes through the server.
+fn approve_contact() {
+    super::push("Approve a contact", || {
+        let scanned = signal(None::<([u8; 16], String)>);
+        let session = crate::camera::use_session(
+            songbird_camera::Purpose::ScanCode,
+            move || scanned.get().is_none(),
+            move |text| {
+                if let Some(features::devices::codes::Scanned::Approve { account, username }) =
+                    features::devices::codes::parse(&text)
+                {
+                    scanned.set(Some((account, username)));
+                }
+            },
+        );
+        view()
+            .items_center()
+            .px_6()
+            .pt_6()
+            .gap_4()
+            .child(dynamic(move || {
+                let now = scanned.get();
+                let session = session.clone();
+                untracked(move || match now {
+                    None => view()
+                        .items_center()
+                        .gap_4()
+                        .child(body("Hold your phone to your child's and scan the code they show.").text_center().max_w(px(420.0)))
+                        .child(crate::camera::camera_view(&session, 280.0, "Point at the code on your child's phone"))
+                        .into_element(),
+                    Some((account, username)) => {
+                        let digits = sup::parent_link()
+                            .and_then(|l| {
+                                songbird_content::supervision::approval_code(&l.secret, &l.child, &account).ok()
+                            })
+                            .unwrap_or_default();
+                        let spaced = format!("{} {}", &digits[..4.min(digits.len())], &digits[4.min(digits.len())..]);
+                        view()
+                            .items_center()
+                            .gap_4()
+                            .child(body(format!("Approve @{username}?")).font_weight(FontWeight::SEMIBOLD))
+                            .child(muted("If you know who this is, let your child type these digits on their phone.").text_center().max_w(px(420.0)))
+                            .child(numeric_code(spaced).label(format!("Approval code {digits}")))
+                            .child(btn("Done", Variant::Primary, BtnSize::Lg, || crate::nav::pop()))
+                            .child(btn("Scan another", Variant::Ghost, BtnSize::Md, move || scanned.set(None)))
+                            .into_element()
+                    }
+                })
+            }))
+            .child(muted("A code approves this one person only, and only for your child's phone.").text_center().max_w(px(420.0)))
+            .into_element()
+    });
+}
+
+/// The child's phone: a new contact waits for the parent's approval (D-0166). The parent's
+/// phone scans the code here and shows eight digits to type.
+pub fn ask_approval() {
+    super::push("Ask your parent", || {
+        let Some((account, username)) = crate::backend::rules::pending() else {
+            return view()
+                .p_6()
+                .child(muted("Nothing is waiting for approval."))
+                .into_element();
+        };
+        let code = features::devices::codes::approve_code(&account, &username);
+        let typed = signal(String::new());
+        let failed = signal(None::<String>);
+        let name = username.clone();
+        view()
+            .items_center()
+            .px_6()
+            .pt_6()
+            .gap_4()
+            .child(body(format!("Your parent's rules ask them to approve each new contact. To message @{username}, ask them now.")).text_center().max_w(px(420.0)))
+            .child(
+                view()
+                    .role(AccessibilityRole::Image)
+                    .label("Approval request, for your parent's phone to scan")
+                    .child(qr_code(&code, 220.0)),
+            )
+            .child(muted("On their phone: You → Parental controls → Approve a contact. Then type the digits it shows.").text_center().max_w(px(420.0)))
+            .child(view().w_full().max_w(px(320.0)).child(field("8 digits", typed)))
+            .child(when(
+                move || failed.get().is_some(),
+                move || {
+                    status_line(
+                        || StatusTone::Problem,
+                        || Icon::Alert,
+                        move || failed.get().unwrap_or_default().into(),
+                    )
+                },
+            ))
+            .child(btn("Approve and message", Variant::Primary, BtnSize::Lg, move || {
+                match crate::backend::rules::approve(&account, &typed.get_untracked()) {
+                    Ok(()) => {
+                        let name = name.clone();
+                        crate::backend::run(async move {
+                            let chat = crate::backend::chat::start_with_username(&name).await?;
+                            crate::nav::pop_to_root();
+                            features::chat::open(chat);
+                            Ok(())
+                        });
+                    }
+                    Err(p) => failed.set(Some(p.0)),
+                }
+            }))
+            .into_element()
+    });
+}
+
 /// Linking in person (PROTOCOL §10.6): this device makes a policy key and
 /// a link secret just for this child and shows them as a code to scan;
 /// both screens then show the same six digits, which parent and child
 /// compare. The child's age (entered on the child's phone) and the
 /// country's age of digital consent set the day supervision ends.
+/// The supervised child's name as this device knows it ("Your child" when it doesn't).
+fn child_name(ext: Signal<crate::store::SettingsExt>) -> String {
+    let n = ext.with_untracked(|x| x.parental.child_name.clone());
+    if n.is_empty() { "Your child".into() } else { n }
+}
+
 fn link_child() {
-    if crate::backend::is_live() && crate::backend::registered() {
+    // A real account always links two phones through the camera; only the demo fixtures
+    // play both sides on one device.
+    if !crate::store::demo() || crate::backend::is_live() && crate::backend::registered() {
         return link_child_live();
     }
     // The preview: both sides on this device (no server, no second phone).
@@ -973,7 +1137,7 @@ fn rules() {
         let ext = s.ext();
         let p =
             move |f: fn(&crate::store::ParentalRules) -> bool| move || ext.with(|x| f(&x.parental));
-        let name = ext.with_untracked(|x| x.parental.child_name.clone());
+        let name = child_name(ext);
         view()
             .child(view().px_4().pt_4().child(banner(
                 Tone::Secure,
@@ -1073,7 +1237,11 @@ fn child_view() {
             move || Some(crate::backend::is_live() && crate::backend::registered()),
             |live, _info| async move {
                 if live {
-                    sup::fetch().await.map_err(|p| p.0)
+                    let p = sup::fetch().await.map_err(|p| p.0)?;
+                    if let Some(p) = &p {
+                        crate::backend::rules::keep(p);
+                    }
+                    Ok::<_, String>(p)
                 } else {
                     Ok(None)
                 }
@@ -1204,7 +1372,8 @@ pub fn proxy() {
                     .gap_2()
                     .child(muted("A proxy helps where Songbird is blocked. Your messages stay end\u{2011}to\u{2011}end encrypted through it."))
                     .child(muted("The proxy's operator sees your IP address and when you connect, never your messages or who you talk to."))
-                    .child(muted("Songbird's servers see the proxy's address instead of yours.")),
+                    .child(muted("Songbird's servers see the proxy's address instead of yours."))
+                    .child(muted("Calls connect directly: they need a kind of connection a proxy doesn't carry.")),
             )
             .into_element()
     });

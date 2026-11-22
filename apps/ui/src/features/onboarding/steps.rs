@@ -315,11 +315,9 @@ pub(super) fn claim_username(s: Store, f: Flow) -> View {
         dismiss_keyboard();
         saving.set(true);
         let wanted = name();
-        // mock: claiming the name (app-core `claim_username`), case-insensitively unique.
-        set_timeout(Duration::from_millis(600), move || {
-            if !saving.try_set(false) {
-                return;
-            }
+        // Claimed on the server (only its hash and a proof leave the device).
+        {
+            saving.set(false);
             if crate::backend::is_live() && crate::backend::registered() {
                 spawn(async move {
                     match crate::backend::claim_username(&wanted).await {
@@ -336,7 +334,7 @@ pub(super) fn claim_username(s: Store, f: Flow) -> View {
             } else {
                 f.taken.set(Some(wanted));
             }
-        });
+        }
     };
     let options = username_suggestions(&lost, |n| s.username_available(n));
     flow_layout(
@@ -434,7 +432,8 @@ pub(super) fn creating(s: Store, f: Flow) -> View {
             }
         });
     } else {
-        // mock: registration with an invisible Argon2id proof of work (D-0048),
+        // The demo fixtures only (a real account is always live): registration with an
+        // invisible Argon2id proof of work (D-0048),
         // about 1.5 s, then claiming the username.
         set_timeout(Duration::from_millis(1500), move || {
             if !f
@@ -536,9 +535,9 @@ pub(super) fn profile(s: Store, f: Flow) -> View {
                                 .border_1()
                                 .border_color(move || c::border())
                                 .text_color(move || c::primary())
-                                .child(icon_btn(Icon::Camera, "Add a photo", || {
-                                    // mock: the photo picker and cropper (app-core encrypts the avatar).
-                                    toast("Choosing a photo isn't in this preview yet");
+                                // The system picker; encrypted and uploaded on this device.
+                                .child(icon_btn(Icon::Camera, "Add a photo", move || {
+                                    crate::backend::avatar::choose(crate::store::store())
                                 })),
                         ),
                 ),
@@ -600,9 +599,13 @@ pub(super) fn recovery(s: Store, f: Flow) -> View {
                         Some(Icon::Download),
                         Variant::Secondary,
                         BtnSize::Md,
-                        || {
-                            // mock: app-core renders the PDF; the save dialog picks where.
-                            toast("Recovery sheet saved to Downloads");
+                        move || {
+                            // A printable text sheet, saved where the user chooses.
+                            let key = s.session.with_untracked(|x| x.recovery_key.clone());
+                            let sheet = format!(
+                                "SONGBIRD RECOVERY KEY\n\n{key}\n\nThis key restores your Songbird backups and your account.\nKeep it somewhere safe and offline. Anyone with it can read your backups.\nSongbird can't recover it for you.\n"
+                            );
+                            save_file("songbird-recovery-key.txt", sheet.into_bytes());
                         },
                     )),
             )
@@ -767,8 +770,8 @@ pub(super) fn connect(s: Store, f: Flow) -> View {
             Some(w)
         });
         found.set(false);
-        if w == Way::Scan {
-            // mock: the camera finds a friend's code (app-core resolves the username link).
+        // The demo's camera "finds" a friend after a moment; a real account scans for real.
+        if w == Way::Scan && crate::store::demo() {
             set_timeout(Duration::from_millis(2600), move || {
                 if way.try_get() == Some(Some(Way::Scan)) {
                     let _ = found.try_set(true);
@@ -801,6 +804,16 @@ pub(super) fn connect(s: Store, f: Flow) -> View {
             return;
         }
         let id = s.create_group(title.clone(), Vec::new());
+        if crate::backend::chat::owns(id) {
+            // A real group's link is made on the server once the group exists (D-0148).
+            crate::backend::chat::ensure_link(s, id, false);
+            finish(
+                s,
+                id,
+                format!("\"{title}\" is ready. Share its invite link from the group's info."),
+            );
+            return;
+        }
         if let Some(chat) = s.chat(id) {
             set_clipboard(chat.invite_link);
         }
@@ -893,7 +906,20 @@ pub(super) fn connect(s: Store, f: Flow) -> View {
                                         )
                                 },
                             )
-                            .otherwise(|| scanner(200.0, "Point your camera at your friend's code. They'll find it in You → Your code.")),
+                            .otherwise(move || {
+                                if crate::store::demo() {
+                                    scanner(200.0, "Point your camera at your friend's code. They'll find it in You → Your code.")
+                                } else {
+                                    // A real camera; the chat opens once their code is read.
+                                    view()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(crate::features::chats::new_chat::friend_scanner(200.0, move |chat| {
+                                            finish(s, chat, welcome())
+                                        }))
+                                        .child(muted("They'll find their code in You → Your code.").text_center())
+                                }
+                            }),
                         ),
                         Some(Way::Group) => card()
                             .gap_3()

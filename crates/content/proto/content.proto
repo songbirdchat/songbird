@@ -355,11 +355,15 @@ message GroupUpdate {
     KIND_SETTINGS_CHANGED = 10;
     KIND_CHANNEL_CREATED = 11;
     KIND_CHANNEL_SUBSCRIBERS_CHANGED = 12;
+    // A member account's own new device joined (D-0171): no line in the chat; carries the
+    // title and the change log's key from the account's other device.
+    KIND_DEVICE_JOINED = 13;
   }
   Kind kind = 1;
   bytes actor = 2;              // 16 bytes
   repeated bytes subjects = 3;  // at most 1,024 accounts, 16 bytes each
   string value = 4;             // a new title or description, at most 4,096 bytes
+  bytes log_key = 5;            // the group's change-log key (32 bytes) for those just added (D-0156)
 }
 
 // Restricted chat (WhatsApp's advanced chat privacy). Every participant's app refuses to export

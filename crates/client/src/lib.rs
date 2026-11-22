@@ -26,6 +26,7 @@
 #![forbid(unsafe_code)]
 
 mod backoff;
+pub mod https;
 mod key;
 mod ws;
 
@@ -115,9 +116,18 @@ impl ClientConfig {
 /// proxies people run. `None` only if the TLS library refuses TLS 1.3 (it does not).
 #[must_use]
 pub fn web_tls() -> Option<Arc<rustls::ClientConfig>> {
-    let roots = rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };
+    // A development build's own root, set when it is built (`SONGBIRD_DEV_CA`, a PEM
+    // certificate), for a test server on a local network. No release build sets it, so they
+    // trust Mozilla's roots alone.
+    if let Some(pem) = option_env!("SONGBIRD_DEV_CA") {
+        use rustls_pki_types::{CertificateDer, pem::PemObject as _};
+        if let Ok(ca) = CertificateDer::from_pem_slice(pem.as_bytes()) {
+            let _ = roots.add(ca);
+        }
+    }
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])

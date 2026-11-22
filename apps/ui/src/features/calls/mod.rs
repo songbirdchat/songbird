@@ -3,14 +3,15 @@
 //!
 //! One call at a time lives in a global ([`state::CallState`]); every
 //! screen reads it and changes it through the functions here. The call
-//! layer, mounted once at the root, drives the mock's clock while a call
+//! layer, mounted once at the root, drives the call's clock while a call
 //! exists and draws the call: full screen on phones, a panel that
 //! shrinks to a corner player on desktops, the ringing card, the ended
 //! state.
 //!
-//! **Mock.** No media yet: no LiveKit, no microphone or camera, no keys.
-//! The phases advance on timers ([`state`]); app-core's call API
-//! (`app_core::calls`) replaces `begin`, `tick` and the toggles.
+//! A call in a real chat is real (D-0152): `backend::calls` rings, answers and hangs up through
+//! app-core and carries the media through LiveKit, end-to-end encrypted, and moves the call
+//! through [`live`]. The demo fixtures' chats (previews, screenshots) have no one at the other
+//! end: their calls walk the same phases on timers ([`state`]).
 
 mod ringing;
 mod state;
@@ -26,8 +27,8 @@ use crate::{
     ui::*,
 };
 
-use state::{ActiveCall, EndReason, Participant, Phase, Waiting};
-pub use state::{CallState, Layout, MicAccess, Share};
+use state::ActiveCall;
+pub use state::{CallState, EndReason, Layout, MicAccess, Participant, Phase, Share, Waiting};
 pub use tab::calls_tab;
 
 /// The call global.
@@ -54,7 +55,7 @@ fn field<T: Clone + PartialEq + 'static>(
     computed(move || st.with(|s| s.call.as_ref().map(&f).unwrap_or_else(|| none.clone())))
 }
 
-/// A call id for the mock (the real one comes from signalling).
+/// The UI's id for a call (the room's own id stays in `backend::calls`).
 fn next_id() -> u64 {
     let n = global::<CallSerial>();
     n.update(|x| x.0 += 1);
@@ -79,11 +80,14 @@ fn describe(s: &Store, chat: ChatId) -> Option<(String, u64, bool, Vec<Participa
                 id: p.id,
                 name: p.name,
                 seed: p.id,
-                // mock: a few people join muted, some with video.
+                // demo: a few people join muted, some with video.
                 muted: i % 3 == 1,
                 hand: false,
                 video: i % 2 == 0,
                 joins_at: i as u32 * 3,
+                identity: String::new(),
+                decrypting: true,
+                speaking: false,
             })
             .collect()
     } else {
@@ -96,6 +100,9 @@ fn describe(s: &Store, chat: ChatId) -> Option<(String, u64, bool, Vec<Participa
                 hand: false,
                 video: true,
                 joins_at: 0,
+                identity: String::new(),
+                decrypting: true,
+                speaking: false,
             })
             .into_iter()
             .collect()
@@ -125,6 +132,7 @@ fn begin(mut call: ActiveCall) {
     if call.phase != Phase::Incoming {
         announce_for_accessibility(format!("Calling {}", call.title));
     }
+    start_real(&call);
     calls().set(CallState { call: Some(call) });
 }
 
@@ -143,11 +151,36 @@ fn start_call_in(s: &Store, chat: ChatId, video: bool) {
     call.chat = Some(chat);
     call.group = group;
     call.video = video;
-    call.participants = people;
+    if crate::backend::chat::owns(chat) {
+        // Real: the room fills the tiles as people join.
+        call.real = true;
+        call.ring_left = ring_ticks(songbird_app_core::calls::RING_MS);
+    } else {
+        call.participants = people;
+    }
     begin(call);
 }
 
-/// Mock: makes `chat` call the user, as a push would (the Calls tab's
+/// A ring of `ms` milliseconds in ticks.
+fn ring_ticks(ms: u64) -> u32 {
+    u32::try_from(ms / state::TICK_MS).unwrap_or(u32::MAX)
+}
+
+/// Asks the backend to set up a real call that just left its first phase (or the permission
+/// explainer).
+fn start_real(call: &ActiveCall) {
+    if call.real && call.link && call.phase == Phase::Connecting {
+        crate::backend::calls::join_link(call.id);
+    } else if call.real
+        && !call.incoming
+        && call.phase == Phase::Calling
+        && let Some(chat) = call.chat
+    {
+        crate::backend::calls::start(call.id, chat, call.video);
+    }
+}
+
+/// The demo's ring: makes `chat` call the user, as a push would (the Calls tab's
 /// demo rows use it). The real ring comes from app-core's push handler.
 pub fn simulate_incoming(chat: ChatId, video: bool) {
     let s = store();
@@ -172,6 +205,35 @@ fn simulate_in(s: &Store, chat: ChatId, video: bool, elsewhere: bool) {
     announce_for_accessibility(format!("{name} is calling"));
 }
 
+/// Opens a call link (pasted or tapped): the user's own links by their name, anyone else's as
+/// "Call link"; in through the lobby where it has one. `false` if `url` is not a call link.
+pub fn open_link(url: &str) -> bool {
+    let Some((root, own)) = crate::backend::calls::describe_link(url) else {
+        return false;
+    };
+    let (title, admin) = match own {
+        Some((name, _)) => (name, true),
+        None => ("Call link".to_string(), false),
+    };
+    let seed = u64::from_be_bytes(root[..8].try_into().unwrap_or_default()) >> 3;
+    let mut call = ActiveCall::new(next_id(), title, seed, Phase::Connecting);
+    call.group = true;
+    call.real = true;
+    call.link = true;
+    call.admin = admin;
+    crate::backend::calls::prepare_link(call.id, root);
+    begin(call);
+    true
+}
+
+/// Lets someone in from a link's lobby, or turns them away (the admin's side).
+fn decide(id: u64, let_in: bool) {
+    match real_id() {
+        Some(call) => crate::backend::calls::admit(call, id, let_in),
+        None => with_call(|c| c.admit(id, let_in)),
+    }
+}
+
 /// Joins a call link: the user's own links open with the lobby on the
 /// admin's side (people waiting); `guest` joins as someone waiting.
 fn join_link(name: String, seed: u64, lobby: bool, guest: bool) {
@@ -182,7 +244,7 @@ fn join_link(name: String, seed: u64, lobby: bool, guest: bool) {
     };
     let mut call = ActiveCall::new(next_id(), name, seed, phase);
     call.group = true;
-    // mock: who is already in the call, and who waits.
+    // demo: who is already in the call, and who waits.
     let people = [
         ("Ioana Ștefănescu", 3),
         ("Andrei Dumitrescu", 4),
@@ -199,6 +261,9 @@ fn join_link(name: String, seed: u64, lobby: bool, guest: bool) {
             hand: false,
             video: i != 1,
             joins_at: i as u32 * 3,
+            identity: String::new(),
+            decrypting: true,
+            speaking: false,
         })
         .collect();
     if lobby && !guest {
@@ -225,13 +290,24 @@ fn end(s: Store, reason: EndReason) {
     let mut log = None;
     let mut chat = None;
     let mut video = false;
+    let mut real = None;
+    let mut link = None;
     with_call(|c| {
         log = c.end(reason);
         chat = c.chat;
         video = c.video;
+        real = c.real.then_some(c.id);
+        link = c.link.then(|| (c.title.clone(), c.seed));
     });
-    if let (Some((direction, secs)), Some(chat)) = (log, chat) {
-        s.log_call(chat, video, direction, secs);
+    if let Some(id) = real {
+        crate::backend::calls::closed(id, reason, true);
+    }
+    match (log, chat, link) {
+        (Some((direction, secs)), Some(chat), _) => s.log_call(chat, video, direction, secs),
+        (Some((direction, secs)), None, Some((title, seed))) => {
+            s.log_link_call(title, seed, video, direction, secs);
+        }
+        _ => {}
     }
     if let Some(line) = calls().with_untracked(|st| st.call.as_ref().map(state::status)) {
         announce_for_accessibility(line);
@@ -248,12 +324,35 @@ fn hang_up(s: Store) {
 }
 
 fn accept(video: bool) {
-    with_call(|c| c.accept(video));
+    if let Some(id) = accept_quietly(video) {
+        // Answered in the app: the system's call screen (iOS, D-0176) goes away.
+        crate::backend::callkit::answered_in_app(id);
+    }
+}
+
+fn accept_quietly(video: bool) -> Option<u64> {
+    let mut real = None;
+    with_call(|c| {
+        c.accept(video);
+        real = (c.real && c.phase == Phase::Connecting).then_some(c.id);
+    });
+    if let Some(id) = real {
+        crate::backend::calls::answer(id);
+    }
+    real
+}
+
+/// The real call's id, if the call going on is real.
+fn real_id() -> Option<u64> {
+    calls().with_untracked(|s| s.call.as_ref().filter(|c| c.real).map(|c| c.id))
 }
 
 fn toggle_mute() {
     with_call(|c| c.muted = !c.muted);
     let muted = calls().with_untracked(|s| s.call.as_ref().is_some_and(|c| c.muted));
+    if let Some(id) = real_id() {
+        crate::backend::calls::set_muted(id, muted);
+    }
     announce_for_accessibility(if muted {
         "Microphone off"
     } else {
@@ -264,7 +363,24 @@ fn toggle_mute() {
 fn toggle_video() {
     with_call(|c| c.video = !c.video);
     let on = calls().with_untracked(|s| s.call.as_ref().is_some_and(|c| c.video));
+    if let Some(id) = real_id() {
+        crate::backend::calls::set_video(id, on);
+    }
     announce_for_accessibility(if on { "Camera on" } else { "Camera off" });
+}
+
+/// The camera can't be used (access refused, or restricted): the call's camera goes off and the
+/// person is told where to allow it (D-0183: before, it stayed "on" and sent nothing).
+pub(super) fn camera_refused() {
+    let was_on = calls().with_untracked(|s| s.call.as_ref().is_some_and(|c| c.video));
+    if !was_on {
+        return;
+    }
+    with_call(|c| c.video = false);
+    if let Some(id) = real_id() {
+        crate::backend::calls::set_video(id, false);
+    }
+    toast("Songbird can't use the camera. Allow it in Settings, then turn it on again.");
 }
 
 fn set_minimised(minimised: bool) {
@@ -275,19 +391,29 @@ fn set_minimised(minimised: bool) {
     });
 }
 
-/// Drives the mock clock and applies what each tick asks. Owned by the
+/// Drives the call's clock and applies what each tick asks. Owned by the
 /// call layer's branch, so it runs only while a call exists.
 fn drive(s: Store) {
     set_interval(Duration::from_millis(state::TICK_MS), move || {
         let mut step = state::Step::default();
         let mut chat = None;
         let mut video = false;
+        let mut ended = None;
         let before = calls().with_untracked(|st| st.call.as_ref().map(|c| c.phase));
         with_call(|c| {
             step = c.tick();
             chat = c.chat;
             video = c.video;
+            if step.ended
+                && let Phase::Ended(reason) = c.phase
+            {
+                ended = Some((c.id, reason));
+            }
         });
+        if let Some((id, reason)) = ended {
+            // A ring that ran out here: the caller tells the callee to stop ringing.
+            crate::backend::calls::closed(id, reason, reason == EndReason::NoAnswer);
+        }
         if let (Some((direction, secs)), Some(chat)) = (step.log, chat) {
             s.log_call(chat, video, direction, secs);
         }
@@ -336,4 +462,205 @@ pub fn call_layer() -> AnyElement {
         },
     )
     .into_element()
+}
+
+/// Raises or lowers the user's hand (everyone in the call sees it).
+fn toggle_hand() {
+    with_call(|c| c.hand = !c.hand);
+    let raised = calls().with_untracked(|s| s.call.as_ref().is_some_and(|c| c.hand));
+    if let Some(id) = real_id() {
+        crate::backend::calls::set_hand(id, raised);
+    }
+    announce_for_accessibility(if raised {
+        "Hand raised"
+    } else {
+        "Hand lowered"
+    });
+}
+
+/// Starts sharing the screen, or a window.
+fn start_sharing(what: Share) {
+    with_call(|c| {
+        c.sharing = Some(what);
+        c.minimised = false;
+    });
+    if let Some(id) = real_id() {
+        crate::backend::calls::share_screen(id, what == Share::Window);
+    }
+    announce_for_accessibility("You are sharing your screen");
+}
+
+/// Stops sharing the screen.
+fn stop_sharing() {
+    with_call(|c| c.sharing = None);
+    if let Some(id) = real_id() {
+        crate::backend::calls::stop_sharing(id);
+    }
+    announce_for_accessibility("You stopped sharing your screen");
+}
+
+/// The participants' decoded video in real calls, by participant identity.
+#[derive(Default, Clone)]
+pub struct CallFrames(pub std::collections::HashMap<String, nsh_core::element::ImageSrc>);
+
+impl PartialEq for CallFrames {
+    fn eq(&self, _: &Self) -> bool {
+        // Every set is a new frame.
+        false
+    }
+}
+
+/// The participants whose video a phone draws natively (`songbird/video`, D-0183), by
+/// participant identity: their frames go to the view, not through here.
+#[derive(Default, Clone, PartialEq)]
+pub struct CallFeeds(pub std::collections::HashSet<String>);
+
+/// The devices a real call can use (the platform's), shown in the devices sheet.
+#[derive(Default, Clone, PartialEq)]
+pub struct CallDevices {
+    pub mics: Vec<String>,
+    pub cameras: Vec<String>,
+    pub outputs: Vec<String>,
+}
+
+/// What `backend::calls` changes: only the call it names, never another.
+pub mod live {
+    use super::{
+        ActiveCall, CallDevices, CallFeeds, CallFrames, CallState, EndReason, Phase, calls,
+    };
+    use nsh_core::prelude::*;
+
+    /// Changes call `id` if it is the one going on.
+    pub fn update(id: u64, f: impl FnOnce(&mut ActiveCall)) {
+        calls().update(|s| {
+            if let Some(c) = s.call.as_mut().filter(|c| c.id == id) {
+                f(c);
+            }
+        });
+    }
+
+    /// Reads call `id`.
+    pub fn with<T>(id: u64, f: impl FnOnce(&ActiveCall) -> T) -> Option<T> {
+        calls().with_untracked(|s| s.call.as_ref().filter(|c| c.id == id).map(f))
+    }
+
+    /// Whether call `id` still goes on.
+    pub fn exists(id: u64) -> bool {
+        with(id, |c| !c.ended()).unwrap_or(false)
+    }
+
+    /// Whether any call goes on (or rings) here.
+    pub fn busy() -> bool {
+        calls().with_untracked(|s| s.call.as_ref().is_some_and(|c| !c.ended()))
+    }
+
+    /// Ends call `id` for a reason this device did not choose, logging it.
+    pub fn end(id: u64, reason: EndReason) {
+        let mut log = None;
+        let mut chat = None;
+        let mut video = false;
+        let mut link = None;
+        update(id, |c| {
+            log = c.end(reason);
+            chat = c.chat;
+            video = c.video;
+            link = c.link.then(|| (c.title.clone(), c.seed));
+        });
+        if let (Some((direction, secs)), Some(s)) = (log, crate::store::try_store()) {
+            match (chat, link) {
+                (Some(chat), _) => s.log_call(chat, video, direction, secs),
+                (None, Some((title, seed))) => {
+                    s.log_link_call(title, seed, video, direction, secs);
+                }
+                _ => {}
+            }
+        }
+        crate::sounds::stop();
+        if let Some(line) = with(id, super::state::status) {
+            announce_for_accessibility(line);
+        }
+    }
+
+    /// The system's call screen (CallKit, D-0176) answered call `id`.
+    pub fn system_answer(id: u64) {
+        if let Some(video) = with(id, |c| c.video) {
+            super::accept_quietly(video);
+        }
+    }
+
+    /// The system's call screen declined or hung up call `id`.
+    pub fn system_end(id: u64) {
+        if exists(id)
+            && let Some(s) = crate::store::try_store()
+        {
+            super::hang_up(s);
+        }
+    }
+
+    /// The system's call screen muted (or unmuted) call `id`.
+    pub fn system_mute(id: u64, muted: bool) {
+        if with(id, |c| c.muted != muted).unwrap_or(false) {
+            super::toggle_mute();
+        }
+    }
+
+    /// An offer rings here: the incoming call, ringing `ring_ms` at most. `None` if one goes on.
+    pub fn ring(chat: crate::store::ChatId, video: bool, group: bool, ring_ms: u64) -> Option<u64> {
+        if busy() || ring_ms == 0 {
+            return None;
+        }
+        let s = crate::store::try_store()?;
+        let (title, seed, _, _) = super::describe(&s, chat)?;
+        let mut call = ActiveCall::new(super::next_id(), title, seed, Phase::Incoming);
+        call.chat = Some(chat);
+        call.group = group;
+        call.video = video;
+        call.real = true;
+        call.ring_left = super::ring_ticks(ring_ms);
+        let (id, name) = (call.id, call.title.clone());
+        calls().set(CallState { call: Some(call) });
+        s.arrive(crate::store::Arrival::Call { chat, video });
+        announce_for_accessibility(format!("{name} is calling"));
+        Some(id)
+    }
+
+    /// Shows (or with `None` removes) a participant's latest video frame.
+    pub fn frame(identity: &str, src: Option<nsh_core::element::ImageSrc>) {
+        global::<CallFrames>().update(|f| match src {
+            Some(src) => {
+                f.0.insert(identity.to_owned(), src);
+            }
+            None => {
+                f.0.remove(identity);
+            }
+        });
+    }
+
+    /// Forgets every frame (the call ended).
+    pub fn clear_frames() {
+        global::<CallFrames>().set(CallFrames::default());
+        global::<CallFeeds>().set(CallFeeds::default());
+    }
+
+    /// A participant's video started (`true`) or stopped on the native view.
+    pub fn feeding(identity: &str, on: bool) {
+        global::<CallFeeds>().update(|f| {
+            if on {
+                f.0.insert(identity.to_owned());
+            } else {
+                f.0.remove(identity);
+            }
+        });
+    }
+
+    /// Reads the platform's devices again (the call's audio opened, or a device came or went).
+    pub fn devices_changed() {
+        let (mics, outputs) = crate::backend::calls::audio_devices();
+        let cameras = crate::camera::lens_names();
+        global::<CallDevices>().set(CallDevices {
+            mics,
+            cameras,
+            outputs,
+        });
+    }
 }

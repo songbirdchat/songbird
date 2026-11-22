@@ -2,8 +2,6 @@
 //! two-step PIN, passkeys, accounts on this device, the account report
 //! and deleting the account.
 
-use std::time::Duration;
-
 use nsh_core::prelude::*;
 
 use crate::{
@@ -24,6 +22,10 @@ fn body() -> AnyElement {
     let pin_open = signal(false);
     let delete_open = signal(false);
     let adding_passkey = signal(false);
+    // The account's passkeys, as the server lists them (D-0177).
+    if crate::backend::is_live() && crate::backend::registered() {
+        crate::backend::run(async move { s.refresh_passkeys().await });
+    }
     let username = move || s.me.with(|m| m.username.clone());
 
     let username_rows = group([
@@ -158,13 +160,20 @@ fn body() -> AnyElement {
                     if adding_passkey.get_untracked() {
                         return;
                     }
+                    if !crate::backend::passkeys::available() {
+                        toast(
+                            "This device can't make passkeys. Add one from your phone or computer.",
+                        );
+                        return;
+                    }
                     adding_passkey.set(true);
-                    // mock: the platform's passkey sheet (app-core `add_passkey`).
-                    set_timeout(Duration::from_millis(1400), move || {
-                        if adding_passkey.try_set(false) {
-                            s.add_passkey();
-                            toast("Passkey added");
-                        }
+                    // The system's passkey sheet, then the server (D-0177).
+                    crate::backend::run(async move {
+                        let r = s.add_passkey().await;
+                        let _ = adding_passkey.try_set(false);
+                        r?;
+                        toast("Passkey added");
+                        Ok(())
                     });
                 })
                 .build(),
@@ -182,12 +191,21 @@ fn body() -> AnyElement {
                     .subtitle(format!("@{} · Using now", me.username))
                     .trailing(icon(Icon::Check, 18.0).text_color(move || c::primary()))
                     .build(),
-                Row::new("Switch accounts")
-                    .icon(Icon::Users)
-                    .subtitle("Up to 3 accounts on this device")
-                    .chevron()
-                    .on_press(move || switcher_open.set(true))
-                    .build(),
+                // One real account per device for now (app-core keeps one store): said plainly
+                // instead of a switcher with nothing real behind it (D-0184).
+                if crate::store::demo() {
+                    Row::new("Switch accounts")
+                        .icon(Icon::Users)
+                        .subtitle("Up to 3 accounts on this device")
+                        .chevron()
+                        .on_press(move || switcher_open.set(true))
+                        .build()
+                } else {
+                    Row::new("One account on this device")
+                        .icon(Icon::Users)
+                        .subtitle("Using a second account on the same device isn't available yet.")
+                        .build()
+                },
             ])
             .into_element()
         })
@@ -206,10 +224,13 @@ fn body() -> AnyElement {
                     .subtitle("This takes a moment."),
                 Some(true) => Row::new("Export report…")
                     .icon(Icon::Download)
-                    .subtitle("Ready. It's available for 3 days.")
+                    .subtitle("Ready. Choose where to save it.")
                     .on_press(move || {
-                        // mock: the save dialog (app-core `export_account` writes the file).
-                        toast("Report saved to Downloads");
+                        crate::backend::run(async {
+                            let bytes = crate::backend::account::report_file().await?;
+                            crate::ui::save_file("songbird-account-report.json", bytes);
+                            Ok(())
+                        });
                     }),
             };
             group([row.build()]).into_element()
@@ -298,16 +319,8 @@ pub fn account_switcher(open: Signal<bool>) -> AnyElement {
                             .build(),
                     );
                 }
-                rows.push(
-                    Row::new("Add account")
-                        .icon(Icon::UserPlus)
-                        .on_press(move || {
-                            open.set(false);
-                            // mock: a second account starts its own onboarding (app-core keeps one store per account).
-                            toast("Adding accounts comes with multi-account support in app-core");
-                        })
-                        .build(),
-                );
+                // Only the demo lists other accounts; adding one needs a store per account,
+                // which app-core doesn't keep yet, so no row offers it (D-0184).
                 group(rows).into_element()
             })
         })),
@@ -414,14 +427,11 @@ fn delete_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
             ))
             .child(
                 btn("Delete account", Variant::Danger, BtnSize::Md, move || {
-                    confirm("Delete your account?", "This can't be undone.", "Delete account", move || {
-                        // mock: app-core `delete_account` (the server deletes every store, D-0041).
-                        open.set(false);
-                        typed.set(String::new());
-                        nav::pop_to_root();
-                        s.replay_onboarding();
-                        toast("Your account was deleted");
-                    })
+                    open.set(false);
+                    typed.set(String::new());
+                    let _ = s;
+                    // The server deletes every store (D-0041); this device erases its own.
+                    crate::features::settings::account::delete_account();
                 })
                 .disabled(move || !matches()),
             ),

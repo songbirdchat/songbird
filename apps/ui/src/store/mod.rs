@@ -1,10 +1,10 @@
 //! The UI's view of app-core: a `Copy` store of signals, made once at the
 //! root and provided as context, and the intents that change it.
 //!
-//! **Mock.** app-core (A2) is not built yet, so this store keeps seed data
-//! in memory and simulates the network: statuses advance on timers,
-//! contacts "type" and reply. Every intent here is a call the real
-//! app-core will take over; screens never write signals directly.
+//! A real account starts empty and its intents reach app-core and the
+//! server (`crate::backend`). Only the demo fixtures (`demo()`) keep seed
+//! data and simulate the network: statuses advance on timers, contacts
+//! "type" and reply (D-0184). Screens never write signals directly.
 
 mod ext_chat;
 mod ext_chats;
@@ -14,7 +14,7 @@ pub mod ext_groups;
 pub mod ext_onboarding;
 mod ext_settings;
 mod model;
-mod seed;
+pub(crate) mod seed;
 
 use std::{collections::HashMap, time::Duration};
 
@@ -33,8 +33,51 @@ pub(crate) mod seed_for_tests {
 
 use crate::ui::Tick;
 
-/// "Now" in mock minutes: Tuesday 17 Nov 2026, 10:24.
-pub const NOW: Minutes = 0;
+/// The minute (since the Unix epoch) `Minutes` count from: when the app started; in tests a fixed
+/// Tuesday, 17 Nov 2026 at 10:24 UTC, so labels are the same on every run (D-0183: before, the
+/// app's clock was that mock Tuesday everywhere, and real messages showed made-up times).
+pub fn anchor() -> i64 {
+    #[cfg(test)]
+    {
+        29_915_184
+    }
+    #[cfg(not(test))]
+    {
+        static ANCHOR: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+        *ANCHOR.get_or_init(|| (nsh_core::time::unix_ms() as i64).div_euclid(60_000))
+    }
+}
+
+/// Now, in `Minutes` (the start of the test day in tests).
+pub fn now() -> Minutes {
+    #[cfg(test)]
+    {
+        0
+    }
+    #[cfg(not(test))]
+    {
+        (nsh_core::time::unix_ms() as i64).div_euclid(60_000) - anchor()
+    }
+}
+
+/// The `Minutes` of a Unix time in milliseconds.
+pub fn minutes_of_ms(ms: u64) -> Minutes {
+    i64::try_from(ms).unwrap_or(i64::MAX).div_euclid(60_000) - anchor()
+}
+
+/// `at` in this device's time zone (UTC in tests).
+fn local(at: Minutes) -> chrono::NaiveDateTime {
+    let secs = (anchor() + at).saturating_mul(60);
+    let utc = chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default();
+    #[cfg(test)]
+    {
+        utc.naive_utc()
+    }
+    #[cfg(not(test))]
+    {
+        utc.with_timezone(&chrono::Local).naive_local()
+    }
+}
 
 /// The time of day `at` shows as ("09:41").
 /// A link's host without `www.` ("songbird.chat").
@@ -68,13 +111,12 @@ fn link_title(url: &str) -> String {
 }
 
 pub fn clock(at: Minutes) -> String {
-    let m = (10 * 60 + 24 + at).rem_euclid(24 * 60);
-    format!("{:02}:{:02}", m / 60, m % 60)
+    local(at).format("%H:%M").to_string()
 }
 
 /// The day `at` falls on, relative to today (0), as the list shows it.
 pub fn day_of(at: Minutes) -> i64 {
-    (10 * 60 + 24 + at).div_euclid(24 * 60)
+    (local(at).date() - local(now()).date()).num_days()
 }
 
 /// The chat list's time: today's clock, "Yesterday", a weekday, a date.
@@ -82,23 +124,14 @@ pub fn when_label(at: Minutes) -> String {
     match day_of(at) {
         0 => clock(at),
         -1 => "Yesterday".into(),
-        d if d > -7 => [
-            "Wednesday",
-            "Thursday",
-            "Friday",
-            "Saturday",
-            "Sunday",
-            "Monday",
-            "Tuesday",
-        ][(d.rem_euclid(7)) as usize]
-            .into(),
-        // Older: the day and month, as WhatsApp shows them ("7 Nov").
-        d => {
-            let day = 17 + d;
-            if day >= 1 {
-                format!("{day} Nov")
+        d if d > -7 => local(at).format("%A").to_string(),
+        // Older: the day and month ("7 Nov"), with the year when it isn't this one.
+        _ => {
+            let (t, today) = (local(at), local(now()));
+            if chrono::Datelike::year(&t) == chrono::Datelike::year(&today) {
+                t.format("%-d %b").to_string()
             } else {
-                format!("{} Oct", 31 + day)
+                t.format("%-d %b %Y").to_string()
             }
         }
     }
@@ -191,10 +224,27 @@ pub fn install(s: Store) {
     provide_context(s);
 }
 
+/// Milliseconds since the epoch (the system clock).
+pub fn now_ms() -> u64 {
+    // After 1970 and within u64 milliseconds.
+    nsh_core::time::unix_ms().max(0.0) as u64
+}
+
+/// Whether this run shows the demo data: only a preview build started as a
+/// screenshot fixture (`SONGBIRD_ONBOARDED=1`, or the `songbird-onboarded`
+/// marker in the data folder). Every other run is a real account on the
+/// real backend, starting empty.
+pub fn demo() -> bool {
+    cfg!(test)
+        || crate::PREVIEW_BUILD
+            && (std::env::var_os("SONGBIRD_ONBOARDED").is_some()
+                || data_dir().is_some_and(|d| d.join("songbird-onboarded").exists()))
+}
+
 impl Store {
-    /// The seeded mock, with the onboarding state from storage.
+    /// The store: empty for a real account, the demo data for fixtures.
     pub fn new() -> Self {
-        let seed = seed::seed();
+        let seed = if demo() { seed::seed() } else { seed::empty() };
         // Debug builds only: `SONGBIRD_ONBOARDED=1` skips the first run (for
         // screenshot tests of the rest of the app).
         // …or a `songbird-onboarded` file in the app's data folder (for
@@ -315,6 +365,9 @@ impl Store {
     }
 
     pub fn mark_read(&self, id: ChatId) {
+        if crate::backend::chat::owns(id) && self.chat(id).is_some_and(|c| c.unread > 0) {
+            crate::backend::chat::mark_read(id);
+        }
         if self
             .chat(id)
             .is_some_and(|c| c.unread > 0 || c.marked_unread || c.mentions > 0)
@@ -333,7 +386,47 @@ impl Store {
         self.edit_chat(id, |c| c.pinned = !c.pinned);
     }
     pub fn toggle_mute(&self, id: ChatId) {
-        self.edit_chat(id, |c| c.muted = !c.muted);
+        let muted = self.chat(id).is_some_and(|c| c.muted);
+        if muted {
+            self.unmute(id);
+        } else {
+            self.mute(id, None);
+        }
+    }
+
+    /// Mutes a chat for `ms` (None: always).
+    pub fn mute(&self, id: ChatId, ms: Option<u64>) {
+        let until = ms.map_or(u64::MAX, |ms| now_ms().saturating_add(ms));
+        self.edit_chat(id, |c| {
+            c.muted = true;
+            c.muted_until = until;
+        });
+    }
+
+    pub fn unmute(&self, id: ChatId) {
+        self.edit_chat(id, |c| {
+            c.muted = false;
+            c.muted_until = 0;
+        });
+    }
+
+    /// Lifts the mutes whose time is up (called every minute).
+    pub fn end_mutes(&self) {
+        let now = now_ms();
+        let due = self.chats.with_untracked(|cs| {
+            cs.iter()
+                .any(|c| c.muted && c.muted_until != u64::MAX && c.muted_until <= now)
+        });
+        if due {
+            self.chats.update(|cs| {
+                for c in cs.iter_mut() {
+                    if c.muted && c.muted_until != u64::MAX && c.muted_until <= now {
+                        c.muted = false;
+                        c.muted_until = 0;
+                    }
+                }
+            });
+        }
     }
     pub fn toggle_archive(&self, id: ChatId) {
         self.edit_chat(id, |c| c.archived = !c.archived);
@@ -341,10 +434,23 @@ impl Store {
     pub fn toggle_favourite(&self, id: ChatId) {
         self.edit_chat(id, |c| c.favourite = !c.favourite);
     }
+    /// Locks or unlocks a chat. Locking needs the app passcode (it is what opens Locked chats):
+    /// without one, nothing changes and the user is told.
     pub fn toggle_lock(&self, id: ChatId) {
+        let locked = self.chat(id).is_some_and(|c| c.locked);
+        if !locked && !crate::backend::lock::is_set() {
+            crate::ui::toast(
+                "Set an app passcode first (Privacy → App lock): it opens locked chats.",
+            );
+            return;
+        }
         self.edit_chat(id, |c| c.locked = !c.locked);
     }
     pub fn set_disappearing(&self, id: ChatId, timer: Option<Disappear>) {
+        if crate::backend::chat::owns(id) {
+            // For everyone in the chat; app-core keeps it and stamps new messages with it.
+            crate::backend::chat::set_timer(id, timer);
+        }
         self.edit_chat(id, |c| c.disappearing = timer);
         let label = match timer {
             Some(t) => format!(
@@ -356,37 +462,72 @@ impl Store {
         self.push_message(id, None, Body::System(label));
     }
     pub fn set_draft(&self, id: ChatId, draft: String) {
+        if crate::backend::chat::owns(id) && self.settings.with_untracked(|x| x.typing_indicators) {
+            crate::backend::chat::typing(id, !draft.trim().is_empty());
+        }
         if self.chat(id).is_some_and(|c| c.draft != draft) {
             self.edit_chat(id, |c| c.draft = draft);
         }
     }
+    /// Clears a chat's messages from this device (a real one's from app-core's store too).
     pub fn clear_chat(&self, id: ChatId) {
+        if crate::backend::chat::owns(id) {
+            crate::backend::chat::clear_chat(id);
+        }
         self.messages.update(|m| {
             m.insert(id, Vec::new());
         });
     }
+    /// Deletes a chat from this device (a real one from app-core's store too, so it stays
+    /// gone after a restart; a message request's deletion reaches the user's other devices).
     pub fn delete_chat(&self, id: ChatId) {
+        if crate::backend::chat::owns(id) {
+            let request = self.chat(id).is_some_and(|c| c.request);
+            crate::backend::chat::delete_chat(id, request);
+        }
+        self.forget_chat(id);
+    }
+
+    /// Takes a chat off the screens only (what the network or app-core already removed).
+    pub(crate) fn forget_chat(&self, id: ChatId) {
         self.chats.update(|cs| cs.retain(|c| c.id != id));
         self.messages.update(|m| {
             m.remove(&id);
         });
     }
+
+    /// Accepts a message request: a real one shares the user's profile key with the requester
+    /// and tells the user's other devices (app-core `accept_request`).
     pub fn accept_request(&self, id: ChatId) {
+        if crate::backend::chat::owns(id) && self.chat(id).is_some_and(|c| c.request) {
+            crate::backend::chat::accept_request(id);
+        }
         self.edit_chat(id, |c| c.request = false);
     }
     pub fn block(&self, contact: ContactId, blocked: bool) {
+        if crate::backend::chat::owns(contact) {
+            crate::backend::chat::block(*self, contact, blocked);
+        }
         self.contacts.update(|cs| {
             if let Some(c) = cs.iter_mut().find(|c| c.id == contact) {
                 c.blocked = blocked;
             }
         });
     }
-    /// Reports to Songbird: the last five messages of the chat are sent,
-    /// as the report flow says (mock: nothing leaves the device).
+    /// Reports to Songbird: the chat's newest five messages from the other
+    /// person, each with its franking proof (PROTOCOL §5.14).
+    /// A real report says how it went once the server answers (never a thank-you before).
     pub fn report(&self, chat: ChatId) {
-        let _ = chat;
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::report(chat);
+        } else {
+            crate::ui::toast("Reported. Thank you.");
+        }
     }
     pub fn verify(&self, contact: ContactId, verified: bool) {
+        if crate::backend::chat::owns(contact) {
+            crate::backend::chat::set_verified(contact, verified);
+        }
         self.contacts.update(|cs| {
             if let Some(c) = cs.iter_mut().find(|c| c.id == contact) {
                 c.verified = verified;
@@ -402,8 +543,8 @@ impl Store {
         let id = self.id();
         let at = self
             .last_message(chat)
-            .map(|m| m.at.max(NOW))
-            .unwrap_or(NOW);
+            .map(|m| m.at.max(now()))
+            .unwrap_or(now());
         let system = matches!(body, Body::System(_));
         let msg = Message {
             id,
@@ -427,6 +568,9 @@ impl Store {
         let incoming = (from.is_some() && !system).then(|| (msg.body.preview(), from));
         self.messages
             .update(|m| m.entry(chat).or_default().push(msg));
+        if incoming.is_some() {
+            self.on_incoming(chat);
+        }
         if let Some((preview, Some(from))) = incoming {
             let sender = self.contact(from).map(|c| c.name);
             self.arrive(Arrival::Message {
@@ -436,6 +580,15 @@ impl Store {
             });
         }
         id
+    }
+
+    /// An incoming message brings an archived chat back to the list unless
+    /// "Keep chats archived" is on (Settings → Chats).
+    pub fn on_incoming(&self, chat: ChatId) {
+        let keep = self.settings.with_untracked(|x| x.keep_archived);
+        if !keep && self.chat(chat).is_some_and(|c| c.archived) {
+            self.edit_chat(chat, |c| c.archived = false);
+        }
     }
 
     /// Tells the notifier, if one listens.
@@ -497,11 +650,31 @@ impl Store {
             self.edit_message(chat, id, |m| m.reply_to = reply_to);
         }
         self.set_draft(chat, String::new());
-        self.simulate_delivery(chat, id);
+        if crate::backend::chat::owns(chat) {
+            // A real chat: app-core encrypts and sends it; ticks follow the
+            // server's answer and the recipient's receipts (D-0139).
+            let body = self.message(chat, id).map(|m| m.body);
+            if let Some(body) = body {
+                crate::backend::chat::send(*self, chat, id, &body);
+            }
+        } else {
+            self.simulate_delivery(chat, id);
+        }
         id
     }
 
+    /// Marks one of the user's messages as failed to send.
+    pub fn fail(&self, chat: ChatId, id: MsgId) {
+        self.edit_message(chat, id, |m| m.status = Tick::Failed);
+    }
+
+    /// The demo's delivery: ticks on a timer and the contact's canned answer. Only the demo
+    /// fixtures have chats no server carries; anywhere else such a message honestly fails.
     fn simulate_delivery(&self, chat: ChatId, id: MsgId) {
+        if !demo() {
+            self.fail(chat, id);
+            return;
+        }
         let store = *self;
         let offline = self.session.with_untracked(|s| s.offline);
         if offline {
@@ -542,14 +715,29 @@ impl Store {
         });
     }
 
+    /// Sends a failed message again (a real chat's through app-core).
     pub fn retry(&self, chat: ChatId, id: MsgId) {
         self.edit_message(chat, id, |m| m.status = Tick::Sending);
+        if crate::backend::chat::owns(chat) {
+            if let Some(body) = self.message(chat, id).map(|m| m.body) {
+                crate::backend::chat::retry(*self, chat, id, &body);
+            }
+            return;
+        }
         self.simulate_delivery(chat, id);
     }
 
     /// Adds, changes or removes the user's reaction (one per message).
     pub fn react(&self, chat: ChatId, id: MsgId, emoji: &str) {
         let emoji = emoji.to_string();
+        if crate::backend::chat::owns(chat) {
+            let had = self.message(chat, id).is_some_and(|m| {
+                m.reactions
+                    .iter()
+                    .any(|r| r.emoji == emoji && r.by.contains(&None))
+            });
+            crate::backend::chat::react(chat, id, if had { String::new() } else { emoji.clone() });
+        }
         self.edit_message(chat, id, |m| {
             let had = m
                 .reactions
@@ -573,6 +761,9 @@ impl Store {
 
     /// Edits the user's own text within the edit window (15 minutes).
     pub fn edit_text(&self, chat: ChatId, id: MsgId, text: String) {
+        if crate::backend::chat::owns(chat) && self.message(chat, id).is_some_and(|m| m.mine()) {
+            crate::backend::chat::edit(chat, id, text.clone());
+        }
         self.edit_message(chat, id, |m| {
             if m.mine() {
                 m.body = Body::Text(text);
@@ -582,13 +773,20 @@ impl Store {
     }
 
     pub fn delete_for_everyone(&self, chat: ChatId, id: MsgId) {
+        if crate::backend::chat::owns(chat) && self.message(chat, id).is_some_and(|m| m.mine()) {
+            crate::backend::chat::delete_for_everyone(chat, id);
+        }
         self.edit_message(chat, id, |m| {
             m.body = Body::Deleted;
             m.reactions.clear();
         });
     }
 
+    /// Deletes a message from this device (a real one from app-core's store too).
     pub fn delete_for_me(&self, chat: ChatId, id: MsgId) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::delete_for_me(&[id]);
+        }
         self.messages.update(|m| {
             if let Some(v) = m.get_mut(&chat) {
                 v.retain(|x| x.id != id);
@@ -596,24 +794,82 @@ impl Store {
         });
     }
 
+    /// Stars or unstars a message (a real chat's stars are kept in its synced record).
     pub fn toggle_star(&self, chat: ChatId, id: MsgId) {
         self.edit_message(chat, id, |m| m.starred = !m.starred);
+        crate::backend::chat::save_stars(*self, chat);
     }
 
     pub fn toggle_pin_message(&self, chat: ChatId, id: MsgId) {
+        if crate::backend::chat::owns(chat) {
+            // Pinned for everyone in the chat; the message shows pinned once app-core has it.
+            let pinned = self
+                .messages
+                .with_untracked(|all| {
+                    all.get(&chat)
+                        .and_then(|v| v.iter().find(|m| m.id == id).map(|m| m.pinned))
+                })
+                .unwrap_or(false);
+            crate::backend::chat::pin(*self, chat, id, !pinned);
+            return;
+        }
         self.edit_message(chat, id, |m| m.pinned = !m.pinned);
     }
 
+    /// The options a press on `option` leaves chosen: one choice is replaced (or taken back);
+    /// with several allowed, it is added or taken back.
+    pub fn after_press(mine: &[usize], option: usize, multiple: bool) -> Vec<usize> {
+        if mine.contains(&option) {
+            mine.iter().copied().filter(|o| *o != option).collect()
+        } else if multiple {
+            let mut v = mine.to_vec();
+            v.push(option);
+            v.sort_unstable();
+            v
+        } else {
+            vec![option]
+        }
+    }
+
     pub fn vote(&self, chat: ChatId, id: MsgId, option: usize) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::vote(*self, chat, id, option);
+            return;
+        }
         self.edit_message(chat, id, |m| {
-            if let Body::Poll { options, mine, .. } = &mut m.body {
-                if let Some(old) = mine.take() {
-                    options[old].1 -= 1;
+            if let Body::Poll {
+                options,
+                mine,
+                multiple,
+                closed: false,
+                ..
+            } = &mut m.body
+            {
+                let next = Self::after_press(mine, option, *multiple);
+                for o in mine.iter() {
+                    if let Some(x) = options.get_mut(*o) {
+                        x.1 = x.1.saturating_sub(1);
+                    }
                 }
-                if *mine != Some(option) {
-                    options[option].1 += 1;
-                    *mine = Some(option);
+                for o in &next {
+                    if let Some(x) = options.get_mut(*o) {
+                        x.1 += 1;
+                    }
                 }
+                *mine = next;
+            }
+        });
+    }
+
+    /// Closes the user's own poll: the votes are final for everyone.
+    pub fn close_poll(&self, chat: ChatId, id: MsgId) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::close_poll(*self, chat, id);
+            return;
+        }
+        self.edit_message(chat, id, |m| {
+            if let Body::Poll { closed, .. } = &mut m.body {
+                *closed = true;
             }
         });
     }
@@ -636,6 +892,10 @@ impl Store {
     }
 
     pub fn open_view_once(&self, chat: ChatId, id: MsgId) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::open_view_once(*self, chat, id);
+            return;
+        }
         self.edit_message(chat, id, |m| {
             if let Body::ViewOnce { opened, .. } = &mut m.body {
                 *opened = true;
@@ -659,16 +919,18 @@ impl Store {
         }
     }
 
-    /// Nudges the other person of a direct chat. The real path: when the
-    /// account is live, `Content.attention {NUDGE}` to their devices
-    /// (`backend::nudge`), which sends nothing until app-core knows them.
-    /// The chat shows it either way. mock: the line in the chat is the
-    /// mock's; a real nudge is not a stored message (PROTOCOL §10.5).
+    /// Nudges the other person of a direct chat. A real chat sends `Content.attention {NUDGE}`
+    /// to their devices (`backend::nudge`, PROTOCOL §10.5) and shows a line here only (a nudge
+    /// is not a stored message); a demo chat shows the line.
     pub fn nudge(&self, chat: ChatId) {
-        if let Some(peer) = self.peer(chat) {
-            let _ = crate::backend::nudge::send(
-                crate::backend::presence::peer_of(*self, peer.id).as_ref(),
-            );
+        if crate::backend::rules::nudges_off() {
+            crate::ui::toast("Nudges are off by your parent's rules.");
+            return;
+        }
+        if crate::backend::chat::owns(chat) {
+            crate::backend::nudge::send(chat);
+            self.push_message(chat, None, Body::Nudge);
+            return;
         }
         self.send(chat, Body::Nudge, None);
     }
@@ -693,6 +955,18 @@ impl Store {
 
     /// Creates a group the user owns and returns it.
     pub fn create_group(&self, title: String, members: Vec<ContactId>) -> ChatId {
+        // Real contacts, or a real account's group of one (people join by its link): a real
+        // MLS group (D-0146). Only the demo makes groups no server knows.
+        let real_account = !demo() && crate::backend::registered();
+        if crate::backend::chat::all_real(&members) || real_account {
+            let id = crate::backend::chat::create_group(*self, title.clone(), members);
+            self.push_message(
+                id,
+                None,
+                Body::System(format!("You created the group “{title}”")),
+            );
+            return id;
+        }
         let id = self.id();
         let mut chat = seed::chat(id, ChatKind::Group, &title);
         chat.members = std::iter::once(Member {
@@ -727,12 +1001,18 @@ impl Store {
     }
 
     pub fn remove_member(&self, chat: ChatId, contact: ContactId) {
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::remove_from_group(chat, contact);
+        }
         self.edit_chat(chat, |c| c.members.retain(|m| m.contact != Some(contact)));
         let name = self.contact_name(Some(contact));
         self.push_message(chat, None, Body::System(format!("You removed {name}")));
     }
 
     pub fn add_members(&self, chat: ChatId, contacts: Vec<ContactId>) {
+        if crate::backend::chat::owns(chat) && crate::backend::chat::all_real(&contacts) {
+            crate::backend::chat::add_to_group(chat, contacts.clone());
+        }
         for &contact in &contacts {
             self.edit_chat(chat, |c| {
                 c.members.push(Member {
@@ -776,7 +1056,31 @@ impl Store {
             video,
             group,
             direction,
-            at: NOW,
+            at: now(),
+            secs,
+        };
+        self.calls.update(|cs| cs.insert(0, record));
+    }
+
+    /// A call through a call link (no chat): kept under the link's name, as a group call
+    /// (D-0183: link calls never reached the history).
+    pub fn log_link_call(
+        &self,
+        title: String,
+        seed: u64,
+        video: bool,
+        direction: CallDirection,
+        secs: u32,
+    ) {
+        let record = CallRecord {
+            id: self.id(),
+            chat: 0,
+            title,
+            seed,
+            video,
+            group: true,
+            direction,
+            at: now(),
             secs,
         };
         self.calls.update(|cs| cs.insert(0, record));
@@ -807,6 +1111,9 @@ impl Store {
     }
 
     pub fn remove_device(&self, id: u64) {
+        if crate::backend::registered() {
+            crate::backend::remove_device(*self, id);
+        }
         self.devices.update(|d| d.retain(|x| x.id != id));
     }
 
@@ -840,8 +1147,13 @@ impl Store {
         self.session.update(|s| s.offline = offline);
     }
 
-    /// Mock: the username check app-core will ask the server for.
+    /// Whether `name` may be offered as a username. Only claiming it on the server
+    /// (`backend::claim_username`) says whether it's free, so a real account checks its form
+    /// only (the server answers the claim); the demo has a list of taken names.
     pub fn username_available(&self, name: &str) -> bool {
+        if !demo() {
+            return ext_onboarding::username_format(name).is_none();
+        }
         let taken = ["ana", "mihai", "admin", "songbird", "support"];
         name.len() >= 3 && !taken.contains(&name.to_lowercase().as_str())
     }
@@ -858,6 +1170,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn poll_presses_replace_add_and_take_back() {
+        assert_eq!(Store::after_press(&[], 1, false), vec![1]);
+        assert_eq!(Store::after_press(&[1], 2, false), vec![2]);
+        assert_eq!(Store::after_press(&[1], 1, false), Vec::<usize>::new());
+        assert_eq!(Store::after_press(&[2], 0, true), vec![0, 2]);
+        assert_eq!(Store::after_press(&[0, 2], 2, true), vec![0]);
+    }
+
+    #[test]
     fn clock_and_days() {
         assert_eq!(clock(0), "10:24");
         assert_eq!(clock(-24), "10:00");
@@ -865,6 +1186,19 @@ mod tests {
         assert_eq!(day_of(-60 * 11), -1);
         assert_eq!(when_label(-60 * 11), "Yesterday");
         assert_eq!(day_label(0), "Today");
+    }
+
+    #[test]
+    fn real_times_show_as_their_clock_and_day() {
+        // A message sent at 11:59 UTC on the test day, and one ten days before.
+        let at = |minutes_after_anchor: i64| {
+            u64::try_from((anchor() + minutes_after_anchor) * 60_000).unwrap()
+        };
+        assert_eq!(minutes_of_ms(at(95)), 95);
+        assert_eq!(clock(minutes_of_ms(at(95))), "11:59");
+        assert_eq!(when_label(minutes_of_ms(at(-10 * 24 * 60))), "7 Nov");
+        assert_eq!(when_label(minutes_of_ms(at(-2 * 24 * 60))), "Sunday");
+        assert_eq!(when_label(minutes_of_ms(at(-400 * 24 * 60))), "13 Oct 2025");
     }
 
     #[test]
@@ -935,5 +1269,55 @@ mod tests {
             .preview(),
             "Voice message (1:15)"
         );
+    }
+}
+
+/// `YYYY-MM-DD HH:MM` (UTC) of Unix milliseconds.
+pub fn date_time(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    // Howard Hinnant's civil-from-days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        tod / 3600,
+        (tod % 3600) / 60
+    )
+}
+
+impl Store {
+    /// The chat as a plain text file (one line per message, UTC times),
+    /// written on this device for the user to save (Export chat).
+    pub fn export_text(&self, chat: ChatId) -> String {
+        let now_ms = nsh_core::time::unix_ms() as i64;
+        let title = self.chat(chat).map(|c| c.title).unwrap_or_default();
+        let mut out = format!("Songbird chat: {title}\nExported {}\n\n", date_time(now_ms));
+        for m in self.messages_of(chat) {
+            let who = self.contact_name(m.from);
+            out.push_str(&format!(
+                "[{}] {who}: {}\n",
+                date_time(now_ms + m.at * 60_000),
+                m.body.preview()
+            ));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod date_tests {
+    #[test]
+    fn dates_are_civil() {
+        assert_eq!(super::date_time(0), "1970-01-01 00:00");
+        assert_eq!(super::date_time(1_795_000_000_000), "2026-11-18 11:06");
     }
 }

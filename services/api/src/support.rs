@@ -14,6 +14,9 @@
 //! budget per IP range (the range keyed, never stored). Closing deletes the ticket and every
 //! message; untouched for 90 days, the worker deletes it.
 //!
+//! **Crash reports** (D-0170) are tickets of kind `crash`, only unsigned: scrubbed on the
+//! device, sent only when the user turned them on, sealed like any message.
+//!
 //! | Request | Auth | Body | Answer |
 //! | --- | --- | --- | --- |
 //! | `GET /v1/support/key` | — | — | `{"key"}` |
@@ -174,7 +177,11 @@ impl Support {
         if !songbird_keys::xeddsa::x25519_public_key_ok(&reply) {
             return Outcome::Malformed("reply_key");
         }
-        if !matches!(b.kind.as_str(), "help" | "appeal" | "billing") {
+        if !matches!(b.kind.as_str(), "help" | "appeal" | "billing" | "crash") {
+            return Outcome::Malformed("kind");
+        }
+        if b.kind == "crash" && account.is_some() {
+            // A crash report never names anyone (D-0170): only unsigned.
             return Outcome::Malformed("kind");
         }
         if b.kind == "appeal" && account.is_none() {

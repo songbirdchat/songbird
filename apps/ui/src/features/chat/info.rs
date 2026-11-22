@@ -61,12 +61,12 @@ fn media_tile(m: &Message, side: f32) -> AnyElement {
     let id = m.id;
     let (shot, label, video) = match &m.body {
         Body::Image { alt, w, h, .. } => (
-            portrait::photo(alt, id, *w, *h),
+            portrait::message_photo(alt, id, *w, *h),
             format!("Photo: {alt}"),
             false,
         ),
         Body::Video { caption, secs } => (
-            portrait::photo(&format!("video {caption}"), id, 16, 9),
+            portrait::message_photo(&format!("video {caption}"), id, 16, 9),
             format!("Video, {}", super::logic::duration(*secs)),
             true,
         ),
@@ -390,9 +390,11 @@ fn contact_info(chat: ChatId) -> AnyElement {
 
     let blocked = move || peer.with(|p| p.as_ref().is_some_and(|p| p.blocked));
     let danger = group([
-        Row::new("Export chat").icon(Icon::Upload).on_press(|| {
-            // mock: app-core writes an encrypted export the user saves.
-            toast("Export ready. Saved to Files.");
+        Row::new("Export chat").icon(Icon::Upload).on_press(move || {
+            // A text file of the chat, saved where the user chooses. It
+            // leaves Songbird's encryption: the user decides where it goes.
+            let text = s.export_text(chat);
+            save_file("songbird-chat.txt", text.into_bytes());
         }).build(),
         Row::new("Clear chat")
             .icon(Icon::Trash)
@@ -435,7 +437,6 @@ fn contact_info(chat: ChatId) -> AnyElement {
                     "Report",
                     move || {
                         s.report(chat);
-                        toast("Reported. Thank you.");
                     },
                 )
             })

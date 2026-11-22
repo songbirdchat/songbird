@@ -20,12 +20,13 @@
 
 use std::cell::RefCell;
 
-use nsh_core::{prelude::*, storage::Storage, time::unix_ms};
+use super::vault::Storage;
+use nsh_core::{prelude::*, time::unix_ms};
 use songbird_proto::storage::{self as wire, Head, ID_LEN, Ids, Record, Write};
 use songbird_sync::{Remote, Replica, StorageKey, SyncError, WriteOutcome};
 
 use crate::store::{
-    Audience, Disappear, LockAfter, MESSAGE_TONES, RINGTONES, Settings, SettingsExt, Store,
+    Audience, Broadcast, Disappear, LockAfter, MESSAGE_TONES, RINGTONES, Settings, SettingsExt, Store,
     ThemeChoice,
 };
 
@@ -89,7 +90,7 @@ fn timer(t: Option<Disappear>) -> String {
         None => "off",
         Some(Disappear::Day) => "day",
         Some(Disappear::Week) => "week",
-        Some(Disappear::Quarter) => "quarter",
+        Some(Disappear::FourWeeks) => "four_weeks",
     }
     .into()
 }
@@ -99,7 +100,8 @@ fn p_timer(v: &str) -> Option<Option<Disappear>> {
         "off" => Some(None),
         "day" => Some(Some(Disappear::Day)),
         "week" => Some(Some(Disappear::Week)),
-        "quarter" => Some(Some(Disappear::Quarter)),
+        // "quarter" (90 days) was offered before the protocol's 4-week limit was honoured.
+        "four_weeks" | "quarter" => Some(Some(Disappear::FourWeeks)),
         _ => None,
     }
 }
@@ -256,12 +258,44 @@ pub const SYNCED: &[(&str, Get, Set)] = &[
     field!("s/auto_docs", s.auto_docs, pair, p_pair),
     flag!("s/hd_uploads", s.hd_uploads),
     field!("s/lists", x.lists, |v: Vec<String>| list(&v), p_list),
+    // The profile's links and the broadcast lists follow the account (D-0184).
+    field!("s/links", x.links, |v: Vec<String>| list(&v), p_list),
+    field!("s/broadcasts", x.broadcasts, |v: Vec<Broadcast>| broadcasts(&v), p_broadcasts),
 ];
+
+/// Broadcast lists as a record: id, name and members (contacts are named by account-derived
+/// IDs, the same on every device).
+fn broadcasts(v: &[Broadcast]) -> String {
+    serde_json::Value::Array(
+        v.iter()
+            .map(|b| serde_json::json!({ "id": b.id, "name": b.name, "members": b.members }))
+            .collect(),
+    )
+    .to_string()
+}
+
+fn p_broadcasts(v: &str) -> Option<Vec<Broadcast>> {
+    let all: Vec<serde_json::Value> = serde_json::from_str(v).ok()?;
+    all.into_iter()
+        .map(|b| {
+            Some(Broadcast {
+                id: b["id"].as_u64()?,
+                name: b["name"].as_str()?.to_owned(),
+                members: b["members"]
+                    .as_array()?
+                    .iter()
+                    .map(serde_json::Value::as_u64)
+                    .collect::<Option<Vec<_>>>()?,
+            })
+        })
+        .collect()
+}
 
 /// Every device-only setting.
 pub const DEVICE: &[(&str, Get, Set)] = &[
     flag!("app_lock", s.app_lock),
     field!("app_lock_after", x.app_lock_after, lock, p_lock),
+    flag!("app_lock_biometrics", x.app_lock_biometrics),
     flag!("block_screenshots", s.block_screenshots),
     flag!("hide_in_switcher", s.hide_in_switcher),
     flag!("enter_sends", s.enter_sends),
@@ -1105,9 +1139,14 @@ mod headless {
         // Synced settings are in the replica (to sync when the account is live); device ones
         // apart, never in it.
         let saved = storage.entries();
+        // Kept under the vault key (D-0172): sealed in app storage.
+        let sealed = saved.get(super::K_STATE).ok_or("no replica")?;
+        assert!(sealed.starts_with("v1:"));
         let replica = songbird_sync::Replica::load(
-            &crate::backend::wire::unhex(saved.get(super::K_STATE).ok_or("no replica")?)
-                .ok_or("hex")?,
+            &crate::backend::wire::unhex(
+                &crate::backend::vault::reveal(super::K_STATE, sealed).ok_or("sealed")?,
+            )
+            .ok_or("hex")?,
         )
         .map_err(|e| e.to_string())?;
         assert_eq!(replica.get("s/typing"), Some(&b"0"[..]));

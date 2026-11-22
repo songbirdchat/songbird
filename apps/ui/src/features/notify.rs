@@ -127,6 +127,9 @@ pub fn install(focus_of: impl Fn() -> Option<u64> + 'static) {
         let n = s.total_unread();
         untracked(|| set_badge(n));
     });
+    // Mutes for 8 hours or a week lift on time.
+    s.end_mutes();
+    set_interval(std::time::Duration::from_secs(60), move || s.end_mutes());
     // Ask once, when the user has anything switched on.
     spawn(async move {
         use nsh_core::notifications::NotificationPermission as P;
@@ -134,8 +137,15 @@ pub fn install(focus_of: impl Fn() -> Option<u64> + 'static) {
             let _ = request_notification_permission().await;
         }
     });
-    watch(s, focused, focus_of, |n: Notice| {
-        let notification = Notification::new(n.id, n.title, n.body).silent(n.silent);
+    watch(s, focused, focus_of, move |n: Notice| {
+        let mut notification = Notification::new(n.id, n.title, n.body).silent(n.silent);
+        // The user's message tone (Settings → Notifications), Songbird's own.
+        let tone = s.ext().with_untracked(|x| x.message_tone);
+        if let Some(path) = crate::sounds::asset(&tone) {
+            notification = notification.sound(path);
+        } else if tone == "None" {
+            notification = notification.silent(true);
+        }
         spawn(async move {
             let _ = show_notification(notification).await;
         });
@@ -184,7 +194,8 @@ fn watch(
 /// tray would, then has the first direct contact write and, later, call: to
 /// see the notifications on screen without driving the UI (D-0098).
 pub fn demo_from_env() {
-    let preview = crate::PREVIEW_BUILD;
+    // The demo fixtures only: a real account's chats never get made-up messages (D-0184).
+    let preview = crate::store::demo();
     // The environment, or (emulators and devices, which pass none through) a
     // `songbird-demo-arrivals` file in the app's data folder.
     let from_file =
@@ -221,6 +232,10 @@ pub fn demo_from_env() {
 }
 
 fn notify(s: Store, chat: u64, event: &Event, focus: Focus, sink: &dyn Fn(Notice)) {
+    // A supervised child's quiet hours (D-0166): nothing notifies.
+    if crate::backend::rules::quiet_now() {
+        return;
+    }
     let Some(c) = s.chat(chat) else { return };
     if let Some(n) = s.settings.with_untracked(|st| decide(event, &c, st, focus)) {
         sink(n);

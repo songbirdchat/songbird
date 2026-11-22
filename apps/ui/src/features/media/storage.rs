@@ -528,7 +528,7 @@ fn chat_storage(chat: ChatId) {
 fn network_usage() {
     nav::push("network-usage", move || {
         let s = store();
-        let usage = move || groups_state().with(|g| g.usage);
+        let usage = move || groups_state().with(|g| g.usage.clone());
         let line =
             move |title: &'static str,
                   glyph: Icon,

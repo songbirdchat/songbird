@@ -7,11 +7,25 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Buying a plan in Google Play (D-0178). -->
+    <uses-permission android:name="com.android.vending.BILLING" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Sharing the screen in a call (D-0180): MediaProjection in a foreground service. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <!-- Scanning link and safety-number codes, photos and videos to send, video calls. -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Calls and voice messages (D-0176): the microphone, and the audio route of a call. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <!-- Songbird works without a camera (tablets, Chromebooks): the screens say so. -->
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <!-- Sharing where you are, once, when you ask (D-0174); never in the background. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-feature android:name="android.hardware.location" android:required="false" />
+    <!-- Saving photos and videos on Android 8 and 9 (10+ uses MediaStore without it; D-0174). -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
     <queries>
         <intent>
@@ -22,6 +36,8 @@
 
     <application
         android:label="Songbird"
+        android:icon="@mipmap/icon_songbird"
+        android:roundIcon="@mipmap/icon_songbird"
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:supportsRtl="true"
         android:allowBackup="false"
@@ -36,15 +52,75 @@
             android:exported="false"
             android:grantUriPermissions="true" />
 
+        <!-- Sharing the screen in a call (D-0180). -->
+        <service
+            android:name="chat.songbird.share.ScreenShareService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
+
+        <!-- UnifiedPush (D-0176): the user's distributor wakes Songbird; no Google services. -->
+        <service
+            android:name="chat.songbird.push.SongbirdPushService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="org.unifiedpush.android.connector.PUSH_EVENT" />
+            </intent-filter>
+        </service>
+
         <activity
             android:name="chat.songbird.app.SongbirdActivity"
             android:exported="true"
             android:configChanges="locale|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|layoutDirection|fontScale"
-            android:windowSoftInputMode="adjustResize">
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- The app icon the person chose (D-0179): one launcher alias per icon, one enabled. -->
+        <activity-alias
+            android:name=".IconSongbird"
+            android:targetActivity="chat.songbird.app.SongbirdActivity"
+            android:icon="@mipmap/icon_songbird"
+            android:roundIcon="@mipmap/icon_songbird"
+            android:enabled="true"
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
+        </activity-alias>
+        <activity-alias
+            android:name=".IconNight"
+            android:targetActivity="chat.songbird.app.SongbirdActivity"
+            android:icon="@mipmap/icon_night"
+            android:roundIcon="@mipmap/icon_night"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".IconPaper"
+            android:targetActivity="chat.songbird.app.SongbirdActivity"
+            android:icon="@mipmap/icon_paper"
+            android:roundIcon="@mipmap/icon_paper"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".IconLavender"
+            android:targetActivity="chat.songbird.app.SongbirdActivity"
+            android:icon="@mipmap/icon_lavender"
+            android:roundIcon="@mipmap/icon_lavender"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
     </application>
 </manifest>

@@ -202,6 +202,7 @@ pub(crate) struct Conv {
     pub event_open: Signal<bool>,
     pub contact_open: Signal<bool>,
     pub sticker_open: Signal<bool>,
+    pub location_open: Signal<bool>,
     /// The camera sheet (a photo to send).
     pub camera_open: Signal<bool>,
     pub timer_open: Signal<bool>,
@@ -262,6 +263,7 @@ impl Conv {
             event_open: signal(false),
             contact_open: signal(false),
             sticker_open: signal(false),
+            location_open: signal(false),
             camera_open: signal(false),
             timer_open: signal(false),
             searching: signal(false),
@@ -682,6 +684,20 @@ pub fn conversation(chat: ChatId) -> AnyElement {
                 .flex_1()
                 .overflow_hidden()
                 .bind_motion(&cv.shake)
+                // The wallpaper chosen in Settings → Chats, over chats that
+                // keep the default theme (a chat's own theme takes over).
+                .child(view().absolute().inset_0().bg(move || {
+                    let own_theme = s
+                        .chat(chat)
+                        .is_some_and(|c| c.theme != crate::store::ChatTheme::default());
+                    if own_theme {
+                        AdaptiveColor::TRANSPARENT
+                    } else {
+                        crate::features::settings::chats::wallpaper_tint(
+                            s.settings.with(|x| x.chat_wallpaper),
+                        )
+                    }
+                }))
                 // The chat's scene, behind the messages (Prompt 9).
                 .child(scene::scene_layer(chat))
                 .child(list::message_list(cv))
@@ -727,8 +743,33 @@ pub fn conversation(chat: ChatId) -> AnyElement {
             root,
             format!("Drop to send to {title}"),
             move |files| {
+                // A real chat: each file is read here, then encrypted and uploaded by app-core
+                // like any attachment (D-0184).
+                if crate::backend::chat::owns(chat) {
+                    let max = songbird_app_core::attachments::MAX_FILE as u64;
+                    let paths: Vec<std::path::PathBuf> = files
+                        .iter()
+                        .filter_map(|f| crate::features::desktop::file_path(&f.uri))
+                        .filter(|p| {
+                            let ok = std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() <= max);
+                            if !ok {
+                                toast("That file can't be sent: files are up to 256 MB.");
+                            }
+                            ok
+                        })
+                        .collect();
+                    let picked = nsh_core::picker::read_files(
+                        &paths,
+                        &nsh_core::picker::PickRequest::new(
+                            true,
+                            u32::try_from(paths.len()).unwrap_or(u32::MAX),
+                        ),
+                    );
+                    let photos = !picked.is_empty() && picked.iter().all(|f| f.mime.starts_with("image/"));
+                    crate::backend::chat::send_picked(s, chat, picked, photos);
+                    return;
+                }
                 for f in files {
-                    // mock: app-core encrypts and uploads the file (A7 attachments).
                     s.send(
                         chat,
                         crate::store::Body::File {

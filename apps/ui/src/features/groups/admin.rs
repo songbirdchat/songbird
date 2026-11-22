@@ -84,18 +84,22 @@ pub fn roles_page(chat: ChatId) {
                     .unwrap_or_default()
             })
         };
+        // A real group's pinning and deleting others' messages are fixed by the protocol
+        // (moderators and admins), not by its policy: shown, not switchable (D-0184).
+        let real = crate::backend::chat::owns(chat);
         let row = move |p: &'static Permission| {
+            let fixed = real && matches!(p.title, "Pin messages" | "Admins can delete others' messages");
             switch_row(
                 p.title,
-                p.explain,
+                if fixed { "Set by Songbird for every group: admins pin and delete others' messages." } else { p.explain },
                 move || ch.with(|c| c.as_ref().is_some_and(|c| (p.get)(&c.permissions))),
-                manage,
+                move || manage() && !fixed,
                 move |v| {
-                    s.update_chat(chat, |c| {
-                        (p.set)(&mut c.permissions, v);
+                    s.set_group_permissions(chat, |perms, announcement| {
+                        (p.set)(perms, v);
                         // "Send messages" and the announcement group are one setting.
                         if p.title == "Send messages" {
-                            c.announcement_only = !v;
+                            *announcement = !v;
                         }
                     })
                 },
@@ -123,9 +127,9 @@ pub fn roles_page(chat: ChatId) {
                         move || ch.with(|c| c.as_ref().is_some_and(|c| c.announcement_only)),
                         manage,
                         move |v| {
-                            s.update_chat(chat, |c| {
-                                c.announcement_only = v;
-                                c.permissions.members_send = !v;
+                            s.set_group_permissions(chat, |perms, announcement| {
+                                *announcement = v;
+                                perms.members_send = !v;
                             })
                         },
                     )]))
@@ -152,6 +156,10 @@ fn role_line(glyph: Icon, title: &'static str, what: &'static str) -> AnyElement
 pub fn invite_link_page(chat: ChatId) {
     nav::push(format!("invite:{chat}"), move || {
         let s = store();
+        // A real group's link is made (or read) by app-core (D-0148).
+        if crate::backend::chat::owns(chat) {
+            crate::backend::chat::ensure_link(s, chat, false);
+        }
         let ch = computed(move || s.chat(chat));
         let manage = move || ch.with(|c| c.as_ref().is_some_and(can_manage));
         let link = move || {
@@ -168,7 +176,11 @@ pub fn invite_link_page(chat: ChatId) {
                 "The current link stops working at once. Anyone who has it will need the new one.",
                 "Reset link",
                 move || {
-                    s.reset_invite(chat);
+                    if crate::backend::chat::owns(chat) {
+                        crate::backend::chat::ensure_link(s, chat, true);
+                    } else {
+                        s.reset_invite(chat);
+                    }
                     toast("New link made");
                 },
             );
@@ -210,11 +222,7 @@ pub fn invite_link_page(chat: ChatId) {
                             .build(),
                         Row::new("Share link…")
                             .icon(Icon::Share)
-                            .on_press(move || {
-                                // mock: the platform share sheet; until then the link is copied.
-                                set_clipboard(link());
-                                toast("Link copied. Paste it in any app to share.");
-                            })
+                            .on_press(move || share_text(link()))
                             .build(),
                         view()
                             .style_when(move || !manage(), |st| st.hidden())
@@ -241,7 +249,7 @@ pub fn invite_link_page(chat: ChatId) {
                                     move || settings().expiry,
                                     move |v| {
                                         if manage() {
-                                            s.set_invite_settings(chat, |x| x.expiry = v)
+                                            s.change_invite_limits(chat, |x| x.expiry = v)
                                         }
                                     },
                                 ),
@@ -259,7 +267,7 @@ pub fn invite_link_page(chat: ChatId) {
                                     move || settings().uses,
                                     move |v| {
                                         if manage() {
-                                            s.set_invite_settings(chat, |x| x.uses = v)
+                                            s.change_invite_limits(chat, |x| x.uses = v)
                                         }
                                     },
                                 ),
@@ -271,7 +279,7 @@ pub fn invite_link_page(chat: ChatId) {
                         "An admin approves each person who uses the link.",
                         move || ch.with(|c| c.as_ref().is_some_and(|c| c.permissions.approve_joins)),
                         manage,
-                        move |v| s.update_chat(chat, |c| c.permissions.approve_joins = v),
+                        move |v| s.set_group_permissions(chat, |p, _| p.approve_joins = v),
                     )]))
                     .child(footnote(
                         "Anyone with the link sees the group's name and photo and can ask to join. The link itself never shows the group's messages.",
@@ -298,6 +306,9 @@ fn disabled_unless(enabled: impl Fn() -> bool + Copy + 'static, control: impl In
 
 /// Join requests, with Approve and Reject for each person.
 pub fn join_requests_page(chat: ChatId) {
+    if crate::backend::chat::owns(chat) {
+        crate::backend::chat::refresh_requests(store(), chat);
+    }
     nav::push(format!("requests:{chat}"), move || {
         let s = store();
         let requests = computed(move || s.chat(chat).map(|c| c.join_requests).unwrap_or_default());
@@ -317,7 +328,7 @@ pub fn join_requests_page(chat: ChatId) {
                 virtual_list(move || requests.with(Vec::len), move |at| {
                     let id = computed(move || requests.with(|r| r.get(at.index()).copied()));
                     let name = move || id.get().map(|i| s.contact_name(Some(i))).unwrap_or_default();
-                    let username = move || id.get().and_then(|i| s.contact(i)).map(|c| format!("@{}", c.username)).unwrap_or_default();
+                    let username = move || id.get().and_then(|i| s.contact(i)).filter(|c| !c.username.is_empty()).map(|c| format!("@{}", c.username)).unwrap_or_default();
                     let seed = move || id.get().unwrap_or(0);
                     // Wide windows: the buttons at the row's end. Narrow ones:
                     // under the name, on the text column, so the line beside
@@ -396,6 +407,8 @@ fn change_icon(line: &str) -> Icon {
 
 /// Who joined, left, was added, removed or made admin, newest first.
 pub fn member_changes_page(chat: ChatId) {
+    // A real group's log is fetched and opened on this device each time the page opens.
+    crate::backend::chat::load_member_changes(chat);
     nav::push(format!("changes:{chat}"), move || {
         let s = store();
         let changes = computed(move || s.member_history(chat));

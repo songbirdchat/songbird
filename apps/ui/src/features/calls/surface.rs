@@ -148,10 +148,13 @@ pub(super) fn ringing_avatar(
         )
 }
 
-/// The mic level: five bars moving while the microphone is on (mock: a
-/// loop, not the real level). Still when muted or with reduced motion.
+/// The mic level: five bars. In a real call they follow the level the room measures while the
+/// user speaks; a demo call has no microphone, so its bars loop. Still when muted or with
+/// reduced motion.
 fn level_meter() -> View {
     let muted = field(|c| c.muted, false);
+    let real = field(|c| c.real, false);
+    let level = field(|c| (c.level * 20.0).round() / 20.0, 0.0);
     let reduced = motion::reduced();
     view()
         .flex_row()
@@ -160,16 +163,29 @@ fn level_meter() -> View {
         .h(px(16.0))
         .label(move || {
             if muted.get() {
-                "Microphone off"
+                "Microphone off".to_string()
+            } else if real.get() {
+                format!("Microphone level {} percent", (level.get() * 100.0).round())
             } else {
-                "Microphone level"
+                "Microphone level".to_string()
             }
         })
         .role(AccessibilityRole::Image)
         .children((0..5).map(move |i| {
+            let peaks = [0.9, 0.6, 1.0, 0.5, 0.8];
             let v = animated_value(0.3);
-            if !reduced {
-                let peaks = [0.9, 0.6, 1.0, 0.5, 0.8];
+            if real.get_untracked() {
+                effect(move || {
+                    let l = if muted.get() { 0.0 } else { level.get() };
+                    let to = (0.2 + 0.8 * l * peaks[i]).clamp(0.2, 1.0);
+                    if reduced {
+                        v.set(to);
+                    } else {
+                        let _ =
+                            Animation::timing(&v, to, Timing::new(120.0, Easing::EaseOut)).start();
+                    }
+                });
+            } else if !reduced {
                 let ms = 260.0 + i as f32 * 70.0;
                 let _ = Animation::sequence([
                     Animation::timing(&v, peaks[i], Timing::new(ms, Easing::EaseInOut)),
@@ -220,7 +236,7 @@ fn lock_line(verify: Signal<bool>) -> nsh_base::ButtonElement {
 }
 
 /// A person's picture filling a frame, as their camera would: the
-/// portrait scaled to cover it (mock: no camera feed yet), or blurred
+/// portrait scaled to cover it (demo calls; a real camera is `live_feed`), or blurred
 /// behind a dark scrim as the backdrop of a voice tile. `None` when the
 /// person has no photo.
 fn feed(seed: u64, blurred: bool) -> Option<View> {
@@ -252,11 +268,101 @@ fn feed(seed: u64, blurred: bool) -> Option<View> {
     )
 }
 
-/// One person's tile: a video tile (their picture filling it, as the
-/// mock's "camera") or a voice tile (their avatar over a dark, blurred
-/// backdrop of the same picture), with their name, a muted mark and a
-/// raised hand. Marks are glyphs with labels, never colour alone.
-fn tile(name: String, seed: u64, video: bool, muted: bool, hand: bool, big: bool) -> View {
+/// What a tile shows of a person.
+#[derive(Clone, PartialEq)]
+struct Look {
+    name: String,
+    seed: u64,
+    video: bool,
+    muted: bool,
+    hand: bool,
+    /// Their participant identity in a real call (their frames are shown by it); empty for the
+    /// user's own tile and demo calls.
+    identity: String,
+    /// Whether their frames decrypt.
+    decrypting: bool,
+    speaking: bool,
+}
+
+impl Look {
+    fn of(p: &Participant) -> Self {
+        Self {
+            name: p.name.clone(),
+            seed: p.seed,
+            video: p.video,
+            muted: p.muted,
+            hand: p.hand,
+            identity: p.identity.clone(),
+            decrypting: p.decrypting,
+            speaking: p.speaking,
+        }
+    }
+}
+
+/// A participant's latest decoded frame filling the tile (real calls).
+/// One image element for the whole call, its source swapped as frames come (D-0183: a new
+/// element per frame flickered and lagged).
+fn live_feed(identity: String) -> View {
+    // Phones: the native view, frames straight from the decoder (D-0183).
+    if songbird_camera::video::supported() {
+        let feeds = global::<super::CallFeeds>();
+        let feed = songbird_camera::video::feed_id(&identity);
+        let has = computed(move || feeds.with(|f| f.0.contains(&identity)));
+        return view()
+            .absolute()
+            .inset_0()
+            .accessibility_elements_hidden(true)
+            .child(when(
+                move || has.get(),
+                move || {
+                    native("songbird/video")
+                        .prop("feed", serde_json::Value::from(feed))
+                        .flex_1()
+                },
+            ));
+    }
+    let frames = global::<super::CallFrames>();
+    let has = {
+        let id = identity.clone();
+        computed(move || frames.with(|f| f.0.contains_key(&id)))
+    };
+    view()
+        .absolute()
+        .inset_0()
+        .accessibility_elements_hidden(true)
+        .child(when(
+            move || has.get(),
+            move || {
+                let id = identity.clone();
+                image(move || {
+                    frames
+                        .with(|f| f.0.get(&id).cloned())
+                        .unwrap_or_else(|| nsh_core::element::ImageSrc::rgba(1, 1, vec![0; 4]))
+                })
+                .absolute()
+                .inset_0()
+                .object_fit(ResizeMode::Cover)
+            },
+        ))
+}
+
+/// One person's tile: a video tile (their camera's frames in a real call; their picture in a
+/// demo one) or a voice tile (their avatar over a dark, blurred backdrop of their picture), with
+/// their name, a muted mark and a raised hand; a ring while they speak; "Can't decrypt" (and
+/// nothing of theirs) when their frames do not decrypt. Marks are glyphs with labels, never
+/// colour alone.
+fn tile(look: Look, big: bool) -> View {
+    let Look {
+        name,
+        seed,
+        video,
+        muted,
+        hand,
+        identity,
+        decrypting,
+        speaking,
+    } = look;
+    let real = !identity.is_empty();
     let size = if big { 112.0 } else { 64.0 };
     let label = {
         let mut l = name.clone();
@@ -269,11 +375,18 @@ fn tile(name: String, seed: u64, video: bool, muted: bool, hand: bool, big: bool
         if video {
             l.push_str(", camera on");
         }
+        if !decrypting {
+            l.push_str(", can't decrypt");
+        }
+        if speaking {
+            l.push_str(", speaking");
+        }
         l
     };
     let person = name.trim_end_matches(" (you)").to_string();
-    let backdrop = feed(seed, !video);
-    let full_feed = video && backdrop.is_some();
+    // A real person's camera is their frames, never their profile picture.
+    let backdrop = feed(seed, !video || real);
+    let full_feed = video && (real || backdrop.is_some());
     view()
         .flex_1()
         .min_h(px(if big { 220.0 } else { 120.0 }))
@@ -285,9 +398,33 @@ fn tile(name: String, seed: u64, video: bool, muted: bool, hand: bool, big: bool
         .label(label)
         .role(AccessibilityRole::Image)
         .child(backdrop)
+        .child((real && video && decrypting).then(|| live_feed(identity.clone())))
         // No photo: their avatar (initials on their hue) on the dark tile,
         // as in the participants sheet, camera or not.
-        .child((!full_feed).then(|| avatar(person.clone(), seed, size)))
+        .child((!full_feed && decrypting).then(|| avatar(person.clone(), seed, size)))
+        .child((!decrypting).then(|| {
+            view()
+                .items_center()
+                .gap_1()
+                .px_3()
+                .accessibility_elements_hidden(true)
+                .child(icon(Icon::Lock, 20.0).text_color(move || c::on_call()))
+                .child(
+                    text("Can't decrypt")
+                        .text_size(px(font::SMALL))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(move || c::on_call()),
+                )
+        }))
+        .child(speaking.then(|| {
+            view()
+                .absolute()
+                .inset_0()
+                .rounded(move || radius::lg())
+                .border_2()
+                .border_color(move || c::primary())
+                .pointer_events(PointerEvents::None)
+        }))
         .child(
             view()
                 .absolute()
@@ -334,20 +471,56 @@ fn tile(name: String, seed: u64, video: bool, muted: bool, hand: bool, big: bool
         }))
 }
 
-/// The user's own tile.
-fn my_tile(s: Store, big: bool) -> AnyElement {
-    let me = s.me.get_untracked();
+/// The user's own tile: their live camera while it's on (a phone's or computer's preview), else
+/// their picture or initials.
+fn my_tile(s: Store, big: bool, cam: crate::camera::Session) -> AnyElement {
+    let me = s.me;
     let look = field(|c| (c.video, c.muted, c.hand), (false, false, false));
-    dynamic(move || {
-        let (video, muted, hand) = look.get();
-        let name = me.name.clone();
-        untracked(move || tile(format!("{name} (you)"), me.seed, video, muted, hand, big))
-    })
+    let live = crate::camera::has_live_preview();
+    let video = field(|c| c.video, false);
+    view()
+        .flex_1()
+        .relative()
+        .child(dynamic(move || {
+            let (video, muted, hand) = look.get();
+            let me = me.get();
+            untracked(move || {
+                tile(
+                    Look {
+                        name: format!("{} (you)", me.name),
+                        seed: me.seed,
+                        video: video && !live,
+                        muted,
+                        hand,
+                        identity: String::new(),
+                        decrypting: true,
+                        speaking: false,
+                    },
+                    big,
+                )
+            })
+        }))
+        // The camera's preview, made once and kept while the camera is on: iOS allows one
+        // preview layer per camera session and aborts on a second (D-0183: remade with every
+        // change of the tile, it crashed the app).
+        .child(when(
+            move || live && video.get(),
+            move || {
+                crate::camera::preview_fill(&cam)
+                    .rounded(move || radius::lg())
+                    .overflow_hidden()
+                    .pointer_events(PointerEvents::None)
+            },
+        ))
+        .into_element()
 }
 
 /// A group call's tiles: a grid, or the speaker big with the rest in a
 /// strip. Tiles arrive one by one as people join.
 fn group_stage(s: Store) -> View {
+    // The user's camera, shown on their own tile (D-0183: before, a group or link call never
+    // opened it, and sent an empty video track).
+    let cam = call_camera();
     let st = calls();
     let joined =
         computed(move || st.with(|x| x.call.as_ref().map(|c| c.joined()).unwrap_or_default()));
@@ -373,20 +546,34 @@ fn group_stage(s: Store) -> View {
         cell().child(
             arrive(0.96, 0.0, motion::SLOW)
                 .aspect_ratio(shape())
-                .child(dynamic(move || {
-                    // Follows their mute and hand without remaking the arrival.
-                    let now = calls().with(|x| {
-                        x.call
-                            .as_ref()
-                            .and_then(|c| c.participants.iter().find(|q| q.id == p.id).cloned())
+                .child({
+                    // Follows what their tile shows (mute, hand, camera, speaking) without
+                    // remaking the arrival, and only when that changes: the call's state also
+                    // carries audio levels many times a second (D-0183).
+                    let look = computed(move || {
+                        let now = calls().with(|x| {
+                            x.call.as_ref().and_then(|c| {
+                                c.participants
+                                    .iter()
+                                    .find(|q| {
+                                        q.id == p.id
+                                            || (!p.identity.is_empty() && q.identity == p.identity)
+                                    })
+                                    .cloned()
+                            })
+                        });
+                        Look::of(&now.unwrap_or_else(|| p.clone()))
                     });
-                    let q = now.unwrap_or_else(|| p.clone());
-                    untracked(move || tile(q.name, q.seed, q.video, q.muted, q.hand, false))
-                })),
+                    dynamic(move || {
+                        let l = look.get();
+                        untracked(move || tile(l, false))
+                    })
+                }),
         )
     };
     view().flex_1().child(dynamic(move || {
         let l = layout.get();
+        let cam = cam.clone();
         untracked(move || match l {
             Layout::Grid => scroll()
                 .flex_1()
@@ -396,7 +583,11 @@ fn group_stage(s: Store) -> View {
                         .flex_wrap()
                         .justify_center()
                         .p(px(4.0))
-                        .child(cell().child(view().aspect_ratio(shape()).child(my_tile(s, false))))
+                        .child(cell().child(view().aspect_ratio(shape()).child(my_tile(
+                            s,
+                            false,
+                            cam.clone(),
+                        ))))
                         .child(each(move || joined.get(), |p: &Participant| p.id, person)),
                 )
                 .into_element(),
@@ -404,14 +595,16 @@ fn group_stage(s: Store) -> View {
                 .flex_1()
                 .gap_2()
                 .p_2()
-                .child(dynamic(move || {
-                    let first = speaker.get();
-                    untracked(move || match first {
-                        Some(p) => {
-                            tile(p.name, p.seed, p.video, p.muted, p.hand, true).into_element()
-                        }
-                        None => my_tile(s, true),
-                    })
+                .child(dynamic({
+                    let cam = cam.clone();
+                    move || {
+                        let first = speaker.get();
+                        let cam = cam.clone();
+                        untracked(move || match first {
+                            Some(p) => tile(Look::of(&p), true).into_element(),
+                            None => my_tile(s, true, cam),
+                        })
+                    }
                 }))
                 .child(
                     scroll().horizontal().h(px(132.0)).child(
@@ -422,7 +615,12 @@ fn group_stage(s: Store) -> View {
                             .min_w(relative(1.0))
                             .justify_center()
                             .gap_2()
-                            .child(view().w(px(160.0)).child(my_tile(s, false)))
+                            // The user's tile is big while no one else is: never twice (one
+                            // camera preview per session).
+                            .child(when(move || speaker.with(Option::is_some), {
+                                let cam = cam.clone();
+                                move || view().w(px(160.0)).child(my_tile(s, false, cam.clone()))
+                            }))
                             .child(each(
                                 move || {
                                     let big = speaker.with(|p| p.as_ref().map(|p| p.id));
@@ -436,9 +634,9 @@ fn group_stage(s: Store) -> View {
                                 |p: &Participant| p.id,
                                 |p, _| {
                                     let p = p.get_untracked();
-                                    arrive(0.96, 0.0, motion::SLOW).w(px(160.0)).child(tile(
-                                        p.name, p.seed, p.video, p.muted, p.hand, false,
-                                    ))
+                                    arrive(0.96, 0.0, motion::SLOW)
+                                        .w(px(160.0))
+                                        .child(tile(Look::of(&p), false))
                                 },
                             )),
                     ),
@@ -467,8 +665,15 @@ fn direct_stage(s: Store, big: f32) -> View {
         },
         false,
     );
-    let video_on = field(|c| c.video && c.phase == Phase::Connected, false);
+    let video_on = field(
+        |c| {
+            c.phase == Phase::Connected
+                && (c.video || (c.real && c.participants.first().is_some_and(|p| p.video)))
+        },
+        false,
+    );
     let theirs = field(|c| c.participants.first().is_some_and(|p| p.video), false);
+    let theirs_now = field(|c| c.participants.first().filter(|_| c.real).cloned(), None);
     let (name, seed) = title.clone();
     let voice = move || {
         let (name, seed) = (name.clone(), seed);
@@ -503,14 +708,35 @@ fn direct_stage(s: Store, big: f32) -> View {
         view()
             .flex_1()
             .p_2()
-            .child(arrive(0.98, 0.0, motion::SLOW).flex_1().child(tile(
-                name,
-                seed,
-                theirs.get_untracked(),
-                false,
-                false,
-                true,
-            )))
+            .child(
+                arrive(0.98, 0.0, motion::SLOW)
+                    .flex_1()
+                    .child(dynamic(move || {
+                        // Their tile follows their camera, mute and decryption in a real call.
+                        let them = theirs_now.get();
+                        let (name, seed) = (name.clone(), seed);
+                        untracked(move || {
+                            let look = them.map_or_else(
+                                || Look {
+                                    name: name.clone(),
+                                    seed,
+                                    video: theirs.get_untracked(),
+                                    muted: false,
+                                    hand: false,
+                                    identity: String::new(),
+                                    decrypting: true,
+                                    speaking: false,
+                                },
+                                |p| Look {
+                                    name: name.clone(),
+                                    seed,
+                                    ..Look::of(&p)
+                                },
+                            );
+                            tile(look, true)
+                        })
+                    })),
+            )
             .child(
                 view()
                     .absolute()
@@ -528,15 +754,71 @@ fn direct_stage(s: Store, big: f32) -> View {
                             .tabular_nums(),
                     ),
             )
-            .child(self_view(s))
+            .child(self_view(s, call_camera()))
     };
     view()
         .flex_1()
         .child(when(move || video_on.get(), video).otherwise(voice))
 }
 
+/// The call's camera: runs while the user's video is on and stops with it and with the call
+/// (D-0110); in a real call each time it (re)opens its frames go to the call's encoder; the
+/// lens picked in the devices sheet. One per call stage, shared by whatever shows the user's
+/// own picture (the corner self-view, or the user's tile in a group or link call).
+fn call_camera() -> crate::camera::Session {
+    let video = field(|c| c.video, false);
+    let session =
+        crate::camera::use_session(songbird_camera::Purpose::Call, move || video.get(), |_| {});
+    // A real call sends what the camera sees: each time the camera (re)opens, its frames go to
+    // the call's encoder.
+    let real = field(|c| c.real.then_some(c.id), None);
+    {
+        let sess = session.clone();
+        effect(move || {
+            let opened = sess.preview.get().is_some();
+            if let (true, Some(id)) = (opened, untracked(move || real.get()))
+                && let Some(frames) = sess.take_frames()
+            {
+                crate::backend::calls::camera_feed(id, frames);
+            }
+        });
+    }
+    // Turning the camera on is the request for it: never asked, the system asks now; refused,
+    // the call's camera goes off and says where to allow it.
+    {
+        let sess = session.clone();
+        effect(move || {
+            let shown = sess.shown.get();
+            if !video.get() {
+                return;
+            }
+            match shown {
+                crate::camera::Shown::NotAsked => sess.ask(),
+                crate::camera::Shown::Denied | crate::camera::Shown::Restricted => {
+                    untracked(super::camera_refused);
+                }
+                _ => {}
+            }
+        });
+    }
+    // The camera picked in the devices sheet.
+    let lens = field(|c| c.camera, 0);
+    {
+        let sess = session.clone();
+        effect(move || {
+            let i = lens.get();
+            if i > 0
+                && let Some(id) = crate::camera::lens_id(i)
+            {
+                sess.select(&id);
+            }
+        });
+    }
+    session
+}
+
 /// The user's self-view in a corner, with flip camera on phones.
-fn self_view(s: Store) -> View {
+fn self_view(s: Store, session: crate::camera::Session) -> View {
     let me = s.me.get_untracked();
     let video = field(|c| c.video, false);
     let front = field(|c| c.front_camera, true);
@@ -545,10 +827,6 @@ fn self_view(s: Store) -> View {
     } else {
         (104.0, 150.0)
     };
-    // The camera runs while the user's video is on, and stops with it and with the call
-    // (D-0110). A demo or test camera has no live picture: the portrait stands in.
-    let session =
-        crate::camera::use_session(songbird_camera::Purpose::Call, move || video.get(), |_| {});
     let live = crate::camera::has_live_preview();
     let flip = session.clone();
     arrive(0.9, 8.0, motion::BASE)
@@ -578,7 +856,7 @@ fn self_view(s: Store) -> View {
             }
         })
         // The same picture as the user's tile and their row in the
-        // participants sheet (mock: the portrait stands for the camera).
+        // participants sheet (a demo or test camera has no live picture).
         .child(when(
             move || video.get() && live,
             move || crate::camera::preview_fill(&session),
@@ -705,10 +983,11 @@ fn notices(people: Signal<bool>) -> View {
                         .text_size(px(font::SMALL + 1.0))
                         .font_weight(FontWeight::SEMIBOLD),
                     )
-                    .child(on_primary_pill(Icon::Close, "Stop sharing", || {
-                        with_call(|c| c.sharing = None);
-                        announce_for_accessibility("You stopped sharing your screen");
-                    }))
+                    .child(on_primary_pill(
+                        Icon::Close,
+                        "Stop sharing",
+                        super::stop_sharing,
+                    ))
             },
         ))
         .child(when(
@@ -743,12 +1022,12 @@ fn notices(people: Signal<bool>) -> View {
                                     .child(call_pill(
                                         Icon::Ban,
                                         format!("Deny {name}"),
-                                        move || with_call(|c| c.admit(id, false)),
+                                        move || super::decide(id, false),
                                     ))
                                     .child(call_pill(
                                         Icon::Check,
                                         format!("Admit {name}"),
-                                        move || with_call(|c| c.admit(id, true)),
+                                        move || super::decide(id, true),
                                     ))
                             })
                         })
@@ -789,8 +1068,8 @@ fn notices(people: Signal<bool>) -> View {
 /// The top bar of the call: minimise, title and lock line, and the
 /// group's layout and participants.
 fn top_bar(verify: Signal<bool>, people: Signal<bool>) -> View {
-    let title =
-        calls().with_untracked(|x| x.call.as_ref().map(|c| c.title.clone()).unwrap_or_default());
+    // Followed, not read once: a link call's name arrives from its admin after joining (D-0183).
+    let title = field(|c| c.title.clone(), String::new());
     let group = calls().with_untracked(|x| x.call.as_ref().is_some_and(|c| c.group));
     let ended = field(|c| c.ended(), false);
     let count = field(|c| c.joined().len() + 1, 1);
@@ -830,7 +1109,7 @@ fn top_bar(verify: Signal<bool>, people: Signal<bool>) -> View {
                 .items_center()
                 .gap(px(2.0))
                 .child(group.then(|| {
-                    text(title.clone())
+                    text(move || title.get())
                         .number_of_lines(1)
                         .text_size(px(font::TITLE))
                         .font_weight(FontWeight::SEMIBOLD)
@@ -978,6 +1257,14 @@ fn controls(sheets: Sheets) -> View {
             move || sheets.more.set(true),
         )
     };
+    // Phones share through the system's capture (D-0180); desktops through the call's own.
+    let screen_share_here = || {
+        songbird_device::share::supported()
+            || !matches!(
+                os(),
+                nsh_core::platform::Os::Ios | nsh_core::platform::Os::Android
+            )
+    };
     let build = move || {
         let row = view()
             .flex_row()
@@ -1006,7 +1293,10 @@ fn controls(sheets: Sheets) -> View {
                 compact,
                 move || {
                     if sharing.get_untracked() {
-                        with_call(|c| c.sharing = None);
+                        super::stop_sharing();
+                    } else if songbird_device::share::supported() {
+                        // A phone shares its whole screen, after the system's own prompt.
+                        super::start_sharing(Share::EntireScreen);
                     } else {
                         sheets.share.set(true);
                     }
@@ -1016,7 +1306,7 @@ fn controls(sheets: Sheets) -> View {
         let row = if !compact {
             row.child(mute())
                 .child(camera())
-                .child(share())
+                .child(screen_share_here().then(share))
                 .child(group.then(|| {
                     call_btn(
                         || Icon::Hand,
@@ -1031,7 +1321,7 @@ fn controls(sheets: Sheets) -> View {
                         move || hand.get(),
                         size,
                         false,
-                        || with_call(|c| c.hand = !c.hand),
+                        super::toggle_hand,
                     )
                 }))
                 .child(call_btn(
@@ -1048,7 +1338,7 @@ fn controls(sheets: Sheets) -> View {
                 .child(view().w(px(8.0)))
                 .child(end())
         } else if desktop {
-            row.child(share())
+            row.child(screen_share_here().then(share))
                 .child(camera())
                 .child(mute())
                 .child(more())
@@ -1061,7 +1351,13 @@ fn controls(sheets: Sheets) -> View {
                 move || speaker.get(),
                 size,
                 true,
-                || with_call(|c| c.speaker = !c.speaker),
+                || {
+                    with_call(|c| {
+                        c.speaker = !c.speaker;
+                        // The sound to the loudspeaker, or back to the earpiece (D-0176).
+                        songbird_device::audio::speaker(c.speaker);
+                    });
+                },
             ))
             .child(camera())
             .child(mute())
@@ -1389,17 +1685,28 @@ fn sheet_line(words: impl Into<SharedString>, alpha: f32, size: f32) -> Text {
 /// The verification code: four symbols both people compare.
 fn verify_sheet(open: Signal<bool>) -> nsh_base::SheetElement {
     let code = field(
-        |c| (c.phase == Phase::Connected).then(|| state::verification_code(c.id, c.chat)),
+        |c| {
+            (c.phase == Phase::Connected).then(|| {
+                if c.real {
+                    // From the call's key: absent only until the key is in.
+                    c.code.map(state::symbols)
+                } else {
+                    Some(state::verification_code(c.id, c.chat))
+                }
+            })?
+        },
         None,
     );
-    let (who, group) = calls().with_untracked(|x| {
+    let (who, group, link) = calls().with_untracked(|x| {
         x.call
             .as_ref()
-            .map(|c| (c.title.clone(), c.group))
+            .map(|c| (c.title.clone(), c.group, c.real && c.link))
             .unwrap_or_default()
     });
     let first = who.split_whitespace().next().unwrap_or("them").to_string();
-    let compare = if group {
+    let compare = if link {
+        "A link call has no shared code: each person sends their own key to each other device in a secure session. People who aren't your contacts show as unverified; compare safety numbers with them in a chat to be sure who they are.".to_string()
+    } else if group {
         "Compare these with the others in the call. If they match, your call is end-to-end encrypted.".to_string()
     } else {
         format!("Compare these with {first}. If they match, your call is end-to-end encrypted.")
@@ -1437,6 +1744,7 @@ fn verify_sheet(open: Signal<bool>) -> nsh_base::SheetElement {
                                 .child(text(name).text_size(px(font::CAPTION)).text_color(move || c::on_call().opacity(0.7)))
                         }))
                         .into_element(),
+                    None if link => view().into_element(),
                     None => view()
                         .flex_row()
                         .items_center()
@@ -1571,10 +1879,10 @@ fn people_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
                                                     .flex_row()
                                                     .gap_2()
                                                     .child(sheet_btn("Deny", false, move || {
-                                                        with_call(|c| c.admit(id, false))
+                                                        super::decide(id, false)
                                                     }))
                                                     .child(sheet_btn("Admit", true, move || {
-                                                        with_call(|c| c.admit(id, true))
+                                                        super::decide(id, true)
                                                     }))
                                                     .into_element(),
                                             ),
@@ -1712,7 +2020,7 @@ fn more_sheet(sheets: Sheets) -> nsh_base::SheetElement {
                                 None,
                                 Some(Box::new(move || {
                                     open.set(false);
-                                    with_call(|c| c.hand = !c.hand);
+                                    super::toggle_hand();
                                 })),
                             )
                         })
@@ -1776,32 +2084,65 @@ fn more_sheet(sheets: Sheets) -> nsh_base::SheetElement {
     )
 }
 
-/// Desktops: microphone, camera and speakers (mock devices), with the
-/// microphone's level.
+/// Desktops: microphone, camera and speakers, with the microphone's level. A real call lists
+/// the computer's own devices and switches to the one picked; a demo call lists sample names.
 fn devices_sheet(open: Signal<bool>) -> nsh_base::SheetElement {
     let mic = field(|c| c.mic, 0);
     let cam = field(|c| c.camera, 0);
     let out = field(|c| c.output, 0);
-    let pick = |names: &'static [&'static str],
-                current: Memo<usize>,
-                set: fn(&mut state::ActiveCall, usize)| {
-        call_group(names.iter().enumerate().map(move |(i, name)| {
-            call_row(
-                None,
-                *name,
-                None,
-                Some(
-                    view()
-                        .text_color(move || c::on_call())
-                        .style_when(move || current.get() != i, |st| st.opacity(0.0))
-                        .child(icon(Icon::Check, 18.0))
-                        .into_element(),
-                ),
-                Some(Box::new(move || {
-                    with_call(|c| set(c, i));
-                    announce_for_accessibility(format!("{name} selected"));
-                })),
-            )
+    let real = field(|c| c.real, false);
+    let devices = global::<super::CallDevices>();
+    // Read again each time the sheet opens: a headset may have come or gone.
+    effect(move || {
+        if open.get() && untracked(move || real.get()) {
+            untracked(super::live::devices_changed);
+        }
+    });
+    let names = move |kind: Kind| -> Vec<String> {
+        if real.get() {
+            devices.with(|d| match kind {
+                Kind::Mic => d.mics.clone(),
+                Kind::Camera => d.cameras.clone(),
+                Kind::Output => d.outputs.clone(),
+            })
+        } else {
+            let demo: &[&str] = match kind {
+                Kind::Mic => &MICS,
+                Kind::Camera => &CAMERAS,
+                Kind::Output => &OUTPUTS,
+            };
+            demo.iter().map(|n| (*n).to_string()).collect()
+        }
+    };
+    let pick = move |kind: Kind, current: Memo<usize>| {
+        view().child(dynamic(move || {
+            let list = names(kind);
+            untracked(move || {
+                if list.is_empty() {
+                    return call_note(match kind {
+                        Kind::Camera => "No camera found.",
+                        _ => "Devices appear once the call's audio is on.",
+                    })
+                    .into_element();
+                }
+                call_group(list.into_iter().enumerate().map(move |(i, name)| {
+                    let label = name.clone();
+                    call_row(
+                        None,
+                        name,
+                        None,
+                        Some(
+                            view()
+                                .text_color(move || c::on_call())
+                                .style_when(move || current.get() != i, |st| st.opacity(0.0))
+                                .child(icon(Icon::Check, 18.0))
+                                .into_element(),
+                        ),
+                        Some(Box::new(move || choose(kind, i, &label))),
+                    )
+                }))
+                .into_element()
+            })
         }))
     };
     call_sheet(
@@ -1819,11 +2160,11 @@ fn devices_sheet(open: Signal<bool>) -> nsh_base::SheetElement {
                         .child(call_section("Microphone").flex_1())
                         .child(view().pb_2().child(level_meter())),
                 )
-                .child(pick(&MICS, mic, |c, i| c.mic = i))
+                .child(pick(Kind::Mic, mic))
                 .child(call_section("Camera"))
-                .child(pick(&CAMERAS, cam, |c, i| c.camera = i))
+                .child(pick(Kind::Camera, cam))
                 .child(call_section("Speakers"))
-                .child(pick(&OUTPUTS, out, |c, i| c.output = i))
+                .child(pick(Kind::Output, out))
                 .child(call_note(
                     "Devices are read from your computer. Songbird uses them only during calls.",
                 )),
@@ -1831,16 +2172,41 @@ fn devices_sheet(open: Signal<bool>) -> nsh_base::SheetElement {
     )
 }
 
+/// A kind of call device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Mic,
+    Camera,
+    Output,
+}
+
+/// Picks device `i` of `kind`: in a real call the platform switches to it.
+fn choose(kind: Kind, i: usize, name: &str) {
+    let real = calls().with_untracked(|s| s.call.as_ref().filter(|c| c.real).map(|c| c.id));
+    let ok = match (kind, real) {
+        (Kind::Mic, Some(id)) => crate::backend::calls::select_audio(id, false, i),
+        (Kind::Output, Some(id)) => crate::backend::calls::select_audio(id, true, i),
+        // The self-view's camera session follows `camera` (it switches lens).
+        _ => true,
+    };
+    if !ok {
+        toast("That device couldn't be used.");
+        return;
+    }
+    with_call(|c| match kind {
+        Kind::Mic => c.mic = i,
+        Kind::Camera => c.camera = i,
+        Kind::Output => c.output = i,
+    });
+    announce_for_accessibility(format!("{name} selected"));
+}
+
 /// Desktops: what to share.
 fn share_sheet(open: Signal<bool>) -> nsh_base::SheetElement {
     let start = move |what: Share| -> Box<dyn Fn()> {
         Box::new(move || {
             open.set(false);
-            with_call(|c| {
-                c.sharing = Some(what);
-                c.minimised = false;
-            });
-            announce_for_accessibility("You are sharing your screen");
+            super::start_sharing(what);
         })
     };
     call_sheet(

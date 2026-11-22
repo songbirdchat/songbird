@@ -13,7 +13,7 @@
 //! | `POST /v1/billing/google` | Google Pub/Sub (OIDC) | real-time developer notifications |
 //! | `POST /v1/billing/mollie/checkout` | the app | a Mollie checkout for a subscriber secret |
 //! | `POST /v1/billing/mollie/webhook` | Mollie | a payment ID, fetched back |
-//! | `POST /v1/billing/mollie/state`, `…/cancel` | the app | a subscriber's state; cancelling |
+//! | `POST /v1/billing/mollie/state`, `…/cancel`, `…/resume` | the app | a subscriber's state; cancelling; renewing again |
 #![forbid(unsafe_code)]
 
 pub mod apple;
@@ -355,6 +355,7 @@ impl Billing {
             "/v1/billing/mollie/webhook" => self.mollie_webhook(&body).await,
             "/v1/billing/mollie/state" => self.mollie_state(&body, peer, false).await,
             "/v1/billing/mollie/cancel" => self.mollie_state(&body, peer, true).await,
+            "/v1/billing/mollie/resume" => self.mollie_resume(&body, peer).await,
             _ => empty(StatusCode::NOT_FOUND),
         }
     }
@@ -776,6 +777,8 @@ impl Billing {
             if self.store.mollie_cancelled(&key).await.is_err() {
                 return empty(StatusCode::SERVICE_UNAVAILABLE);
             }
+            // Cancelled again: a later resume may start renewal once more.
+            let _ = self.store.forget(&resume_claim(&key, row.state.paid)).await;
             return empty(StatusCode::NO_CONTENT);
         }
         reply(
@@ -788,6 +791,83 @@ impl Billing {
                 "revoked": row.state.revoked,
             }),
         )
+    }
+}
+
+/// The mark that one resume of this row's paid period is under way.
+fn resume_claim(key: &[u8], paid: u32) -> [u8; 32] {
+    sha256(&[b"mollie-resume\0", key, &paid.to_be_bytes()])
+}
+
+impl Billing {
+    /// `POST /v1/billing/mollie/resume`: renewal on again after a cancellation, while the paid
+    /// period lasts (D-0169). Mollie can't reactivate a cancelled subscription, so a new one
+    /// starts on the customer's mandate, its first charge the day the paid period would have
+    /// renewed (never sooner than tomorrow): nothing is charged twice. 204; 404 for no such
+    /// subscriber; 409 `revoked`, `expired` (buy again), `renews` (nothing to resume),
+    /// `mandate` (Mollie refused: pay again by checkout).
+    async fn mollie_resume(&self, body: &[u8], peer: IpAddr) -> Response<Body> {
+        let Some(m) = &self.mollie else {
+            return empty(StatusCode::NOT_FOUND);
+        };
+        if !self.budget.take(peer) {
+            return error(StatusCode::TOO_MANY_REQUESTS, "budget");
+        }
+        let Some(secret) = serde_json::from_slice::<SubscriberBody>(body)
+            .ok()
+            .and_then(|b| secret32(&b.subscriber))
+        else {
+            return error(StatusCode::BAD_REQUEST, "body");
+        };
+        let key = self.store.key("mollie", &secret);
+        let row = match self.store.get(&key).await {
+            Ok(Some(r)) if r.state.provider == "mollie" => r,
+            Ok(_) => return empty(StatusCode::NOT_FOUND),
+            Err(_) => return empty(StatusCode::SERVICE_UNAVAILABLE),
+        };
+        if row.state.revoked {
+            return error(StatusCode::CONFLICT, "revoked");
+        }
+        if row.state.renews {
+            return error(StatusCode::CONFLICT, "renews");
+        }
+        let renew_on = row.state.paid.saturating_sub(MOLLIE_SLACK_DAYS);
+        if row.state.paid < today() {
+            return error(StatusCode::CONFLICT, "expired");
+        }
+        let (Some(customer), Some(interval)) = (row.customer.as_deref(), row.interval.as_deref())
+        else {
+            return error(StatusCode::CONFLICT, "mandate");
+        };
+        // One resume at a time per row (two taps, two subscriptions otherwise).
+        let claim = resume_claim(&key, row.state.paid);
+        match self.store.first_time(&claim, today() + 3_650).await {
+            Ok(true) => {}
+            Ok(false) => return error(StatusCode::CONFLICT, "renews"),
+            Err(_) => return empty(StatusCode::SERVICE_UNAVAILABLE),
+        }
+        let start = ymd(renew_on.max(today() + 1));
+        let id = match m
+            .subscribe(customer, row.state.plan, interval, &start)
+            .await
+        {
+            Ok(id) => id,
+            Err(ProviderError::Refused) => {
+                let _ = self.store.forget(&claim).await;
+                return error(StatusCode::CONFLICT, "mandate");
+            }
+            Err(_) => {
+                let _ = self.store.forget(&claim).await;
+                return error(StatusCode::SERVICE_UNAVAILABLE, "provider");
+            }
+        };
+        if self.store.mollie_resumed(&key, &id).await.is_err() {
+            // Not recorded: the new subscription is cancelled again, so nothing charges unseen.
+            let _ = m.cancel(customer, &id).await;
+            let _ = self.store.forget(&claim).await;
+            return empty(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        empty(StatusCode::NO_CONTENT)
     }
 }
 

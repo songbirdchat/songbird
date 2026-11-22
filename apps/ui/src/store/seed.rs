@@ -67,6 +67,7 @@ pub fn chat(id: ChatId, kind: ChatKind, title: &str) -> Chat {
         community: None,
         pinned: false,
         muted: false,
+        muted_until: 0,
         archived: false,
         favourite: false,
         locked: false,
@@ -153,6 +154,47 @@ fn react(m: &mut Message, emoji: &str, by: Vec<Option<ContactId>>) {
     });
 }
 
+/// A real account's starting point: nobody, no chats, no calls. Only the
+/// defaults of settings and session come from [`seed`]; everything else
+/// arrives from the server and app-core (the owner's rule: no mock data).
+pub fn empty() -> Seed {
+    let base = seed();
+    Seed {
+        me: Profile {
+            name: String::new(),
+            username: String::new(),
+            about: String::new(),
+            status_line: None,
+            presence: Presence::Online,
+            seed: 42,
+        },
+        contacts: Vec::new(),
+        chats: Vec::new(),
+        messages: HashMap::new(),
+        calls: Vec::new(),
+        call_links: Vec::new(),
+        devices: Vec::new(),
+        // The demo's choices, minus what only the server or the user can say (D-0183: a real
+        // account showed the demo's PIN as on, WhatsApp as linked and invites it never had).
+        settings: Settings {
+            two_step_pin: false,
+            passkey: false,
+            whatsapp_linked: false,
+            backup_on: false,
+            backup_last: None,
+            backup_size: String::new(),
+            ..base.settings
+        },
+        session: Session {
+            recovery_key: String::new(),
+            invites_left: 0,
+            invites_used: 0,
+            ..base.session
+        },
+    }
+}
+
+/// The demo data, for screenshot fixtures only (see `store::demo`).
 pub fn seed() -> Seed {
     // ---------------------------------------------------------- people
     let mut contacts = vec![
@@ -365,8 +407,9 @@ pub fn seed() -> Seed {
                     ("Sushi".into(), 5),
                     ("Salad bar".into(), 1),
                 ],
-                mine: Some(1),
+                mine: vec![1],
                 multiple: false,
+                closed: false,
             },
         );
         t.add(
@@ -386,6 +429,7 @@ pub fn seed() -> Seed {
             Body::Location {
                 label: "Piața Unirii, Cluj-Napoca".into(),
                 live: false,
+                at: Some((46.7697, 23.5896)),
             },
         );
         t.add(
@@ -687,8 +731,9 @@ pub fn seed() -> Seed {
             Body::Poll {
                 question: "Leave at".into(),
                 options: vec![("7:00".into(), 2), ("8:30".into(), 4)],
-                mine: None,
+                mine: Vec::new(),
                 multiple: false,
+                closed: false,
             },
         );
         put(&mut chats, g, t);

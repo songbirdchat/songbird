@@ -45,6 +45,7 @@ pub mod gifs;
 pub mod groups;
 pub mod keys;
 pub mod kt;
+pub mod maps;
 pub mod media;
 pub mod messages;
 pub mod packs;
@@ -365,6 +366,9 @@ impl App {
         }
         if path.starts_with("/v1/gifs/") {
             return gifs::route(self, req).await;
+        }
+        if path.starts_with("/v1/maps/") {
+            return maps::route(self, req).await;
         }
         if path == "/v1/family" || path.starts_with("/v1/family/") {
             return self.family(req).await;
@@ -1086,6 +1090,7 @@ impl App {
                 t.history(&self.registry, &self.hot, &account, &body).await
             }
             (&Method::POST, "/v1/kt/audit") => t.audit(&self.hot, &account, &body).await,
+            (&Method::POST, "/v1/kt/roots") => t.roots(&self.hot, &account, &body).await,
             _ => return Err(Refusal::Status(StatusCode::NOT_FOUND)),
         };
         Ok(match out {
@@ -1567,6 +1572,12 @@ impl App {
                 let (device, body) = self.authenticate_json(req).await?;
                 let account = account_of(device).await?;
                 d.fetch_list(&self.registry, &self.hot, &account, &body)
+                    .await
+            }
+            (&Method::POST, "/v1/devices/identity", None) => {
+                let (device, body) = self.authenticate_json(req).await?;
+                let account = account_of(device).await?;
+                d.fetch_identity(&self.registry, &self.hot, &account, &body)
                     .await
             }
             (&Method::DELETE, "/v1/devices/self", None) => {

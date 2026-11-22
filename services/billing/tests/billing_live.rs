@@ -889,6 +889,119 @@ async fn mollie_checkout_webhooks_and_cancel() {
     assert_eq!(st, 404);
 }
 
+/// D-0169: a cancelled Mollie subscription renews again while its paid period lasts: a new
+/// subscription on the same customer, its first charge when the paid period would have renewed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mollie_renewal_resumes_after_cancel() {
+    let Some(r) = rig(Env::Sandbox, false).await else {
+        return;
+    };
+    let secret = hex::encode([0x5b; 32]);
+    let body = || json!({ "subscriber": secret }).to_string();
+    let (st, _) = r
+        .post(
+            "/v1/billing/mollie/checkout",
+            json!({ "plan": "plus", "interval": "month", "subscriber": secret })
+                .to_string()
+                .as_bytes(),
+            &[],
+        )
+        .await;
+    assert_eq!(st, 200);
+    // Nothing to resume before anything is paid (no renewal was ever on; not paid either).
+    assert_eq!(
+        r.post("/v1/billing/mollie/resume", body().as_bytes(), &[])
+            .await
+            .0,
+        409
+    );
+    {
+        let mut w = r.world.lock().unwrap();
+        let p = w.payments.get_mut("tr_1").unwrap();
+        p["status"] = json!("paid");
+        p["paidAt"] = json!(paid_at(songbird_billing::today()));
+    }
+    assert_eq!(
+        r.post("/v1/billing/mollie/webhook", b"id=tr_1", &[])
+            .await
+            .0,
+        200
+    );
+    // Renewing already: nothing to resume.
+    let (st, v) = r
+        .post("/v1/billing/mollie/resume", body().as_bytes(), &[])
+        .await;
+    assert_eq!((st, v["error"].as_str()), (409, Some("renews")));
+    assert_eq!(
+        r.post("/v1/billing/mollie/cancel", body().as_bytes(), &[])
+            .await
+            .0,
+        204
+    );
+    assert_eq!(
+        r.post("/v1/billing/mollie/state", body().as_bytes(), &[])
+            .await
+            .1["renews"],
+        false
+    );
+    // Resume: a second subscription, starting when the paid period renews; renewal on again.
+    assert_eq!(
+        r.post("/v1/billing/mollie/resume", body().as_bytes(), &[])
+            .await
+            .0,
+        204
+    );
+    let s = r
+        .post("/v1/billing/mollie/state", body().as_bytes(), &[])
+        .await
+        .1;
+    assert_eq!(s["renews"], true);
+    {
+        let w = r.world.lock().unwrap();
+        assert_eq!(w.subscriptions.len(), 2);
+        let paid = u32::try_from(s["paid_through"].as_u64().unwrap()).unwrap();
+        let start = songbird_billing::ymd(paid - songbird_billing::MOLLIE_SLACK_DAYS);
+        assert_eq!(
+            w.subscriptions[1].2, start,
+            "the first charge when the period would renew"
+        );
+    }
+    // A second tap: nothing more.
+    assert_eq!(
+        r.post("/v1/billing/mollie/resume", body().as_bytes(), &[])
+            .await
+            .0,
+        409
+    );
+    assert_eq!(r.world.lock().unwrap().subscriptions.len(), 2);
+    // Cancel and resume again: the new subscription is the one cancelled, then a third starts.
+    assert_eq!(
+        r.post("/v1/billing/mollie/cancel", body().as_bytes(), &[])
+            .await
+            .0,
+        204
+    );
+    assert_eq!(
+        r.world.lock().unwrap().cancelled.last().map(String::as_str),
+        Some("sub_2")
+    );
+    assert_eq!(
+        r.post("/v1/billing/mollie/resume", body().as_bytes(), &[])
+            .await
+            .0,
+        204
+    );
+    assert_eq!(r.world.lock().unwrap().subscriptions.len(), 3);
+    // An unknown subscriber.
+    let other = json!({ "subscriber": hex::encode([2u8; 32]) }).to_string();
+    assert_eq!(
+        r.post("/v1/billing/mollie/resume", other.as_bytes(), &[])
+            .await
+            .0,
+        404
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn caps_hold_under_concurrency() {
     let Some(r) = rig(Env::Sandbox, false).await else {

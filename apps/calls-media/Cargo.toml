@@ -1,0 +1,58 @@
+[package]
+name = "songbird-calls-media"
+description = "Call media for the Songbird apps (D-0151): LiveKit's Rust SDK over libwebrtc, every frame and data packet end-to-end encrypted by LiveKit's frame cryptor under per-sender keys from app-core's key schedule. libwebrtc comes only from scripts/fetch-libwebrtc.sh (pinned SHA-256, LK_CUSTOM_WEBRTC)."
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "LicenseRef-Proprietary"
+
+[workspace]
+
+[dependencies]
+# TLS for the signalling WebSocket and LiveKit's HTTP calls: rustls on aws-lc-rs (the locked
+# crypto stack) with Mozilla's roots. LiveKit's own "rustls-tls-webpki-roots" feature would turn
+# on rustls's `ring` provider, so the roots are asked of tokio-tungstenite and reqwest directly
+# and rustls gets only aws-lc-rs. No OpenSSL anywhere.
+livekit = { version = "=0.12.0", default-features = false, features = ["native", "__rustls-tls"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+tokio = { version = "1", default-features = false, features = ["sync", "macros", "rt", "time"] }
+thiserror = "2"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+zeroize = "1"
+
+[dev-dependencies]
+# The real key schedule (PROTOCOL §8.2) and tokens minted as services/calls mints them.
+songbird-content = { path = "../../crates/content" }
+livekit-api = { version = "=0.10.2", default-features = false, features = ["access-token"] }
+aws-lc-rs = "1"
+zeroize = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+
+# The workspace's lints (this crate is its own workspace so libwebrtc stays out of the server's).
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+allow_attributes_without_reason = "warn"
+as_conversions = "warn"
+dbg_macro = "warn"
+exit = "warn"
+expect_used = "warn"
+get_unwrap = "warn"
+indexing_slicing = "warn"
+mem_forget = "warn"
+panic = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"

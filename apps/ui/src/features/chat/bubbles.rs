@@ -928,7 +928,7 @@ pub(crate) fn rich_text(
                                 .underline()
                                 .role(AccessibilityRole::Link)
                                 .on_press(move || {
-                                    let _ = open_url(url.clone());
+                                    crate::features::open_link_or_url(&url);
                                 });
                         }
                         el
@@ -974,7 +974,7 @@ fn link_body(cv: Conv, item: ItemMemo) -> AnyElement {
         .child(
             pressable()
                 .on_press(move || {
-                    let _ = open_url(card.with_untracked(|c| c.0.clone()));
+                    crate::features::open_link_or_url(&card.with_untracked(|c| c.0.clone()));
                 })
                 .accessibility_label(super::say(move || {
                     card.with(|c| format!("Link preview: {}, {}", c.1, c.2))
@@ -1043,11 +1043,47 @@ fn photo_frame(shot: Memo<(String, u64, u32, u32)>, label: impl Fn() -> String +
         .role(AccessibilityRole::Image)
         .label(label)
         .child(
-            image(move || shot.with(|s| portrait::photo(&s.0, s.1, s.2.max(1), s.3.max(1))))
-                .absolute()
-                .inset_0()
-                .object_fit(ResizeMode::Cover),
+            image(move || {
+                shot.with(|s| {
+                    // A real photo: its bytes once this device has them (tracked, so a photo
+                    // still sending or downloading appears when it can; D-0183: a sent photo
+                    // stayed blank until tapped); the illustrations only in the demo.
+                    if let Some(src) = crate::backend::chat::media_src(s.1) {
+                        src
+                    } else if crate::backend::chat::is_media(s.1) || !crate::store::demo() {
+                        ImageSrc::from("")
+                    } else {
+                        portrait::photo(&s.0, s.1, s.2.max(1), s.3.max(1))
+                    }
+                })
+            })
+            .absolute()
+            .inset_0()
+            .object_fit(ResizeMode::Cover),
         )
+        .child(when(
+            move || {
+                shot.with(|s| {
+                    crate::backend::chat::is_media(s.1)
+                        && crate::backend::chat::media_src(s.1).is_none()
+                })
+            },
+            move || {
+                let msg = shot.with_untracked(|s| s.1);
+                // A failed download says so and offers to try again.
+                dynamic(move || {
+                    Some(if crate::backend::chat::photo_failed(msg) {
+                        icon_btn(Icon::Refresh, "Couldn't download the photo. Try again", move || {
+                            crate::backend::chat::retry_photo(msg);
+                        })
+                    } else {
+                        icon_btn(Icon::Download, "Download photo", move || {
+                            crate::backend::chat::retry_photo(msg);
+                        })
+                    })
+                })
+            },
+        ))
 }
 
 /// A small label over a photo ("HD", a video's length): a dark scrim pill
@@ -1319,6 +1355,7 @@ fn voice_body(cv: Conv, item: ItemMemo) -> AnyElement {
 
 fn file_body(cv: Conv, item: ItemMemo) -> AnyElement {
     let ink = ink_of(cv, item);
+    let id = sel(item, |i| i.m.id);
     let info = sel(item, |i| match &i.m.body {
         Body::File { name, size, kind } => (name.clone(), size.clone(), kind.clone()),
         _ => Default::default(),
@@ -1361,8 +1398,15 @@ fn file_body(cv: Conv, item: ItemMemo) -> AnyElement {
                 ),
         )
         .child(icon_btn(Icon::Download, "Download", move || {
-            // mock: app-core downloads and decrypts the file.
-            toast(format!("Saved {}", info.with_untracked(|i| i.0.clone())));
+            // Downloaded, verified and decrypted by app-core, then saved
+            // where the user chooses.
+            let name = info.with_untracked(|i| i.0.clone());
+            let msg = id.get_untracked();
+            if crate::backend::chat::is_media(msg) {
+                crate::backend::chat::save_media(msg, name);
+            } else {
+                toast("This file is only in the demo.");
+            }
         }))
         .into_element()
 }
@@ -1391,7 +1435,7 @@ fn poll_body(cv: Conv, item: ItemMemo) -> AnyElement {
                             label.clone(),
                             *votes,
                             *votes as f32 / total as f32,
-                            *mine == Some(n),
+                            mine.contains(&n),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1400,6 +1444,10 @@ fn poll_body(cv: Conv, item: ItemMemo) -> AnyElement {
         })
     });
     let total = computed(move || options.with(|o| o.iter().map(|o| o.2).sum::<u32>()));
+    let closed = sel(item, |i| {
+        matches!(i.m.body, Body::Poll { closed: true, .. })
+    });
+    let own = sel(item, |i| i.m.mine());
     view()
         .w(px(270.0))
         .px(px(PAD_X))
@@ -1436,7 +1484,9 @@ fn poll_body(cv: Conv, item: ItemMemo) -> AnyElement {
                 let chosen = move || o.with(|o| o.4);
                 pressable()
                     .on_press(move || {
-                        cv.s.vote(cv.chat, id.get_untracked(), o.with_untracked(|o| o.0))
+                        if !closed.get_untracked() {
+                            cv.s.vote(cv.chat, id.get_untracked(), o.with_untracked(|o| o.0));
+                        }
                     })
                     .selected(chosen)
                     .accessibility_label(super::say(move || {
@@ -1514,12 +1564,34 @@ fn poll_body(cv: Conv, item: ItemMemo) -> AnyElement {
             },
         ))
         .child(
-            text(move || match total.get() {
-                1 => "1 vote".to_string(),
-                n => format!("{n} votes"),
-            })
-            .text_size(px(font::CAPTION))
-            .text_color(move || c::bubble_meta()),
+            view()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .child(
+                    text(move || {
+                        let n = match total.get() {
+                            1 => "1 vote".to_string(),
+                            n => format!("{n} votes"),
+                        };
+                        if closed.get() {
+                            format!("{n} · Final results")
+                        } else {
+                            n
+                        }
+                    })
+                    .text_size(px(font::CAPTION))
+                    .text_color(move || c::bubble_meta()),
+                )
+                .child(when(
+                    move || own.get() && !closed.get(),
+                    move || {
+                        btn("Close poll", Variant::Ghost, BtnSize::Sm, move || {
+                            cv.s.close_poll(cv.chat, id.get_untracked());
+                        })
+                        .into_element()
+                    },
+                )),
         )
         .into_element()
 }
@@ -1796,8 +1868,12 @@ fn map_image(seed: u64, w: f32, h: f32) -> ImageSrc {
 fn location_body(cv: Conv, item: ItemMemo) -> AnyElement {
     let _ = cv;
     let info = sel(item, |i| match &i.m.body {
-        Body::Location { label, live } => (label.clone(), *live),
+        Body::Location { label, live, .. } => (label.clone(), *live),
         _ => Default::default(),
+    });
+    let at = sel(item, |i| match &i.m.body {
+        Body::Location { at, .. } => *at,
+        _ => None,
     });
     let id = sel(item, |i| i.m.id);
     let (w, h) = (if is_desktop() { 280.0 } else { 240.0 }, 140.0);
@@ -1813,12 +1889,18 @@ fn location_body(cv: Conv, item: ItemMemo) -> AnyElement {
                 .bg(AdaptiveColor::rgb(0xEEEAE1, 0xEEEAE1))
                 .role(AccessibilityRole::Image)
                 .label(move || info.with(|i| format!("Map of {}", i.0)))
-                .child(
-                    image(move || map_image(id.get(), w, h))
+                // The real map of the place (self-hosted OSM tiles, D-0142).
+                .child(dynamic(move || match at.get() {
+                    Some(p) => crate::features::maps::map(signal(p), signal(15.0), false)
                         .absolute()
                         .inset_0()
-                        .object_fit(ResizeMode::Cover),
-                )
+                        .into_element(),
+                    None => image(move || map_image(id.get(), w, h))
+                        .absolute()
+                        .inset_0()
+                        .object_fit(ResizeMode::Cover)
+                        .into_element(),
+                }))
                 // The pin: its tip on the centre, the whole of it inside.
                 .child(
                     view()
@@ -1895,25 +1977,53 @@ fn sticker_body(cv: Conv, item: ItemMemo) -> AnyElement {
             untracked(|| super::scene::autoplay(cv.chat, id, &sticker));
         }
     });
+    // A sticker from an installed pack carries its artwork (real chats); the built-in pack's
+    // are emoji drawn here.
+    let art = computed(move || {
+        let m = id.get();
+        crate::backend::chat::is_media(m).then(|| {
+            crate::backend::chat::load_photo(m);
+            crate::backend::chat::media_src(m)
+        })
+    });
     view()
         .flex_row()
         .items_end()
         .gap_1()
-        .child(
-            text(move || info.with(|i| i.0.clone()))
-                .text_size(px(96.0))
-                .line_height(px(112.0))
-                .px_1()
-                .label(move || {
-                    info.with(|i| {
-                        if sound.get() {
-                            format!("Sound sticker from {}", i.1)
-                        } else {
-                            format!("Sticker from {}", i.1)
-                        }
-                    })
+        .child(dynamic(move || {
+            let a = art.get();
+            untracked(move || {
+                a.flatten().map(|src| {
+                    image(src)
+                        .size(px(128.0))
+                        .object_fit(ResizeMode::Contain)
+                        .label(move || info.with(|i| format!("Sticker from {}", i.1)))
+                        .role(AccessibilityRole::Image)
+                        .into_element()
                 })
-                .role(AccessibilityRole::Image),
+            })
+        }))
+        .child(
+            text(move || {
+                if art.with(|a| matches!(a, Some(Some(_)))) {
+                    String::new()
+                } else {
+                    info.with(|i| i.0.clone())
+                }
+            })
+            .text_size(px(96.0))
+            .line_height(px(112.0))
+            .px_1()
+            .label(move || {
+                info.with(|i| {
+                    if sound.get() {
+                        format!("Sound sticker from {}", i.1)
+                    } else {
+                        format!("Sticker from {}", i.1)
+                    }
+                })
+            })
+            .role(AccessibilityRole::Image),
         )
         .child(when(
             move || sound.get(),
@@ -1957,7 +2067,7 @@ fn view_once_body(cv: Conv, item: ItemMemo) -> AnyElement {
                 return;
             }
             cv.s.open_view_once(cv.chat, id.get_untracked());
-            // mock: the viewer shows it once, then app-core deletes it.
+            // The viewer shows it once; a real one's file is then gone from app-core's store.
             toast(if photo {
                 "View once photo opened"
             } else {

@@ -55,4 +55,10 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
+    // UnifiedPush (Apache-2.0): pushes through the user's own distributor, no Google services
+    // (D-0176). Brings kotlin-stdlib and Tink (its Web Push decryption).
+    implementation("org.unifiedpush.android:connector:3.3.6")
+    // Google Play Billing (D-0178): Songbird's plans bought in Play; the purchase token goes to
+    // Songbird's billing service, which verifies it with Google.
+    implementation("com.android.billingclient:billing:9.1.0")
 }

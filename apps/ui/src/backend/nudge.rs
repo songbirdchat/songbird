@@ -8,68 +8,31 @@
 //! contact is lost, as Yahoo's buzz was. It learns that a nudge happened
 //! between two accounts, never what it is.
 //!
-//! mock: the payload must be sealed for each of the contact's devices over
-//! an end-to-end session (app-core, A2), and contacts have no known devices
-//! until then, so [`send`] returns without sending. The delivery client
-//! lives in `backend::ws`, which hands it out once app-core encrypts.
+//! The payload is sealed for each of the contact's devices over an end-to-end session by
+//! app-core (`Messenger::nudge`); a nudge received is taken only from the attention class
+//! (`Messenger::receive_attention`).
 //!
 //! **Never by surprise** (D-0101 question 9): the first nudge this device
 //! ever sends is confirmed first; the answer is kept on this device.
 
-use nsh_core::storage::Storage;
+use super::vault::Storage;
+#[cfg(test)]
 use songbird_content::{
     Content,
     presence::{Attention, AttentionKind},
     schema::content::Body,
 };
 
-use super::presence::Peer;
-
 const K_CONFIRMED: &str = "sb.nudge_confirmed";
 
-/// What became of a nudge on the real backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sent {
-    /// The account isn't live: the mock shows it.
-    Offline,
-    /// No device of the contact is known (until app-core): nothing sent.
-    NoDevices,
-}
-
-/// The plaintext of a nudge (`Content.attention {NUDGE}`), padded as every
-/// content is; what app-core seals for each device.
-pub fn content() -> Option<Vec<u8>> {
-    let c = Content {
-        version: songbird_content::VERSION,
-        message_id: super::wire::random::<16>().to_vec(),
-        sent_at_ms: nsh_core::time::unix_ms().max(0.0) as u64,
-        body: Some(Body::Attention(Attention {
-            kind: i32::from(AttentionKind::Nudge),
-        })),
-        ..Content::default()
-    };
-    songbird_content::seal(&c, None)
-        .ok()
-        .map(|(bytes, _)| bytes)
-}
-
-/// Sends a nudge to `peer`'s devices when the account is live.
-pub fn send(peer: Option<&Peer>) -> Sent {
-    decide(super::is_live() && super::registered(), peer)
-}
-
-fn decide(live: bool, peer: Option<&Peer>) -> Sent {
-    if !live {
-        return Sent::Offline;
+/// Nudges the other person of a real chat (sealed for each of their devices in the attention
+/// class; the server drops it silently when over a budget, blocked or offline).
+pub fn send(chat: crate::store::ChatId) {
+    if !(super::is_live() && super::registered()) {
+        crate::ui::toast("Not connected: the nudge wasn't sent.");
+        return;
     }
-    let Some(peer) = peer.filter(|p| !p.devices.is_empty()) else {
-        return Sent::NoDevices;
-    };
-    // mock: app-core seals `content()` for each device and calls
-    // `Client::attention(device, sealed)`; nothing is sent in the clear.
-    let _ = content();
-    let _ = peer;
-    Sent::NoDevices
+    super::chat::nudge(chat);
 }
 
 /// Whether the user already agreed to send nudges (asked once, ever).
@@ -89,29 +52,20 @@ mod tests {
 
     #[test]
     fn a_nudge_is_an_attention_content() {
-        let bytes = content().expect("encodes");
+        let c = Content {
+            version: songbird_content::VERSION,
+            message_id: vec![1; 16],
+            sent_at_ms: 1,
+            body: Some(Body::Attention(Attention {
+                kind: i32::from(AttentionKind::Nudge),
+            })),
+            ..Content::default()
+        };
+        let (bytes, _) = songbird_content::seal(&c, None).expect("encodes");
         let opened = songbird_content::open(&bytes).expect("opens");
         assert!(matches!(
             opened.content.body,
             Some(Body::Attention(Attention { kind })) if kind == i32::from(AttentionKind::Nudge)
         ));
-    }
-
-    #[test]
-    fn nothing_is_sent_without_known_devices() {
-        let peer = Peer {
-            account: [1; 16],
-            devices: Vec::new(),
-            access_key: [0; 16],
-        };
-        assert_eq!(decide(false, Some(&peer)), Sent::Offline);
-        assert_eq!(decide(true, Some(&peer)), Sent::NoDevices);
-        assert_eq!(decide(true, None), Sent::NoDevices);
-        // Even with devices, nothing goes out until app-core can seal it.
-        let known = Peer {
-            devices: vec![[2; 16]],
-            ..peer
-        };
-        assert_eq!(decide(true, Some(&known)), Sent::NoDevices);
     }
 }

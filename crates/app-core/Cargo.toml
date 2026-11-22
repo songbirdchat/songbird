@@ -1,0 +1,39 @@
+[package]
+name = "songbird-app-core"
+description = "Songbird's client core (A2, D-0136): PQXDH and a post-quantum Double Ratchet for 1:1 sessions (implemented from Signal's specifications, not linked, D-0047), the sealed per-device envelope, safety numbers, the encrypted on-device store (SQLCipher), and the message pipeline over the delivery client. Never linked by a service."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+songbird-keys.workspace = true
+songbird-content.workspace = true
+songbird-proto.workspace = true
+aws-lc-rs.workspace = true
+rusqlite.workspace = true
+bytes.workspace = true
+prost.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+songbird-aws-lc-ext.workspace = true
+# Groups (D-0145): OpenMLS core with Songbird's own aws-lc-rs provider (no RustCrypto backend).
+openmls = { version = "=0.9.2", default-features = false, features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_traits = { version = "=0.6.0", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_memory_storage = "=0.6.0"
+tls_codec = "0.5"
+# The group wire formats and rules the server checks (Bundle, roles, DS key): shared, not copied.
+songbird-groups.workspace = true
+songbird-types.workspace = true
+# Key transparency on the device (D-0168): akd's lookup verifier and its protobuf proofs.
+akd.workspace = true
+protobuf.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -201,7 +201,10 @@ pub(crate) fn contact_pick_row(
                 .child(
                     text(move || {
                         contact.with(|c| {
+                            // A contact whose username this account never learned shows none,
+                            // not a bare "@".
                             c.as_ref()
+                                .filter(|c| !c.username.is_empty())
                                 .map(|c| format!("@{}", c.username))
                                 .unwrap_or_default()
                         })
@@ -301,9 +304,9 @@ fn details_page(base: usize, community: Option<ChatId>, picked: Signal<Vec<Conta
         }
         let id = s.create_group(title, picked.get_untracked());
         let (add, appr) = (members_add.get_untracked(), approve.get_untracked());
-        s.update_chat(id, |c| {
-            c.permissions.members_add = add;
-            c.permissions.approve_joins = appr;
+        s.set_group_permissions(id, |p, _| {
+            p.members_add = add;
+            p.approve_joins = appr;
         });
         if let Some(t) = timer.get_untracked() {
             s.set_disappearing(id, Some(t));
@@ -323,7 +326,11 @@ fn details_page(base: usize, community: Option<ChatId>, picked: Signal<Vec<Conta
             let c = s.contact(id);
             Row::new(s.contact_name(Some(id)))
                 .leading(avatar(s.contact_name(Some(id)), id, 36.0))
-                .subtitle(c.map(|c| format!("@{}", c.username)).unwrap_or_default())
+                .subtitle(
+                    c.filter(|c| !c.username.is_empty())
+                        .map(|c| format!("@{}", c.username))
+                        .unwrap_or_default(),
+                )
                 .build()
         })
         .collect();
@@ -379,7 +386,7 @@ fn details_page(base: usize, community: Option<ChatId>, picked: Signal<Vec<Conta
                                         (None, "Off"),
                                         (Some(Disappear::Day), "24 hours"),
                                         (Some(Disappear::Week), "7 days"),
-                                        (Some(Disappear::Quarter), "90 days"),
+                                        (Some(Disappear::FourWeeks), "4 weeks"),
                                     ],
                                     move || timer.get(),
                                     move |v| timer.set(v),
@@ -494,11 +501,8 @@ fn share_sheet(s: Store, created: Signal<Option<ChatId>>, base: usize) -> View {
                         Some(Icon::Share),
                         Variant::Secondary,
                         BtnSize::Md,
-                        move || {
-                            // mock: the platform share sheet; until then the link is copied.
-                            set_clipboard(link());
-                            toast("Link copied. Paste it in any app to share.");
-                        },
+                        // The platform's share sheet (copied where there is none).
+                        move || share_text(link()),
                     )
                     .flex_1(),
                 ),

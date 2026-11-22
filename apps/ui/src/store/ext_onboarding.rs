@@ -2,16 +2,16 @@
 //! recovery key, account security, linked devices, backups, restore and
 //! transfer.
 //!
-//! **Mock.** app-core is not built yet. The pure rules (formats, the
-//! recovery key's groups, the safety number's layout) are plain functions
-//! with unit tests; the intents simulate the server and the backup engine
-//! with timers. Each says which app-core call takes its place.
+//! The pure rules (formats, the recovery key's groups, the safety number's
+//! layout) are plain functions with unit tests. A real account's intents
+//! reach the server and app-core (`crate::backend`); only the demo fixtures
+//! (`store::demo()`) simulate them with timers (D-0184).
 
 use std::time::Duration;
 
 use nsh_core::prelude::*;
 
-use super::{BackupDestination, DeviceKind, NOW, Store, clock};
+use super::{BackupDestination, Store};
 
 // ---------------------------------------------------------------- invite codes
 
@@ -303,6 +303,16 @@ pub enum Frequency {
 }
 
 impl Frequency {
+    /// How long after a backup the next is due.
+    pub fn period_ms(self) -> u64 {
+        const DAY: u64 = 24 * 60 * 60 * 1000;
+        match self {
+            Frequency::Daily => DAY,
+            Frequency::Weekly => 7 * DAY,
+            Frequency::Monthly => 30 * DAY,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Frequency::Daily => "Daily",
@@ -329,6 +339,8 @@ pub enum BackupProblem {
 pub struct BackupExtra {
     pub frequency: Frequency,
     pub second: Option<BackupDestination>,
+    /// When the last backup finished (ms since the epoch; 0: never).
+    pub last_ms: u64,
     /// A backup running now: 0.0 to 1.0.
     pub running: Option<f32>,
     pub problem: Option<BackupProblem>,
@@ -426,6 +438,15 @@ pub struct AccountExtra {
 
 impl Default for AccountExtra {
     fn default() -> Self {
+        // A real account: its own link from the server, no made-up other accounts (D-0183).
+        if !super::demo() {
+            return Self {
+                username_link: crate::backend::username::my_link().unwrap_or_default(),
+                passkeys: Vec::new(),
+                others: Vec::new(),
+                report: None,
+            };
+        }
         Self {
             username_link: "https://songbird.chat/u/radu#7Fq2-xN8p".into(),
             passkeys: Vec::new(),
@@ -467,10 +488,20 @@ impl Store {
         global::<AccountExtra>()
     }
 
-    /// Mock: registration (invite, username, Argon2id proof of work) as
-    /// app-core's `register` will do it; here the name is just kept.
+    /// After registration and the username's claim (`backend::register`,
+    /// `backend::claim_username`): keeps the name and makes the account's
+    /// username link on the server (PROTOCOL §4.3). The demo makes one up.
     pub fn create_account(&self, username: String) {
         self.profile_update(|p| p.username = username.clone());
+        if !super::demo() {
+            let extra = self.account_extra();
+            crate::backend::run(async move {
+                let l = crate::backend::username::make_link(&username).await?;
+                extra.update(|a| a.username_link = l);
+                Ok(())
+            });
+            return;
+        }
         self.account_extra().update(|a| {
             a.username_link = format!(
                 "https://songbird.chat/u/{username}#{:x}",
@@ -479,17 +510,24 @@ impl Store {
         });
     }
 
-    /// Mock: a fresh invite link to share (app-core `create_invite`).
+    /// This account's personal invite link (PROTOCOL §14.10): its card in the
+    /// fragment, which no server sees. Empty before registration.
     pub fn invite_link(&self) -> String {
-        let me = self.me.with_untracked(|m| m.username.clone());
-        format!(
-            "https://songbird.chat/i/{:x}",
-            hash(&format!("invite-{me}")) & 0xffff_ffff
-        )
+        crate::backend::plans::my_invite_link().unwrap_or_default()
     }
 
-    /// Mock: a new username link; the old one stops working.
+    /// A new username link; the old one stops working (the demo makes one up).
     pub fn reset_username_link(&self) {
+        if !super::demo() {
+            // The server's reset: the old link stops working.
+            let extra = self.account_extra();
+            crate::backend::run(async move {
+                let l = crate::backend::username::reset().await?;
+                extra.update(|a| a.username_link = l);
+                Ok(())
+            });
+            return;
+        }
         let me = self.me.with_untracked(|m| m.username.clone());
         self.account_extra().update(|a| {
             let next = hash(&a.username_link) & 0xffff_ff;
@@ -497,7 +535,7 @@ impl Store {
         });
     }
 
-    /// Mock: app-core reports that a contact's identity key changed.
+    /// Marks a contact whose identity key changed (or accepted again); app-core reports it.
     pub fn set_key_changed(&self, contact: super::ContactId, changed: bool) {
         self.contacts.update(|cs| {
             if let Some(c) = cs.iter_mut().find(|c| c.id == contact) {
@@ -507,6 +545,7 @@ impl Store {
     }
 
     pub fn rename_device(&self, id: u64, name: String) {
+        crate::backend::rename_device(id, &name);
         self.devices.update(|d| {
             if let Some(x) = d.iter_mut().find(|x| x.id == id) {
                 x.name = name;
@@ -514,56 +553,77 @@ impl Store {
         });
     }
 
-    /// Mock: linking a new device after the scan (app-core `link_device`,
-    /// which needs the two-step PIN when it is on).
-    pub fn link_scanned_device(&self) -> String {
-        let n = self.devices.with_untracked(|d| d.len());
-        let (name, kind) = match n % 3 {
-            0 => ("iPad", DeviceKind::Tablet),
-            1 => ("MacBook Pro", DeviceKind::Desktop),
-            _ => ("Linux laptop", DeviceKind::Desktop),
-        };
-        self.link_device(name.into(), kind);
-        name.into()
+    /// Makes a passkey with the system's sheet and registers it (D-0177).
+    ///
+    /// # Errors
+    /// A [`crate::backend::Problem`].
+    pub async fn add_passkey(&self) -> Result<(), crate::backend::Problem> {
+        let account = crate::backend::live()
+            .with_untracked(|l| l.account.as_deref().and_then(crate::backend::wire::unhex))
+            .and_then(|b| <[u8; 16]>::try_from(b).ok())
+            .ok_or_else(|| crate::backend::problem("Create your account on the server first."))?;
+        let name = self.profile_name_for_passkey();
+        crate::backend::passkeys::add(account, name).await?;
+        self.refresh_passkeys().await
     }
 
-    /// Mock: a passkey made by the platform (app-core `add_passkey`).
-    pub fn add_passkey(&self) {
-        let name = if is_desktop() {
-            "Passkey on this computer"
-        } else {
-            "Passkey on this phone"
-        };
-        self.account_extra()
-            .update(|a| a.passkeys.push(name.into()));
-        self.settings_update(|s| s.passkey = true);
+    fn profile_name_for_passkey(&self) -> String {
+        crate::backend::live()
+            .with_untracked(|l| l.username.clone())
+            .map_or_else(|| "Songbird".into(), |u| format!("@{u}"))
+    }
+
+    /// The account's passkeys, as the server lists them.
+    ///
+    /// # Errors
+    /// A [`crate::backend::Problem`].
+    pub async fn refresh_passkeys(&self) -> Result<(), crate::backend::Problem> {
+        let ids = crate::backend::passkeys::list().await?;
+        let names: Vec<String> = ids
+            .iter()
+            .map(|id| format!("Passkey {}", &id[..id.len().min(8)]))
+            .collect();
+        let any = !names.is_empty();
+        self.account_extra().update(|a| a.passkeys = names);
+        self.settings_update(|s| s.passkey = any);
+        Ok(())
     }
 
     pub fn remove_passkey(&self, index: usize) {
-        self.account_extra().update(|a| {
-            if index < a.passkeys.len() {
-                a.passkeys.remove(index);
-            }
+        let s = *self;
+        crate::backend::run(async move {
+            let ids = crate::backend::passkeys::list().await?;
+            let id = ids
+                .get(index)
+                .cloned()
+                .ok_or_else(|| crate::backend::problem("That passkey is already gone."))?;
+            crate::backend::passkeys::remove(id).await?;
+            s.refresh_passkeys().await
         });
-        let none = self
-            .account_extra()
-            .with_untracked(|a| a.passkeys.is_empty());
-        if none {
-            self.settings_update(|s| s.passkey = false);
-        }
     }
 
-    /// Mock: the account report (app-core `export_account`), ready after a
-    /// moment.
+    /// The account report: the server's export (`GET /v1/account/export`), ready when it
+    /// answers; a failure is said, and the row offers it again.
     pub fn request_account_report(&self) {
         let extra = self.account_extra();
         extra.update(|a| a.report = Some(false));
-        later(1800, move || extra.update(|a| a.report = Some(true)));
+        crate::backend::run(async move {
+            let r = crate::backend::account::export().await;
+            extra.update(|a| a.report = if r.is_ok() { Some(true) } else { None });
+            if r.is_err() {
+                crate::ui::toast("Your report couldn't be prepared. Try again.");
+            }
+            r.map(|_| ())
+        });
     }
 
-    /// Mock: switching accounts swaps the profile shown (app-core keeps a
-    /// store per account).
+    /// The demo's account switcher: swaps the profile shown. One device holds one real
+    /// account (app-core keeps one store), so a real account has no others to switch to and
+    /// never swaps its published profile (D-0184).
     pub fn switch_account(&self, index: usize) {
+        if !super::demo() {
+            return;
+        }
         let extra = self.account_extra();
         let Some(next) = extra.with_untracked(|a| a.others.get(index).cloned()) else {
             return;
@@ -670,20 +730,44 @@ impl Store {
         let messages = snap.messages;
         let chats = snap.chats;
         let target = extra.get_untracked();
+        // The second copy (D-0165): the same content, after the main one, to its own place.
+        let second = target
+            .second
+            .filter(|d| *d != dest && crate::backend::backup::available(*d));
+        let snap2 = second.map(|_| snap.clone());
         Owner::detached().run(|| {
             spawn(async move {
-                let r = crate::backend::backup::back_up(dest, target, snap, records).await;
+                let r = crate::backend::backup::back_up(dest, target.clone(), snap, records).await;
                 poll.cancel();
                 match r {
-                    Ok(_) => {
+                    Ok(stats) => {
+                        let now = nsh_core::time::unix_ms() as u64;
                         extra.update(|b| {
                             b.running = None;
                             b.messages = messages;
                             b.chats = chats;
+                            b.last_ms = now;
                         });
                         store.settings_update(|s| {
-                            s.backup_last = Some(format!("Today at {}", clock(NOW)))
+                            s.backup_last = Some(crate::backend::backup::ago(now));
+                            s.backup_size =
+                                crate::store::ext_groups::format_bytes(stats.plaintext_bytes);
                         });
+                        if let (Some(d2), Some(snap2)) = (second, snap2) {
+                            let none = Arc::new(AtomicU32::new(0));
+                            if let Err(p) =
+                                crate::backend::backup::back_up(d2, target, snap2, none).await
+                            {
+                                extra.update(|b| {
+                                    b.problem = Some(BackupProblem::Other);
+                                    b.note = Some(format!(
+                                        "Your main backup is done, but the second copy, to {}, didn't finish. {}",
+                                        d2.label(),
+                                        p.0
+                                    ));
+                                });
+                            }
+                        }
                     }
                     Err(p) => extra.update(|b| {
                         b.running = None;
@@ -786,6 +870,11 @@ impl Store {
                     .session
                     .update(|s| s.recovery_key = key.display().to_string());
                 crate::backend::backup::apply(store, &r);
+                if let Err(p) = crate::backend::backup::import_core(store, &r).await {
+                    extra.update(|b| b.note = Some(p.0));
+                    stage.set(RestoreStage::Failed);
+                    return;
+                }
                 extra.update(|b| {
                     b.messages = r.messages;
                     b.chats = r.chats;

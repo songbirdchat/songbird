@@ -66,7 +66,7 @@ pub struct Member {
 }
 
 /// What a group's roles may do (owners and admins toggle these).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GroupPermissions {
     pub members_edit_info: bool,
     pub members_add: bool,
@@ -109,7 +109,7 @@ pub enum ChatKind {
 pub enum Disappear {
     Day,
     Week,
-    Quarter,
+    FourWeeks,
 }
 
 impl Disappear {
@@ -117,7 +117,7 @@ impl Disappear {
         match self {
             Disappear::Day => "24 hours",
             Disappear::Week => "7 days",
-            Disappear::Quarter => "90 days",
+            Disappear::FourWeeks => "4 weeks",
         }
     }
 }
@@ -177,6 +177,8 @@ pub struct Chat {
     pub community: Option<ChatId>,
     pub pinned: bool,
     pub muted: bool,
+    /// When a mute ends (unix ms); `u64::MAX` while muted always.
+    pub muted_until: u64,
     pub archived: bool,
     pub favourite: bool,
     pub locked: bool,
@@ -230,8 +232,11 @@ pub enum Body {
     Poll {
         question: String,
         options: Vec<(String, u32)>,
-        mine: Option<usize>,
+        /// The options the user chose.
+        mine: Vec<usize>,
         multiple: bool,
+        /// Its author closed it: the votes are final.
+        closed: bool,
     },
     Event {
         title: String,
@@ -247,6 +252,8 @@ pub enum Body {
     Location {
         label: String,
         live: bool,
+        /// Latitude and longitude, when the place is real (a map shows it).
+        at: Option<(f64, f64)>,
     },
     Sticker {
         emoji: String,
@@ -282,7 +289,7 @@ impl Body {
             Body::Poll { question, .. } => format!("Poll: {question}"),
             Body::Event { title, .. } => format!("Event: {title}"),
             Body::Contact { name, .. } => format!("Contact: {name}"),
-            Body::Location { label, live } => {
+            Body::Location { label, live, .. } => {
                 if *live {
                     format!("Live location · {label}")
                 } else {
@@ -347,6 +354,9 @@ pub enum CallDirection {
     Incoming,
     Outgoing,
     Missed,
+    /// A call that never connected: the server refused it or the connection failed (D-0183: it
+    /// was logged as "No answer").
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq)]

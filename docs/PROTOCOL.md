@@ -89,6 +89,14 @@ endpoints and refuses anything else by closing the connection without a response
 the inner `ClientHello` is opaque to the proxy. The inner `ClientHello` must fit in
 `max_client_hello_bytes` (default 16 KiB) and arrive within the handshake timeout (default 10 s).
 
+**HTTPS through the proxy (D-0164).** With a proxy set, the client sends every request to
+Songbird's own hosts (the api, which also serves media, GIFs, packs and the backup vault, and
+billing) the same way: HTTP/1.1 inside the inner TLS session, redirects followed only to HTTPS and
+only through the proxy. A proxy that can't be reached, or that refuses a host, fails the request;
+the client never falls back to a direct connection. Backup destinations the user chose (their own
+WebDAV, S3 or cloud drive) are reached directly, since a proxy carries only Songbird's hosts.
+Call media (LiveKit and its WebRTC transport) does not go through a proxy.
+
 **Proxy links.** UTF-8, at most 300 bytes, one of:
 
 ```
@@ -623,6 +631,7 @@ link, and invites answer 403 `{"error": "pending"}` (lookups and reading links a
 | `GET /v1/devices` | none | 200 `{"devices": [{"device", "auth_key", "identity_key", "primary", "pending", "confirm"}], "list_version"}` |
 | `PUT /v1/devices/list` | list | 204; 400 `{"error": "list" \| "account" \| "limit" \| "signature"}`; 409 `{"error": "version" \| "devices" \| "identity"}` |
 | `POST /v1/devices/list/fetch` | `{"account": hex}` | 200 list; 404 (none stored); 429 |
+| `POST /v1/devices/identity` | `{"account": hex}` | 200 `{"identity_key": hex}` (the account identity key that signs the list; prove it with a KT lookup, §4.9; A2, D-0138); 404; 429 (the list-fetch budget) |
 | `DELETE /v1/devices/self` | none | 204; 409 `{"error": "primary"}` |
 
 Throttles (defaults), all as GCRA records in `valkey-hot` under keyed hashes:
@@ -771,6 +780,7 @@ What the directory records about each account:
 | `POST /v1/kt/lookup` | `{"account": hex, "kind": "identity" \| "device_list" \| "username"}` | 200 `{"salt", "head", "proof"}`; 404 (nothing published); 400; 429 |
 | `POST /v1/kt/history` | the same | 200 `{"salt", "head", "most_recent": 64, "proof"}`; 404; 400; 429 |
 | `POST /v1/kt/audit` | `{"from", "to"}` (at most 1,000 epochs apart) | 200 `{"proof"}`; 400 for epochs out of order or beyond the directory; 429 |
+| `POST /v1/kt/roots` | the same | 200 `{"roots": [hex, …]}`, every epoch's root from `from` to `to` as the publisher recorded it (D-0171); 404 if one is missing; 400; 429 |
 
 **What clients do** (with `akd_core`'s verifiers, `lookup_verify`, `key_history_verify` and
 `audit_verify`):
@@ -779,7 +789,8 @@ What the directory records about each account:
 - Before trusting a contact's identity key or device list, verify a lookup proof for the
   contact's label (`kind || account`) against a verified head. The proven value must equal
   `HMAC(salt, context || kind || SHA-256(key or list in hand))`.
-- Verify an audit proof between the last head seen and a newer one. Two signed heads that no audit
+- Verify an audit proof between the last head seen and a newer one, with every root in between
+  from `/v1/kt/roots` (the first and last must be the two signed heads' roots; D-0171). Two signed heads that no audit
   proof joins are evidence of a fork: show it and stop trusting the server.
 - Owners check their own key history regularly. A version they did not publish is the warning.
 
@@ -1377,6 +1388,17 @@ ratchet tree` to:
 
 Anyone else gets 404, the same answer as for no group.
 
+- **Member accounts** (D-0155): for a device in the group, the answer to `POST
+  /v1/groups/state` ends, after the meta blob, with `n u16 | n × (device [16] | account [16])`:
+  each member device's account. Devices check every pair against that account's signed device
+  list before using it, so the server can leave a device out but not attribute it to another
+  account. A link's state (`/v1/groups/links/open`) has no such part.
+- **Clients check commits too** (D-0155): before merging a member's commit, a device builds
+  the commit's change in accounts from pairs it verified and runs the same `authorize` the
+  server ran; a commit it refuses ends its following of the group (it shows why). It also drops
+  group messages from accounts the roles do not let send, and pins from accounts that may not
+  pin.
+
 ### 6.5 Group messages: `Send` with `GROUP` (`0x40`)
 
 Flags `SHARED | GROUP`; the `GROUP` block (`group [16]`) comes after every other block; `count`
@@ -1480,6 +1502,15 @@ A commit the rule refuses gets 403 `role`, and clients drop it.
   - **Reading:** `POST /v1/groups/log` with `version u8 (1) | group [16] | after u64`
     (`u64::MAX` for all) answers `n u16 | n × (epoch u64 | len u16 | entry)`, at most 200, for
     the same devices as the state.
+
+- **The log key and entries on the device** (D-0156): a group's creator draws a random 32-byte
+  **log key**; it reaches members in a group message (`GroupUpdate.log_key`) sent after every
+  add (the "created" update for the first members) and by a member that processes a join by
+  link. An entry's ciphertext is `nonce [12] | ChaCha20-Poly1305(log key, nonce, 1 | at_ms u64 |
+  GroupUpdate{kind, actor, subjects}, aad = "songbird.v1/change-log-entry\0" | group |
+  from_epoch u64)`. Apps write one with each add, removal, committed leave and settings change
+  they commit, and show the entries they can open as "Member changes". Entries that do not
+  open (written before a member had the key, or with another) are left out.
 
 ### 6.8 Invite links and join requests (M3, D-0071)
 
@@ -1755,6 +1786,13 @@ travels only inside end-to-end encrypted content, is the capability.
 - **Forwarding** encrypts again under a fresh key and uploads a new object (§7.1). The server
   never copies an object, so two messages never share an ID.
 
+### 7.3a Map tiles (D-0142)
+
+`GET /v1/maps/v1/<z>/<x>/<y>` (z 0–14, x and y within the grid): the OpenStreetMap vector tile
+(Mapbox Vector Tile 2.1, OpenMapTiles schema), 200 `application/vnd.mapbox-vector-tile`; 204 for
+an empty tile; 404 outside the grid; 429 past the IP range's serving budget. Unsigned: no account
+or device is named. Clients over-zoom beyond 14 and show "© OpenStreetMap contributors".
+
 ### 7.4 Packs (M4, D-0083)
 
 One generic service carries sticker packs, chat scenes (IMVironments), sound stickers and
@@ -1876,6 +1914,16 @@ timestamp, counter) cannot collide across senders.
   ring for late frames. The server also disconnects removed devices from the SFU (§8.6).
 - **Call links** are §8.4.
 
+- **The verification code** (D-0152) both people compare: the first 24 bits of
+  `HKDF-Expand(PRK = epoch secret, "songbird.v1/call-code\0", 32)`, four symbols of 6 bits
+  (indices into the apps' list of 64). It changes with every group epoch.
+- **Hellos** (D-0152): on joining, and to each newcomer, a device sends on the room's encrypted
+  data channel (topic `songbird.v1/call-hello`) `account (16) ‖ device (16) ‖ XEdDSA signature
+  (64)` by its device identity key over `"songbird.v1/call-hello\0" ‖ call ID ‖ u8(len) ‖
+  identity ‖ account ‖ device`. Receivers check the device in the account's signed device list
+  before showing a name; until then the tile names nobody. A raised hand is one byte (1 or 0)
+  on topic `songbird.v1/call-hand`.
+
 ### 8.3 Rules for apps
 
 - Never reuse a `call_secret` or a call ID; never send a sender key or secret outside a Signal
@@ -1911,6 +1959,20 @@ stored    = SHA-256("songbird.v1/call-link-hash\0" ‖ link ID)                 
   each participant draws a new key at the next index and sends it to those still present, so a
   newcomer cannot decrypt what came before and a leaver cannot decrypt what follows. Joining
   needs a Songbird account (sessions need one).
+- **On the device** (D-0153). The Signal session's envelope carrying a `sender_key` travels on
+  the room's data channel (topic `songbird.v1/call-key`, addressed to that participant), not
+  through the message lanes: those would refuse a stranger whose account is closed, and a link
+  call is mostly strangers. A key counts only if it came, over the session, from the account and
+  device the sender's card names, for the identity the card names. A link call's data channel is
+  **not** encrypted by LiveKit (its packets would be under sender keys a newcomer does not hold
+  yet); everything sent there is sealed by the app: cards (topic `songbird.v1/call-card`, the
+  card's identity must be its sender's), key envelopes, and other data such as a raised hand
+  (topic `songbird.v1/call-hand`) as `nonce [12] | ChaCha20-Poly1305(link key, nonce, data,
+  aad = "songbird.v1/call-link-data\0")`. Media stays encrypted by LiveKit under the sender keys.
+  No hello (§8.2) is sent in a link call.
+- A card sent to a lobby is made before the device has a participant identity; it carries the
+  identity `lobby`.
+- The link's URL is `https://songbird.chat/call#<base64url, no padding, of the root>`.
 
 ### 8.5 Signalling
 
@@ -2166,6 +2228,8 @@ Inside the ciphertext only:
 | --- | --- |
 | `s/<name>` | An account-wide setting |
 | `c/<chat>/<name>` | A per-chat preference; `<chat>` is the hex of the peer's account ID or the group ID |
+| `g/<group>` | The account is in this group (`1`): its other devices join it by external commit (D-0167) |
+| `c/<chat>/state` | The chat's list state: `a=,p=,m=<muted until ms>,u=,f=,l=<lists>` joined by `;` (D-0163) |
 | `k/<id>` | A saved contact (name, notes, buddy-list groups) |
 | `l/<id>` | A custom chat list |
 | `b/<id>` | A broadcast list |
@@ -2308,7 +2372,11 @@ signature = Ed25519(policy key, "songbird.v1/supervision\0" ‖ every byte befor
 `client_rules` is AES-256-GCM-SIV ciphertext under a key from the link secret (HKDF, salt
 `"songbird.v1/supervision"`, info `"client-rules"`; AAD `"songbird.v1/client-rules\0" ‖ child ‖
 be64(version)`): approving each new contact, declining calls from non-contacts, nudges off, quiet
-hours. Only the two devices read it; the child's app enforces it and shows it.
+hours. Only the two devices read it; the child's app enforces it and shows it (D-0166). A new
+contact is approved in person: the child's phone shows `SONGBIRD:APPROVE:<account hex>:<username>`,
+the parent's phone shows eight digits, `HMAC-SHA256(HKDF-SHA256(salt "songbird.v1/supervision",
+link secret, info "contact-approval"), "songbird.v1/contact-approval\0" ‖ child ‖ contact)`, the
+first 8 bytes big-endian mod 10^8, which the child types.
 
 | Request | Who | Answers |
 | --- | --- | --- |
@@ -2449,8 +2517,9 @@ device list's version, the server name); the profile; settings (the record store
 with their values, and device-only settings under `d/`); contacts; groups (ID, name, metadata
 key, members, role: enough to rejoin by re-add or external commit, §6); chats; messages (the
 content protobuf of §5 as sent or received, with media references, status and star); media.
-**Never**: ratchet sessions, prekeys, device identity keys, MLS epoch secrets, KeyPackages. A
-restored device starts fresh sessions.
+**Never**: ratchet sessions, prekeys, device identity keys, MLS epoch secrets, KeyPackages,
+disappearing messages, view-once messages, deleted messages (D-0165). A restored device starts
+fresh sessions. A device keeps its rollback state (§11.4) per vault and per destination.
 
 ### 11.6 Restoring
 
@@ -2899,6 +2968,7 @@ providers' credentials. It never sees an account.
 | `POST /v1/billing/mollie/checkout` | the app | `{"plan": "plus" \| "family", "interval": "month" \| "year", "subscriber": <64 hex>}` | 200 `{"checkout": <Mollie URL>}`; 409 `exists`; 409 `revoked` (refunded or charged back: the app starts over with a new subscriber secret) |
 | `POST /v1/billing/mollie/webhook` | Mollie | `id=tr_…` (form) | 200 (unknown IDs too); 503 retry |
 | `POST /v1/billing/mollie/state`, `/cancel` | the app | `{"subscriber"}` | state `{"plan", "interval", "paid_through", "renews", "revoked"}`; cancel 204; 404 |
+| `POST /v1/billing/mollie/resume` | the app | `{"subscriber"}` | 204: a new subscription on the customer's mandate, its first charge the day the paid period would renew (D-0169); 404; 409 `revoked`, `expired`, `renews`, `mandate` |
 
 **Rows.** `sub` under `HMAC(billing secret, provider ‖ 0 ‖ ID)[..16]`, where the ID is Apple's
 original transaction ID, Google's purchase token, or the app's Mollie subscriber secret: the
@@ -3011,7 +3081,9 @@ it never overrides or shortens a moderator's row.
 
 A ticket is opened by the app, signed or not, and read with a bearer secret. Messages are sealed
 on the device and opened only by staff with the support key, or by the app with the ticket's
-reply key: the server stores ciphertext.
+reply key: the server stores ciphertext. `kind` is `help`, `appeal` (signed only), `billing` or
+`crash` (unsigned only: a crash report, scrubbed on the device and sent only when the user turned
+them on; D-0170).
 
 | Request | Auth | Body | Answer |
 | --- | --- | --- | --- |

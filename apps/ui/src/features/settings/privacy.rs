@@ -24,7 +24,6 @@ pub fn privacy() {
 fn content() -> AnyElement {
     let s = store();
     let settings = s.settings;
-    let ext = s.ext();
     let count_blocked = move || {
         s.contacts
             .with(|cs| cs.iter().filter(|c| c.blocked).count())
@@ -104,46 +103,56 @@ fn content() -> AnyElement {
         ))
         .child(section(
             "On this device",
-            vec![
+            [
                 value_row(
                     "App lock",
                     Some(Icon::Lock),
                     move || if settings.with(|x| x.app_lock) { "On".into() } else { "Off".into() },
                     app_lock,
                 ),
+            ]
+            .into_iter()
+            // Linux can't keep an app out of screenshots: no setting that does nothing.
+            .chain((os() != nsh_core::platform::Os::Linux).then(|| {
                 toggle_row_icon(
                     Icon::EyeOff,
                     "Block screenshots",
-                    Some("Stops screenshots and screen recording of Songbird on this device."),
+                    Some(match os() {
+                        nsh_core::platform::Os::Ios => "iOS can't block screenshots. Songbird hides while your screen is recorded.",
+                        _ => "Stops screenshots and screen recording of Songbird on this device.",
+                    }),
                     move || settings.with(|x| x.block_screenshots),
                     move |on| s.settings_update(|x| x.block_screenshots = on),
-                ),
+                )
+            }))
+            // The app switcher's snapshot is a phone's (D-0173).
+            .chain(matches!(os(), nsh_core::platform::Os::Ios | nsh_core::platform::Os::Android).then(|| {
                 toggle_row_icon(
                     Icon::Layers,
                     "Hide content in app switcher",
                     Some("Shows a blank screen when you switch apps."),
                     move || settings.with(|x| x.hide_in_switcher),
                     move |on| s.settings_update(|x| x.hide_in_switcher = on),
-                ),
-                toggle_row_icon(
-                    Icon::Link,
-                    "Link previews",
-                    Some("Previews are made on your device. Nobody else learns which links you share."),
-                    move || settings.with(|x| x.link_previews),
-                    move |on| s.settings_update(|x| x.link_previews = on),
-                ),
-            ],
+                )
+            }))
+            .chain([toggle_row_icon(
+                Icon::Link,
+                "Link previews",
+                Some("Previews are made on your device. Nobody else learns which links you share."),
+                move || settings.with(|x| x.link_previews),
+                move |on| s.settings_update(|x| x.link_previews = on),
+            )])
+            .collect(),
         ))
         .child(section(
             "Advanced",
             vec![
-                toggle_row_icon(
-                    Icon::Shield,
-                    "Protect IP address in calls",
-                    Some("Calls go through Songbird's relay, so the other person can't see your IP address. Call quality may drop a little."),
-                    move || ext.with(|x| x.protect_ip_in_calls),
-                    move |on| s.ext_update(|x| x.protect_ip_in_calls = on),
-                ),
+                // Every call's media goes through Songbird's call server (D-0177): the other
+                // person never sees your IP address, so there is nothing to turn on.
+                Row::new("IP address in calls")
+                    .icon(Icon::Shield)
+                    .subtitle("Calls always go through Songbird's servers, so the people you call never see your IP address.")
+                    .build(),
                 toggle_row_icon(
                     Icon::Alert,
                     "Send crash reports",
@@ -291,7 +300,7 @@ pub fn default_timer() {
             (None, "Off"),
             (Some(Disappear::Day), "24 hours"),
             (Some(Disappear::Week), "7 days"),
-            (Some(Disappear::Quarter), "90 days"),
+            (Some(Disappear::FourWeeks), "4 weeks"),
         ];
         view()
             .child(view().items_center().pt_6().pb_2().child(hero_icon(Icon::Timer)))
@@ -420,7 +429,7 @@ pub fn app_lock() {
         view()
             .child(view().pt_4().child(group(vec![toggle_row(
                 "Lock with a passcode",
-                Some("Songbird asks for six digits when you open it. They stay on this device. Face ID and fingerprints are coming."),
+                Some("Songbird asks for six digits when you open it. They stay on this device."),
                 on,
                 move |v| {
                     if v {
@@ -430,6 +439,36 @@ pub fn app_lock() {
                     }
                 },
             )])))
+            .child(when(
+                move || on() && crate::backend::biometric::kind().is_some(),
+                move || {
+                    let kind = crate::backend::biometric::kind()
+                        .map_or("biometrics", |k| k.label());
+                    view()
+                        .pt_4()
+                        .child(group(vec![toggle_row(
+                            format!("Unlock with {kind}"),
+                            Some("Your passcode still opens Songbird, and is needed after too many tries."),
+                            move || ext.with(|x| x.app_lock_biometrics),
+                            move |v| {
+                                if !v {
+                                    s.ext_update(|x| x.app_lock_biometrics = false);
+                                    return;
+                                }
+                                // Turned on only after a match: proof the owner is here.
+                                spawn(async move {
+                                    if crate::backend::biometric::verify("turn on biometric unlock")
+                                        .await
+                                        .is_ok()
+                                    {
+                                        s.ext_update(|x| x.app_lock_biometrics = true);
+                                    }
+                                });
+                            },
+                        )]))
+                        .into_element()
+                },
+            ))
             .child(when(on, move || {
                 section_plain(
                     "Lock automatically",

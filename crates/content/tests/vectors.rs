@@ -317,6 +317,7 @@ fn vectors() -> Vec<(&'static str, Content)> {
                     actor: b(0x22, 16),
                     subjects: vec![b(0x44, 16), b(0x55, 16)],
                     value: String::new(),
+                    log_key: Vec::new(),
                 }),
                 b(0x99, 16),
                 0,

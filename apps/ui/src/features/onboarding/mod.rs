@@ -166,8 +166,12 @@ impl Flow {
 }
 
 /// Leaves the first run into `chat`, with a welcome.
+/// Ends the first run: opens `chat` where it exists (the demo's welcome chat; a real account
+/// starts on its chat list, D-0183: it opened a chat that wasn't there).
 pub(crate) fn finish(s: Store, chat: ChatId, message: String) {
-    crate::features::chat::open(chat);
+    if s.chat(chat).is_some() {
+        crate::features::chat::open(chat);
+    }
     toast(message);
     s.finish_onboarding();
 }

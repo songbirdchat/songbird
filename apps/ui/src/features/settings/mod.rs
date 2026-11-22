@@ -8,14 +8,16 @@
 //! `Store::settings_update` / `profile_update` or the intents in
 //! `store::ext_settings`.
 
-mod account;
+pub(crate) mod account;
 mod appearance;
 mod centre;
-mod chats;
+pub(crate) mod chats;
 mod extras;
+pub use extras::ask_approval;
 mod links;
 mod notifications;
 mod privacy;
+pub use privacy::app_lock;
 mod profile;
 
 use std::rc::Rc;
@@ -660,7 +662,7 @@ fn profile_card() -> AnyElement {
             let (emoji, until) = ext.with(|x| (x.status_emoji.clone(), x.status_until));
             format!(
                 "{emoji} {line} · {}",
-                until_label(until, crate::store::NOW).to_lowercase()
+                until_label(until, crate::store::now()).to_lowercase()
             )
         })
     };
@@ -709,11 +711,14 @@ fn profile_card() -> AnyElement {
                 .outline_color(move || c::ring())
         })
         // Presence shows once on this tab: the choice right below.
-        .child(avatar(
-            me.with_untracked(|p| p.name.clone()),
-            me.with_untracked(|p| p.seed),
-            64.0,
-        ))
+        .child({
+            // Follows a name changed on the profile page.
+            let who = computed(move || me.with(|p| (p.name.clone(), p.seed)));
+            dynamic(move || {
+                let (name, seed) = who.get();
+                Some(avatar(name, seed, 64.0))
+            })
+        })
         .child(
             view()
                 .flex_1()

@@ -44,7 +44,9 @@ fn mix(seed: u64, lane: u64) -> u64 {
 /// Whether this (mock) person has set a photo: most have, a few show
 /// initials, as in real life.
 pub fn has_photo(seed: u64) -> bool {
-    seed == ME_SEED || mix(seed, 7) % 6 != 0
+    // Illustrated stand-ins only in the demo fixtures; a real account shows
+    // real photos (`backend::avatar`) or initials.
+    crate::store::demo() && (seed == ME_SEED || mix(seed, 7) % 6 != 0)
 }
 
 /// The user's own seed (the mock store's `me.seed`): the user has set a
@@ -346,5 +348,16 @@ mod photo_tests {
         assert!(photo_markup("first snow in the garden", 1, 4, 3).contains("#FFFFFF"));
         assert!(photo_markup("a street at dusk", 1, 4, 3).contains("#2D2A44"));
         assert_eq!(photo_markup("x", 5, 16, 9), photo_markup("x", 5, 16, 9));
+    }
+}
+
+/// A message's photo: the real one for a real attachment (empty until this
+/// device has it), the illustration only in the demo fixtures.
+pub fn message_photo(alt: &str, id: u64, w: u32, h: u32) -> ImageSrc {
+    if crate::backend::chat::is_media(id) {
+        crate::backend::chat::load_photo(id);
+        crate::backend::chat::media_src(id).unwrap_or_else(|| ImageSrc::from(""))
+    } else {
+        photo(alt, id, w, h)
     }
 }

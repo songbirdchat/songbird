@@ -4,7 +4,7 @@
 use nsh_core::prelude::*;
 
 use crate::{
-    store::{NOW, StatusExpiry, store, until_label},
+    store::{StatusExpiry, now, store, until_label},
     ui::*,
 };
 
@@ -43,8 +43,22 @@ fn content() -> AnyElement {
     let name_invalid = move || name.with(|n| n.trim().is_empty());
     let candidate = move || username.with(|u| u.trim().trim_start_matches('@').to_lowercase());
     let unchanged = move || me.with(|p| p.username == candidate());
-    let available = move || unchanged() || s.username_available(&candidate());
-    let link = move || format!("songbird.chat/u/{}", me.with(|p| p.username.clone()));
+    // Taken or not is the server's answer to the claim; here only the format is checked.
+    let available =
+        move || unchanged() || songbird_keys::username::Username::parse(&candidate()).is_ok();
+    // The real username link (PROTOCOL §4.3): made on first visit, reset on demand.
+    let link_url = signal(crate::backend::username::my_link().unwrap_or_default());
+    if link_url.get_untracked().is_empty() && crate::backend::registered() {
+        let name = me.with_untracked(|p| p.username.clone());
+        if !name.is_empty() {
+            crate::backend::run(async move {
+                let l = crate::backend::username::make_link(&name).await?;
+                let _ = link_url.try_set(l);
+                Ok(())
+            });
+        }
+    }
+    let link = move || link_url.get().trim_start_matches("https://").to_string();
     let seed = me.with_untracked(|p| p.seed);
 
     view()
@@ -57,7 +71,11 @@ fn content() -> AnyElement {
                 .child(
                     view()
                         .size(px(112.0))
-                        .child(avatar(me.with_untracked(|p| p.name.clone()), seed, 112.0))
+                        .child({
+                            // Follows the name as it is typed (its initials).
+                            let name = computed(move || me.with(|p| p.name.clone()));
+                            dynamic(move || Some(avatar(name.get(), seed, 112.0)))
+                        })
                         .child(
                             view()
                                 .absolute()
@@ -68,9 +86,9 @@ fn content() -> AnyElement {
                                 .text_color(move || c::on_primary())
                                 .border_2()
                                 .border_color(move || c::background())
-                                // mock: the photo picker and the encrypted avatar upload (app-core, Prompt 3).
-                                .child(icon_btn(Icon::Camera, "Change profile photo", || {
-                                    toast("Photo picker opens here")
+                                // The system picker; the photo is encrypted on this device.
+                                .child(icon_btn(Icon::Camera, "Change profile photo", move || {
+                                    crate::backend::avatar::choose(s)
                                 })),
                         ),
                 )
@@ -127,8 +145,13 @@ fn content() -> AnyElement {
                     .child(
                         btn("Save", Variant::Secondary, BtnSize::Md, move || {
                             let u = candidate();
-                            s.profile_update(|p| p.username = u.clone());
-                            toast(format!("Your username is now @{u}"));
+                            crate::backend::run(async move {
+                                let l = crate::backend::username::change(&u).await?;
+                                s.profile_update(|p| p.username = u.clone());
+                                let _ = link_url.try_set(l);
+                                toast(format!("Your username is now @{u}"));
+                                Ok(())
+                            });
                         })
                         .disabled(move || unchanged() || !available()),
                     ),
@@ -139,9 +162,9 @@ fn content() -> AnyElement {
                     } else if u.len() < 3 {
                         "Use at least 3 letters or numbers.".to_string()
                     } else if available() {
-                        format!("@{u} is available.")
+                        format!("Save to claim @{u}. If someone has it, you'll be told.")
                     } else {
-                        format!("@{u} is taken. Try another.")
+                        "3 to 32 letters, numbers, _ or ., starting with a letter.".to_string()
                     }
                 },
                 move || !unchanged() && !available(),
@@ -153,7 +176,7 @@ fn content() -> AnyElement {
                     .flex_row()
                     .items_center()
                     .gap_4()
-                    .child(qr_code(&me.with_untracked(|p| p.username.clone()), 112.0))
+                    .child(dynamic(move || qr_code(&link_url.get(), 112.0).into_element()))
                     .child(
                         view()
                             .flex_1()
@@ -167,16 +190,20 @@ fn content() -> AnyElement {
                                     .flex_wrap()
                                     .gap_2()
                                     .child(btn_with_icon("Copy link", Some(Icon::Copy), Variant::Outline, BtnSize::Sm, move || {
-                                        set_clipboard(format!("https://{}", link()));
+                                        set_clipboard(link_url.get_untracked());
                                         toast("Link copied");
                                     }))
-                                    .child(btn_with_icon("Reset", Some(Icon::Refresh), Variant::Outline, BtnSize::Sm, || {
+                                    .child(btn_with_icon("Reset", Some(Icon::Refresh), Variant::Outline, BtnSize::Sm, move || {
                                         confirm(
                                             "Reset your username link?",
                                             "Your old link and QR code will stop working.",
                                             "Reset",
-                                            // mock: app-core makes a new random link handle (Prompt 3, usernames).
-                                            || toast("New link made. The old one no longer works."),
+                                            move || crate::backend::run(async move {
+                                                let l = crate::backend::username::reset().await?;
+                                                let _ = link_url.try_set(l);
+                                                toast("New link made. The old one no longer works.");
+                                                Ok(())
+                                            }),
                                         )
                                     })),
                             ),
@@ -314,7 +341,7 @@ pub fn status_sheet(open: Signal<bool>) -> nsh_base::SheetElement {
                             chip(x.label(), move || expiry.get() == x, move || expiry.set(x))
                         })),
                 )
-                .child(muted(move || until_label(expiry.get().until(NOW), NOW))),
+                .child(muted(move || until_label(expiry.get().until(now()), now()))),
         )
         .child(
             view()

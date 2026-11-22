@@ -384,7 +384,11 @@ fn group_update(g: &GroupUpdate) -> R {
     check(g.kind != 0, "group_update.kind")?;
     id(&g.actor, "group_update.actor")?;
     ids(&g.subjects, MAX_MEMBERS, "group_update.subjects")?;
-    len(&g.value, 4_096, "group_update.value")
+    len(&g.value, 4_096, "group_update.value")?;
+    check(
+        g.log_key.is_empty() || g.log_key.len() == 32,
+        "group_update.log_key",
+    )
 }
 
 fn receipt(r: &ReceiptMessage) -> R {

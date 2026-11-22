@@ -789,6 +789,28 @@ async fn support_tickets_are_sealed_bearer_bound_and_gone_at_close() {
     ));
     assert_eq!(s.app.registry.tickets(10).await.unwrap().len(), 1);
 
+    // A crash report (D-0170): unsigned only, nobody attached; signed, refused.
+    let crash = seal_with(Domain::Support, &support, b"{\"panic\":\"<scrubbed>\"}").unwrap();
+    let (st, _) = c
+        .send("POST", "/v1/support/tickets", Some(&body("crash", &crash)))
+        .await
+        .unwrap();
+    assert_eq!(st, 400);
+    let (st, _) = raw(
+        s.addr,
+        "POST",
+        "/v1/support/tickets",
+        &[],
+        Some(body("crash", &crash)),
+    )
+    .await;
+    assert_eq!(st, 201);
+    let rows = s.app.registry.tickets(10).await.unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r.account.is_none() && r.kind == "crash")
+    );
+
     // Opening has a budget per IP range.
     let mut throttled = false;
     for _ in 0..12 {
