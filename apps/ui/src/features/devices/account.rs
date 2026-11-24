@@ -32,7 +32,14 @@ fn body() -> AnyElement {
         Row::new("Username")
             .icon(Icon::User)
             .trailing(
-                text(move || format!("@{}", username()))
+                text(move || {
+                    let u = username();
+                    if u.is_empty() {
+                        "Not set".to_string()
+                    } else {
+                        handle(&u)
+                    }
+                })
                     .text_size(px(font::SMALL + 1.0))
                     .text_color(move || c::muted_fg()),
             )
@@ -188,7 +195,11 @@ fn body() -> AnyElement {
             group([
                 Row::new(me.name.clone())
                     .leading(avatar(me.name.clone(), me.seed, 32.0))
-                    .subtitle(format!("@{} · Using now", me.username))
+                    .subtitle(if me.username.is_empty() {
+                        "Using now".to_string()
+                    } else {
+                        format!("{} · Using now", handle(&me.username))
+                    })
                     .trailing(icon(Icon::Check, 18.0).text_color(move || c::primary()))
                     .build(),
                 // One real account per device for now (app-core keeps one store): said plainly
@@ -290,7 +301,7 @@ pub fn account_switcher(open: Signal<bool>) -> AnyElement {
                 let mut rows = vec![
                     Row::new(me.name.clone())
                         .leading(avatar(me.name.clone(), me.seed, 36.0))
-                        .subtitle(format!("@{}", me.username))
+                        .subtitle(handle(&me.username))
                         .trailing(
                             view()
                                 .flex_row()
@@ -310,7 +321,7 @@ pub fn account_switcher(open: Signal<bool>) -> AnyElement {
                     rows.push(
                         Row::new(a.name.clone())
                             .leading(avatar(a.name.clone(), a.seed, 36.0))
-                            .subtitle(format!("@{}", a.username))
+                            .subtitle(handle(&a.username))
                             .on_press(move || {
                                 s.switch_account(i);
                                 open.set(false);

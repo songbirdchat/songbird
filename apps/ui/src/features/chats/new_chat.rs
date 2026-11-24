@@ -32,6 +32,45 @@ fn action_tile(glyph: Icon) -> View {
         .child(icon(glyph, if is_desktop() { 18.0 } else { 20.0 }))
 }
 
+/// The "message this username" row: its words follow the lookup, and a spinner stands in for
+/// its icon while it runs.
+fn username_action(
+    label: impl Fn() -> String + Copy + 'static,
+    busy: impl Fn() -> bool + Copy + 'static,
+    on_press: impl Fn() + 'static,
+) -> impl IntoElement {
+    search::pressable(
+        "Message this username on Songbird".to_string(),
+        on_press,
+        view()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .px(px(row::GUTTER - row::fill_inset()))
+            .min_h(px(if is_desktop() { 52.0 } else { 60.0 }))
+            .child(dynamic(move || {
+                Some(untracked(move || {
+                    if busy() {
+                        view()
+                            .size(px(if is_desktop() { 40.0 } else { 44.0 }))
+                            .items_center()
+                            .justify_center()
+                            .child(spinner(22.0))
+                            .into_element()
+                    } else {
+                        action_tile(Icon::Search).into_element()
+                    }
+                }))
+            }))
+            .child(
+                text(label)
+                    .flex_1()
+                    .text_size(px(font::body()))
+                    .font_weight(FontWeight::MEDIUM),
+            ),
+    )
+}
+
 fn action(glyph: Icon, label: &'static str, on_press: impl Fn() + 'static) -> impl IntoElement {
     search::pressable(
         label.to_string(),
@@ -131,21 +170,37 @@ fn body() -> impl IntoElement {
                             !browsing() && crate::backend::is_live() && crate::backend::registered()
                         },
                         move || {
-                            action(
-                                Icon::Search,
-                                "Message this username on Songbird",
-                                move || {
+                            // The lookup takes a moment (the username's hash, then their keys):
+                            // the row says so and takes no second tap meanwhile (found on an
+                            // iPhone: taps seemed to do nothing).
+                            let finding = signal(None::<String>);
+                            let label = move || match finding.get() {
+                                Some(n) => format!("Finding {n}…"),
+                                None => "Message this username on Songbird".to_string(),
+                            };
+                            username_action(label, move || finding.with(Option::is_some), move || {
+                                    if finding.with_untracked(Option::is_some) {
+                                        return;
+                                    }
                                     let name = query.get_untracked();
                                     // A call link pasted here joins its call.
                                     if crate::features::calls::open_link(&name) {
                                         nav::pop_to_root();
                                         return;
                                     }
+                                    let shown = name.trim().trim_start_matches('@');
+                                    finding.set(Some(if shown.starts_with("https://") {
+                                        "the link".to_string()
+                                    } else {
+                                        format!("@{shown}")
+                                    }));
                                     crate::backend::run(async move {
-                                        let chat = match crate::backend::chat::start_with_username(
+                                        let found = crate::backend::chat::start_with_username(
                                             &name,
                                         )
-                                        .await
+                                        .await;
+                                        let _ = finding.try_set(None);
+                                        let chat = match found
                                         {
                                             Err(p)
                                                 if p.0 == crate::backend::rules::NEEDS_APPROVAL =>
@@ -331,7 +386,10 @@ fn open_scan() {
 
 /// A camera that reads a friend's Songbird code (their username link, or a group's invite
 /// link) on this device and opens the chat: `on_chat` gets it (D-0184).
-pub(crate) fn friend_scanner(size: f32, on_chat: impl Fn(crate::store::ChatId) + Copy + 'static) -> View {
+pub(crate) fn friend_scanner(
+    size: f32,
+    on_chat: impl Fn(crate::store::ChatId) + Copy + 'static,
+) -> View {
     let busy = signal(false);
     let session = crate::camera::use_session(
         songbird_camera::Purpose::ScanCode,

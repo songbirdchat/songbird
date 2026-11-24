@@ -529,7 +529,7 @@ fn new_call(s: Store) {
                                         let id = p.id;
                                         Row::new(p.name.clone())
                                             .leading(avatar(p.name.clone(), p.id, 40.0))
-                                            .subtitle(format!("@{}", p.username))
+                                            .subtitle(handle(&p.username))
                                             .trailing(
                                                 view()
                                                     .flex_row()

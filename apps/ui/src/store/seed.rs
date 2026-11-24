@@ -136,6 +136,7 @@ impl Thread {
             pinned: false,
             forwarded: false,
             receipts: Vec::new(),
+            album: None,
         });
         self.out.last_mut().unwrap()
     }

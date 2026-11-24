@@ -11,7 +11,7 @@ use super::{Conv, bubbles, logic};
 use crate::ui::floating;
 use crate::{
     features::devices,
-    store::{Body, ChatKind, Message},
+    store::{Body, ChatKind, Message, MsgId},
     ui::*,
 };
 
@@ -20,6 +20,67 @@ use crate::{
 pub(crate) struct Item {
     pub m: Message,
     pub place: logic::Place,
+    /// An album's places in album order (its items, then any still on their way); empty for
+    /// a message on its own.
+    pub album: Vec<Tile>,
+}
+
+impl Item {
+    /// A message drawn on its own (outside the list: the lifted copy, message info).
+    pub fn single(m: Message, place: logic::Place) -> Self {
+        Self {
+            m,
+            place,
+            album: Vec::new(),
+        }
+    }
+}
+
+/// One place of an album: a photo or video, or one still on its way (`id` 0).
+#[derive(Clone, PartialEq)]
+pub(crate) struct Tile {
+    pub id: MsgId,
+    pub alt: String,
+    pub w: u32,
+    pub h: u32,
+    /// A video's length in seconds.
+    pub video: Option<u32>,
+    /// The user's own, and its sending failed (the album's Retry resends it).
+    pub failed: bool,
+    /// The user's own, still uploading (a spinner over it).
+    pub sending: bool,
+}
+
+impl Tile {
+    fn of(m: &Message) -> Self {
+        let (alt, w, h, video) = match &m.body {
+            Body::Image { alt, w, h, .. } => (alt.clone(), *w, *h, None),
+            Body::Video { caption, secs } => (format!("video {caption}"), 16, 9, Some(*secs)),
+            _ => (String::new(), 1, 1, None),
+        };
+        Self {
+            id: m.id,
+            alt,
+            w,
+            h,
+            video,
+            failed: m.mine() && m.status == crate::ui::Tick::Failed,
+            sending: m.mine() && m.status == crate::ui::Tick::Sending,
+        }
+    }
+
+    /// A place for an item still on its way.
+    fn waiting() -> Self {
+        Self {
+            id: 0,
+            alt: String::new(),
+            w: 1,
+            h: 1,
+            video: None,
+            failed: false,
+            sending: false,
+        }
+    }
 }
 
 /// A cell's current row (a memo: bindings run only when it changes).
@@ -44,14 +105,63 @@ const END_SLOP: f32 = 80.0;
 /// capsule's height and its 8pt above the composer).
 const JUMP_ROOM: f32 = 56.0;
 
+/// An album's status: failed if any photo failed, else the least advanced one's.
+fn album_status(all: impl Iterator<Item = crate::ui::Tick>) -> crate::ui::Tick {
+    use crate::ui::Tick;
+    let rank = |t: Tick| match t {
+        Tick::Failed => 0,
+        Tick::Sending => 1,
+        Tick::Sent => 2,
+        Tick::Delivered => 3,
+        Tick::Read => 4,
+        Tick::Played => 5,
+    };
+    all.min_by_key(|t| rank(*t)).unwrap_or(Tick::Sent)
+}
+
 /// The list of messages.
 pub(crate) fn message_list(cv: Conv) -> impl IntoElement {
     let (s, chat) = (cv.s, cv.chat);
+    // The composer's frame is measured after the list first rests at its
+    // end, and it grows with multi-line drafts, replies and the keyboard:
+    // more than the follow slop, so the newest message would end up under
+    // it. While following, the list goes back to its end each time.
+    effect(move || {
+        let (_, _) = (cv.bottom_inset.get(), cv.top_inset.get());
+        if cv.following.get_untracked() {
+            cv.list.scroll_to_end(false);
+        }
+    });
+    // Opening a chat rests at its end by estimated row heights; tall rows (an album, a photo)
+    // measure larger as they appear and move the end past the follow slop (found on two
+    // iPhones: chats opened short of the newest message). While the chat settles, it goes back
+    // to the end, unless the user has scrolled away.
+    // Measuring can itself report "not at the end" for a moment, so this doesn't ask; a jump
+    // to a message (a highlight) wins.
+    for ms in [60, 200, 450, 900] {
+        set_timeout(Duration::from_millis(ms), move || {
+            if cv.highlight.get_untracked().is_none() {
+                cv.list.scroll_to_end(false);
+                cv.following.set(true);
+            }
+        });
+    }
+    // One row per message, or per album at its first item (D-0186): an album's items join its
+    // row as they arrive, so nothing above or below moves.
     virtual_list(
-        move || s.message_count(chat),
+        move || cv.rows.with(Vec::len),
         move |at: Position| row(cv, at),
     )
-    .keys(move || s.message_ids(chat))
+    .keys(move || {
+        s.messages.with(|m| {
+            let v = m.get(&chat);
+            cv.rows.with(|r| {
+                r.iter()
+                    .map(|row| v.and_then(|v| v.get(row.at)).map_or(0, |x| x.id))
+                    .collect::<Vec<_>>()
+            })
+        })
+    })
     .estimated_item_size(px(58.0))
     .alignment(ListAlignment::Bottom)
     .follow_end(px(END_SLOP))
@@ -108,10 +218,38 @@ pub(crate) fn gutter(cv: Conv) -> f32 {
 fn row(cv: Conv, at: Position) -> View {
     let (s, chat) = (cv.s, cv.chat);
     let item: ItemMemo = computed(move || {
-        let (prev, cur, next) = s.message_window(chat, at.index());
-        let m = cur?;
-        let place = logic::place(prev.as_ref(), &m, next.as_ref());
-        Some(Item { m, place })
+        let n = at.index();
+        cv.rows.with(|rows| {
+            let r = rows.get(n)?;
+            s.messages.with(|all| {
+                let v = all.get(&chat)?;
+                // The row's newest message speaks for an album (its time, its status line),
+                // placed among the rows around it.
+                let last = r.items.iter().copied().max().unwrap_or(r.at);
+                let mut m = v.get(last)?.clone();
+                let prev = n
+                    .checked_sub(1)
+                    .and_then(|p| rows.get(p))
+                    .and_then(|p| v.get(p.items.iter().copied().max().unwrap_or(p.at)));
+                let next = rows.get(n + 1).and_then(|x| v.get(x.at));
+                let first = v.get(r.at)?;
+                let mut place = logic::place(prev, first, next);
+                place.last = logic::place(prev, &m, next).last;
+                let album: Vec<Tile> = if r.items.is_empty() {
+                    Vec::new()
+                } else {
+                    let members: Vec<&Message> = r.items.iter().filter_map(|&k| v.get(k)).collect();
+                    // The album's status line speaks for all of it: a failure anywhere, else
+                    // the least advanced of its photos (never "Read" while one is sending).
+                    m.status = album_status(members.iter().map(|x| x.status));
+                    let mut tiles: Vec<Tile> = members.into_iter().map(Tile::of).collect();
+                    let waiting = (r.count as usize).saturating_sub(tiles.len());
+                    tiles.extend(std::iter::repeat_with(Tile::waiting).take(waiting));
+                    tiles
+                };
+                Some(Item { m, place, album })
+            })
+        })
     });
     let kind = computed(move || {
         item.with(|i| {
@@ -312,10 +450,18 @@ fn nudge_row(cv: Conv, item: ItemMemo) -> View {
 fn bubble_row(cv: Conv, item: ItemMemo) -> AnyElement {
     let s = cv.s;
     let id = sel(item, |i| i.m.id);
+    // An album is selected and unselected whole.
+    let ids = sel(item, |i| {
+        if i.album.is_empty() {
+            vec![i.m.id]
+        } else {
+            i.album.iter().map(|t| t.id).filter(|&id| id != 0).collect()
+        }
+    });
     let people = s
         .chat(cv.chat)
         .is_some_and(|c| matches!(c.kind, ChatKind::Group | ChatKind::Community));
-    let selected = move || cv.selected.with(|v| v.contains(&id.get()));
+    let selected = move || ids.with(|ids| cv.selected.with(|v| ids.iter().all(|x| v.contains(x))));
     // While selecting, the marks make a column of their own at the
     // leading edge (for both sides' messages), and the chosen rows are
     // tinted: shape and colour.
@@ -354,7 +500,7 @@ fn bubble_row(cv: Conv, item: ItemMemo) -> AnyElement {
                     "Select message"
                 }
             }))
-            .on_press(move || cv.toggle_selected(id.get_untracked()))
+            .on_press(move || cv.toggle_all(ids.get_untracked()))
     });
     if is_desktop() {
         return view().child(content).child(picker).into_element();
@@ -566,4 +712,24 @@ pub(crate) fn flash(cv: Conv, id: crate::store::MsgId) {
             h.set(None);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::album_status;
+    use crate::ui::Tick;
+
+    #[test]
+    fn an_album_shows_its_worst_photo() {
+        let s = |v: &[Tick]| album_status(v.iter().copied());
+        assert_eq!(
+            s(&[Tick::Read, Tick::Read, Tick::Delivered]),
+            Tick::Delivered
+        );
+        assert_eq!(
+            s(&[Tick::Failed, Tick::Read, Tick::Read, Tick::Read]),
+            Tick::Failed
+        );
+        assert_eq!(s(&[Tick::Read, Tick::Sending, Tick::Sent]), Tick::Sending);
+    }
 }

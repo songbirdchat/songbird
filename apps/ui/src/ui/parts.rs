@@ -300,8 +300,9 @@ impl Row {
     pub fn leading_kind(&self) -> Leading {
         self.leading_kind
     }
+    /// The line under the title; an empty one draws nothing (not a blank line).
     pub fn subtitle(mut self, s: impl Into<SharedString>) -> Self {
-        self.subtitle = Some(s.into());
+        self.subtitle = Some(s.into()).filter(|s| !s.is_empty());
         self
     }
     pub fn chevron(mut self) -> Self {
@@ -461,6 +462,16 @@ pub fn icon_tile(glyph: Icon) -> View {
 }
 
 // ---------------------------------------------------------------- people
+
+/// "@name", or nothing for an account without a username (a contact known only by its key, or
+/// this account when its claim failed at sign-up): never a bare "@" (found on an iPhone).
+pub fn handle(username: &str) -> String {
+    if username.is_empty() {
+        String::new()
+    } else {
+        format!("@{username}")
+    }
+}
 
 /// The initials of a name, at most two letters.
 pub fn initials(name: &str) -> String {
@@ -1082,4 +1093,84 @@ pub fn skeleton_row() -> View {
                 .child(skeleton(140.0, 12.0))
                 .child(skeleton(220.0, 10.0)),
         )
+}
+
+/// A turning arc (`size` points): the drawing of every spinner. Reduced motion keeps it still.
+fn turning_arc(size: f32) -> nsh_core::element::Image {
+    thread_local! {
+        static ARC: nsh_core::element::ImageSrc = nsh_core::element::ImageSrc::svg_markup(
+            "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'>\
+             <circle cx='12' cy='12' r='9' fill='none' stroke='white' stroke-opacity='0.3' stroke-width='2.4'/>\
+             <path d='M12 3a9 9 0 0 1 9 9' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round'/>\
+             </svg>",
+        );
+    }
+    let turn = motion();
+    if !crate::ui::motion::reduced() {
+        let mut t = KeyframeTiming::default();
+        t.duration_ms = 900.0;
+        t.easing = Easing::Linear;
+        t.iterations = None;
+        let _ = turn.play(MotionSpec::new(t).values(MotionChannel::Rotate, [0.0, 360.0]));
+    }
+    image(ARC.with(Clone::clone))
+        .size(px(size))
+        .bind_motion(&turn)
+}
+
+/// Work going on in place (a lookup, a list row waiting): the arc in the muted text colour.
+pub fn spinner(size: f32) -> View {
+    view()
+        .size(px(size))
+        .items_center()
+        .justify_center()
+        .role(AccessibilityRole::Progressbar)
+        .label("Loading")
+        .child(turning_arc(size).tint_color(move || c::muted_fg()))
+}
+
+/// An action over a picture (download a photo, try it again): a light glyph on the same dark
+/// disc as [`media_spinner`], so it reads on a light photo as well as a dark one (a plain icon
+/// button took the theme's text colour and vanished on a light stand-in, found on an iPhone).
+/// Its 44pt press area is bigger than the disc it draws.
+pub fn media_btn(
+    glyph: Icon,
+    label: impl Into<SharedString>,
+    on_press: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
+    button()
+        .on_press(on_press)
+        .accessibility_label(label.into())
+        .size(px(44.0))
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .transition()
+        .duration(motion::FAST)
+        .active(|s| s.opacity(0.7))
+        .child(
+            view()
+                .size(px(40.0))
+                .rounded_full()
+                .items_center()
+                .justify_center()
+                .bg(move || c::overlay())
+                .text_color(move || c::on_avatar())
+                .child(icon(glyph, 20.0)),
+        )
+}
+
+/// Something on its way (a photo uploading or downloading): a light arc turning on a dark disc,
+/// drawn over a picture, so it reads on any photo in either theme (as `photo_badge` and the
+/// video play button). Reduced motion keeps the arc still.
+pub fn media_spinner(disc: f32) -> View {
+    view()
+        .size(px(disc))
+        .rounded_full()
+        .items_center()
+        .justify_center()
+        .bg(move || c::overlay())
+        .role(AccessibilityRole::Progressbar)
+        .label("Loading")
+        .child(turning_arc((disc * 0.6).round()))
 }

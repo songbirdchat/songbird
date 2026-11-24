@@ -269,8 +269,13 @@ fn leave_space(s: Store, chat: ChatId) {
     );
 }
 
-/// Find channels: a directory with Follow buttons.
+/// Find channels: a directory with Follow buttons. There is no public directory yet (public
+/// channels await the owner's legal review, D-0065 §4), so a real account follows a channel by
+/// the link someone shares: the page says so and takes the link.
 pub fn find_channels() {
+    if directory().is_empty() {
+        return follow_by_link();
+    }
     nav::push("find-channels", move || {
         let s = store();
         let query = signal(String::new());
@@ -359,6 +364,56 @@ pub fn find_channels() {
                     ).pb_6())
                     .flex_1(),
                 ),
+        )
+    });
+}
+
+/// Following a channel by its link: the way in while there is no directory.
+fn follow_by_link() {
+    nav::push("find-channels", move || {
+        let link = signal(String::new());
+        let ours = move || link.with(|l| l.trim().starts_with("https://songbird.chat/g#"));
+        let invalid = move || link.with(|l| !l.trim().is_empty()) && !ours();
+        let open = move || {
+            let url = link.get_untracked();
+            if crate::features::open_songbird_link(&url) {
+                link.set(String::new());
+            } else {
+                toast("Not connected yet. Try again in a moment.");
+            }
+        };
+        page(
+            "Find channels",
+            view()
+                .flex_1()
+                .px_4()
+                .pt_4()
+                .gap_3()
+                .child(muted(
+                    "There's no channel directory yet. To follow a channel, open the link its admin shared, or paste it here.",
+                ))
+                .child(labelled_field(
+                    "Channel link",
+                    field("https://songbird.chat/g#…", link)
+                        .auto_capitalize(AutoCapitalize::None)
+                        .keyboard_type(KeyboardType::Url)
+                        .on_submit(move |_: &str| {
+                            if ours() {
+                                open();
+                            }
+                        }),
+                    move || {
+                        if invalid() {
+                            "That isn't a Songbird channel link.".to_string()
+                        } else {
+                            "Links to channels and groups start with songbird.chat/g#".to_string()
+                        }
+                    },
+                    invalid,
+                ))
+                .child(view().flex_row().child(
+                    btn("Follow", Variant::Primary, BtnSize::Md, open).disabled(move || !ours()),
+                )),
         )
     });
 }

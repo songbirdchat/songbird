@@ -96,6 +96,9 @@ pub fn connect() {
                         });
                         if let Err(p) = super::chat::start().await {
                             live().update(|l| l.problem = Some(p.0));
+                        } else {
+                            // What failed for want of a connection goes now, by itself.
+                            super::chat::resend_waiting();
                         }
                     }
                     // Stored by app-core, then acknowledged; in `seq` order.
@@ -107,6 +110,7 @@ pub fn connect() {
                             }
                         } else {
                             live().update(|l| l.waiting += 1);
+                            retry_waiting();
                         }
                     }
                     // Typing and other ephemeral events: decrypted, never stored or acknowledged.
@@ -154,6 +158,26 @@ pub(crate) fn client() -> Option<Rc<Client>> {
 }
 
 /// Closes the connection.
+/// A delivery that couldn't be stored stays on the server, which sends it again on the next
+/// connection: reconnect once, quietly, after a pause (several failures, one reconnect), so a
+/// passing failure doesn't wait for the user's Reconnect.
+fn retry_waiting() {
+    thread_local! {
+        static PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if PENDING.replace(true) {
+        return;
+    }
+    Owner::detached().run(|| {
+        set_timeout(std::time::Duration::from_secs(20), || {
+            PENDING.set(false);
+            if live().with_untracked(|l| l.waiting > 0 && l.link == Link::Connected) {
+                connect();
+            }
+        });
+    });
+}
+
 pub fn disconnect() {
     if let Some(t) = READER.with_borrow_mut(Option::take) {
         t.cancel();

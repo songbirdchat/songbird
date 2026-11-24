@@ -21,6 +21,9 @@ pub const MAX_TEXT: usize = 32_768;
 pub const MAX_QUOTE_TEXT: usize = 2_048;
 /// Most formatting spans and mentions in one text.
 pub const MAX_SPANS: usize = 256;
+/// Most items in one album (D-0186).
+pub const MAX_ALBUM: u32 = 100;
+
 /// Most attachments in one message.
 pub const MAX_ATTACHMENTS: usize = 32;
 /// Most poll options.
@@ -182,6 +185,12 @@ fn timer(s: u32, field: &'static str) -> R {
     check(s == 0 || (MIN_TIMER_S..=MAX_TIMER_S).contains(&s), field)
 }
 
+/// [`message`], for the crate's tests.
+#[cfg(test)]
+pub(crate) fn message_for_tests(m: &Message) -> R {
+    message(m)
+}
+
 fn message(m: &Message) -> R {
     let visible = m.text.as_ref().is_some_and(|t| !t.body.is_empty())
         || !m.attachments.is_empty()
@@ -225,7 +234,19 @@ fn message(m: &Message) -> R {
         "message.view_once",
     )?;
     check(m.previews.len() <= 4, "message.previews")?;
-    m.previews.iter().try_for_each(preview)
+    m.previews.iter().try_for_each(preview)?;
+    if let Some(a) = &m.album {
+        // An album item is a photo or video message, seen more than once.
+        check(
+            a.id.len() == 16
+                && (2..=MAX_ALBUM).contains(&a.count)
+                && a.index < a.count
+                && !m.attachments.is_empty()
+                && !m.view_once,
+            "message.album",
+        )?;
+    }
+    Ok(())
 }
 
 /// A text with its spans: offsets in UTF-8 bytes, on character boundaries, within the body.

@@ -564,6 +564,7 @@ impl Store {
             pinned: false,
             forwarded: false,
             receipts: Vec::new(),
+            album: None,
         };
         let incoming = (from.is_some() && !system).then(|| (msg.body.preview(), from));
         self.messages
@@ -602,6 +603,11 @@ impl Store {
     pub fn on_arrival(&self, f: impl Fn(Store, Arrival) + 'static) {
         self.on_arrival
             .with(|slot| *slot = Some(std::rc::Rc::new(f)));
+    }
+
+    /// Marks a message the user is sending as one item of an album (D-0186).
+    pub fn set_album(&self, chat: ChatId, id: MsgId, album: AlbumTag) {
+        self.edit_message(chat, id, |m| m.album = Some(album));
     }
 
     fn edit_message(&self, chat: ChatId, id: MsgId, f: impl FnOnce(&mut Message)) {

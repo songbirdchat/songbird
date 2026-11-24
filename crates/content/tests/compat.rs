@@ -66,7 +66,8 @@ mod v2 {
     pub(crate) struct Message {
         #[prost(message, optional, tag = "1")]
         pub(crate) text: Option<Text>,
-        #[prost(bool, tag = "12")]
+        // A tag this version doesn't use (12 is `album`, D-0186).
+        #[prost(bool, tag = "40")]
         pub(crate) reply_privately: bool,
     }
 

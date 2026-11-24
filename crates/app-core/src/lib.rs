@@ -19,12 +19,14 @@
 pub mod attachments;
 pub mod backup;
 pub mod blob;
+pub mod blurhash;
 pub mod call_links;
 pub mod calls;
 pub mod crypto;
 pub mod kt;
 pub mod maps;
 pub mod messenger;
+pub mod metadata;
 pub mod mls;
 pub mod packs;
 pub mod session;

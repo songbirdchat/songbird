@@ -474,7 +474,7 @@ fn search_bar(cv: Conv) -> View {
     let show = move |n: usize| {
         if let Some(id) = hits.with_untracked(|h| h.get(n).copied()) {
             cv.hit.set(n);
-            if let Some(i) = s.index_of(chat, id) {
+            if let Some(i) = cv.row_of(id) {
                 cv.list
                     .scroll_to_index(i as u32, percentage(0.5), px(0.0), true);
             }

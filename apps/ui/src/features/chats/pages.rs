@@ -133,18 +133,34 @@ fn requests() -> impl IntoElement {
     .flex_1()
 }
 
+/// Who a request is from, as the card names them: their profile name, else their username,
+/// else neither yet (a stranger's username never reaches this device; the name comes with
+/// their first message). Found on an iPhone: the card said only "@".
+fn request_title(r: &model::RequestRow) -> String {
+    if !r.name.trim().is_empty() {
+        r.name.clone()
+    } else if !r.username.is_empty() {
+        format!("@{}", r.username)
+    } else {
+        "Someone new".into()
+    }
+}
+
+/// The line under it: their username when the title is their name, and that they're new.
+fn request_subtitle(r: &model::RequestRow) -> String {
+    if !r.name.trim().is_empty() && !r.username.is_empty() {
+        format!("@{} · Not in your contacts", r.username)
+    } else {
+        "Not in your contacts".into()
+    }
+}
+
 fn request_card(s: Store, req: Memo<Option<model::RequestRow>>) -> impl IntoElement {
     let get = move |f: fn(&model::RequestRow) -> String| {
         move || req.with(|r| r.as_ref().map(f).unwrap_or_default())
     };
     let chat = move || req.with_untracked(|r| r.as_ref().map(|r| r.chat));
-    let who = move || {
-        req.with_untracked(|r| {
-            r.as_ref()
-                .map(|r| format!("@{}", r.username))
-                .unwrap_or_default()
-        })
-    };
+    let who = move || req.with_untracked(|r| r.as_ref().map(request_title).unwrap_or_default());
     let accept = move || {
         if let Some(id) = chat() {
             animate_change();
@@ -210,13 +226,13 @@ fn request_card(s: Store, req: Memo<Option<model::RequestRow>>) -> impl IntoElem
                             .min_w(px(0.0))
                             .gap(px(2.0))
                             .child(
-                                text(get(|r| format!("@{}", r.username)))
+                                text(get(request_title))
                                     .number_of_lines(1)
                                     .text_size(px(font::body()))
                                     .font_weight(FontWeight::SEMIBOLD),
                             )
                             .child(
-                                text("Not in your contacts")
+                                text(get(request_subtitle))
                                     .text_size(px(font::SMALL))
                                     .text_color(move || c::muted_fg()),
                             ),
@@ -478,4 +494,37 @@ fn lists() -> impl IntoElement {
                 "Your lists show above your chats, beside All. Only you see them.",
             )),
     )
+}
+
+#[cfg(test)]
+mod request_names {
+    use super::{request_subtitle, request_title};
+    use crate::features::chats::model::RequestRow;
+
+    fn row(name: &str, username: &str) -> RequestRow {
+        RequestRow {
+            chat: 1,
+            name: name.into(),
+            username: username.into(),
+            seed: 0,
+            first: String::new(),
+            more: 0,
+            when: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_request_is_named_by_what_is_known() {
+        assert_eq!(request_title(&row("Ana Test", "")), "Ana Test");
+        assert_eq!(
+            request_subtitle(&row("Ana Test", "")),
+            "Not in your contacts"
+        );
+        assert_eq!(
+            request_subtitle(&row("Ana Test", "ana")),
+            "@ana · Not in your contacts"
+        );
+        assert_eq!(request_title(&row("", "ana")), "@ana");
+        assert_eq!(request_title(&row(" ", "")), "Someone new");
+    }
 }

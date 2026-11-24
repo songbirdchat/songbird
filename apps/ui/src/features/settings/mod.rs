@@ -741,7 +741,7 @@ fn profile_card() -> AnyElement {
                     },
                 ))
                 .child(
-                    text(move || format!("@{}", me.with(|p| p.username.clone())))
+                    text(move || me.with(|p| handle(&p.username)))
                         .text_size(px(font::SMALL))
                         .text_color(move || c::muted_fg())
                         .number_of_lines(1),

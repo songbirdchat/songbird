@@ -435,7 +435,7 @@ fn pool(s: Store) -> Pool {
             .map(|p| Candidate {
                 target: Target::Person(p.id),
                 title: p.name.clone(),
-                keywords: format!("@{}", p.username),
+                keywords: handle(&p.username),
                 hint: "Person".into(),
                 lead: Lead::Person {
                     name: p.name.clone(),

@@ -141,9 +141,7 @@ pub(super) fn viewer_page(chat: ChatId, start: MsgId) -> Screen {
         move || msg.with(|m| matches!(m.as_ref().map(|m| &m.body), Some(Body::Video { .. })));
     // A real video plays in the platform's player with its own controls and position; only
     // the demo's stand-in has the simulated scrubber (D-0184).
-    let demo_video = move || {
-        is_video() && !crate::backend::chat::is_media(current.get())
-    };
+    let demo_video = move || is_video() && !crate::backend::chat::is_media(current.get());
 
     let stage = view()
         .flex_1()
@@ -324,12 +322,20 @@ fn picture(
     // illustration as its bubble.
     let real = crate::backend::chat::is_media(m.id);
     let (pw, ph) = (w.max(1), h.max(1));
-    let src = if real {
+    let demo_src = (!real).then(|| crate::ui::portrait::message_photo(&alt, m.id, pw, ph));
+    if real && !video {
         crate::backend::chat::load_photo(m.id);
-        crate::backend::chat::media_src(m.id).unwrap_or_else(|| ImageSrc::from(""))
-    } else {
-        crate::ui::portrait::message_photo(&alt, m.id, pw, ph)
-    };
+    }
+    // Tracked (D-0186): a photo still downloading shows its sender's blurred stand-in, then
+    // itself when it arrives (it was read once, so a photo opened before it had downloaded
+    // stayed black).
+    let msg = m.id;
+    let src = std::rc::Rc::new(move || {
+        demo_src.clone().or_else(|| {
+            crate::backend::chat::media_src(msg).or_else(|| crate::backend::chat::blur_src(msg))
+        })
+    });
+    let here = move || crate::backend::chat::media_src(msg).is_some();
     let playing_url = signal(None::<String>);
     if real && video {
         crate::backend::chat::media_file(m.id, move |url| playing_url.set(Some(url)));
@@ -361,11 +367,44 @@ fn picture(
             format!("Photo: {alt}")
         })
         .child((!(real && video)).then(|| {
-            image(src)
+            let has = src.clone();
+            when(
+                move || has().is_some(),
+                move || {
+                    let src = src.clone();
+                    image(move || src().unwrap_or_else(|| ImageSrc::from("")))
+                        .absolute()
+                        .inset_0()
+                        .object_fit(ResizeMode::Cover)
+                        .accessibility_elements_hidden(true)
+                },
+            )
+        }))
+        // While it downloads, a spinner; if it couldn't, a way to try again.
+        .child((real && !video).then(|| {
+            view()
                 .absolute()
                 .inset_0()
-                .object_fit(ResizeMode::Cover)
-                .accessibility_elements_hidden(true)
+                .items_center()
+                .justify_center()
+                .child(when(
+                    move || !here() && crate::backend::chat::photo_loading(msg),
+                    || crate::ui::media_spinner(48.0),
+                ))
+                .child(when(
+                    move || {
+                        !here()
+                            && !crate::backend::chat::photo_loading(msg)
+                            && crate::backend::chat::photo_failed(msg)
+                    },
+                    move || {
+                        crate::ui::media_btn(
+                            Icon::Refresh,
+                            "Couldn't download the photo. Try again",
+                            move || crate::backend::chat::retry_photo(msg),
+                        )
+                    },
+                ))
         }))
         // A real video plays in the platform's player, with its own controls.
         .child((real && video).then(|| {

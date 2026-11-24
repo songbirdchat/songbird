@@ -174,7 +174,7 @@ pub fn contact_row(s: Store, p: Contact, query: Option<Signal<String>>) -> impl 
         .status_line
         .clone()
         .or_else(|| (!p.about.is_empty()).then(|| p.about.clone()))
-        .unwrap_or_else(|| format!("@{}", p.username));
+        .unwrap_or_else(|| handle(&p.username));
     let spoken = format!(
         "{}{}, {}",
         p.name,

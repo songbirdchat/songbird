@@ -172,15 +172,24 @@ fn blocked_bar(cv: Conv) -> AnyElement {
 fn request_bar(cv: Conv) -> AnyElement {
     let (s, chat) = (cv.s, cv.chat);
     let peer = s.peer(chat);
-    let name = peer
+    // Their name, else their username, else neither (a stranger's username may never reach
+    // this device): never a bare "@", as the request card (D-0186).
+    let who = peer
         .as_ref()
-        .map(|p| p.username.clone())
-        .unwrap_or_default();
+        .map(|p| {
+            if p.name.trim().is_empty() {
+                handle(&p.username)
+            } else {
+                p.name.clone()
+            }
+        })
+        .filter(|w| !w.is_empty())
+        .unwrap_or_else(|| "This person".into());
     bar()
         .gap_3()
         .child(
             text(format!(
-                "@{name} is not in your contacts. They won't know you've seen their message until you accept."
+                "{who} is not in your contacts. They won't know you've seen their message until you accept."
             ))
             .text_size(px(font::SMALL))
             .line_height(px(18.0))

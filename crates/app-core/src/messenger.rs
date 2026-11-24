@@ -254,6 +254,13 @@ pub(crate) fn unhex_vec(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+/// A failure that may pass if tried again: the network, rate limiting, a server error. An
+/// account that is gone (404, 410) or a list that doesn't verify will not change.
+fn passing(e: &Error) -> bool {
+    matches!(e, Error::Network)
+        || matches!(e, Error::Server(s) if *s == 408 || *s == 429 || *s >= 500)
+}
+
 pub(crate) fn unhex<const N: usize>(s: &str) -> Result<[u8; N]> {
     if s.len() != N * 2 {
         return Err(Error::Malformed);
@@ -831,16 +838,52 @@ impl<N: Net> Messenger<N> {
         files: Vec<(Vec<u8>, crate::attachments::FileMeta)>,
         text: &str,
     ) -> Result<[u8; 16]> {
-        let theirs = self.devices_of(to, false).await?.len();
+        self.send_files_in(to, files, text, None).await
+    }
+
+    /// [`Self::send_files`], as one item of an album (D-0186).
+    pub async fn send_files_in(
+        &mut self,
+        to: &[u8; 16],
+        files: Vec<(Vec<u8>, crate::attachments::FileMeta)>,
+        text: &str,
+        album: Option<crate::attachments::AlbumRef>,
+    ) -> Result<[u8; 16]> {
+        let timer = self.store.timer(to)?;
+        self.send_files_with(to, false, timer, files, text, album)
+            .await
+    }
+
+    /// Writes a photo or file message before any network (D-0186): its id, its content with
+    /// the pointers still to upload, this device's copy of each file, and a pending record. Then
+    /// [`Self::finish_media`] uploads and sends it. Without a connection it waits, stored as
+    /// Sending, and goes on the next [`Self::flush_outbox`] with the same id: nothing is lost on
+    /// a restart and a retry never makes a second message.
+    pub(crate) async fn send_files_with(
+        &mut self,
+        chat: &[u8; 16],
+        is_group: bool,
+        timer: u32,
+        files: Vec<(Vec<u8>, crate::attachments::FileMeta)>,
+        text: &str,
+        album: Option<crate::attachments::AlbumRef>,
+    ) -> Result<[u8; 16]> {
         let me = self.local.account;
-        let mine = self.store.devices(&me)?.len().saturating_sub(1);
+        let id = *random::<16>()?;
+        let sent_at = now_ms();
+        // Where and when a photo was taken stays on this device (D-0186): it is cleaned before
+        // it is stored or sent, so even this device's copy and every resend are clean.
+        let files: Vec<(Vec<u8>, crate::attachments::FileMeta)> = files
+            .into_iter()
+            .map(|(b, meta)| (crate::metadata::strip(&b), meta))
+            .collect();
         let mut pointers = Vec::with_capacity(files.len());
         let mut preview = String::new();
         for (bytes, meta) in &files {
-            let (mut p, ct) = crate::attachments::encrypt(bytes, meta)?;
-            let id = crate::attachments::upload(&self.net, &ct, theirs + mine).await?;
-            p.object_id = id.to_vec();
-            p.uploaded_at_ms = now_ms();
+            // What the file is (its key and object come at upload).
+            let (mut p, _) = crate::attachments::encrypt(bytes, meta)?;
+            p.key.clear();
+            p.digest.clear();
             if preview.is_empty() {
                 preview = attachment_label(&p);
             }
@@ -852,24 +895,145 @@ impl<N: Net> Messenger<N> {
                 spans: Vec::new(),
             }),
             attachments: pointers,
+            album: crate::attachments::album_field(album),
             ..Default::default()
         };
-        let data = DataMessage {
-            kind: Some(data_message::Kind::Message(message)),
-            ..Default::default()
+        let content = Content {
+            version: songbird_content::VERSION,
+            required_version: 1,
+            message_id: id.to_vec(),
+            sent_at_ms: sent_at,
+            body: Some(Body::Data(DataMessage {
+                group_id: if is_group { chat.to_vec() } else { Vec::new() },
+                expire_timer_s: timer,
+                kind: Some(data_message::Kind::Message(message)),
+            })),
         };
         let shown = if text.is_empty() {
             preview
         } else {
             text.to_owned()
         };
-        let id = self.send_data(to, data, &shown).await?;
-        // The sender keeps its own files (encrypted at rest, in the store).
-        for (i, (bytes, _)) in files.iter().enumerate() {
+        let bytes = content.encode_to_vec();
+        self.store.insert_message(
+            &MessageRow {
+                chat: *chat,
+                author: me,
+                id,
+                sent_ms: sent_at,
+                stored_ms: sent_at,
+                text: shown.clone(),
+                content: bytes.clone(),
+                status: Status::Sending,
+            },
+            false,
+        )?;
+        // The sender keeps its own files (encrypted at rest, in the store), from the start.
+        for (i, (b, _)) in files.iter().enumerate() {
             self.store
-                .put_file(&me, &id, u32::try_from(i).unwrap_or(u32::MAX), bytes)?;
+                .put_file(&me, &id, u32::try_from(i).unwrap_or(u32::MAX), b)?;
         }
-        Ok(id)
+        self.store
+            .pending_media_put(&id, chat, is_group, &bytes, &shown, sent_at)?;
+        match self.finish_media(&id).await {
+            // Offline: it waits (Sending) and goes on the next flush, with this id.
+            Ok(()) | Err(Error::Network) => Ok(id),
+            Err(e) => {
+                self.store.pending_media_done(&id)?;
+                self.store.advance(&me, &id, Status::Failed)?;
+                Err(e)
+            }
+        }
+    }
+
+    /// Uploads what a pending photo or file message still needs (each upload kept as it is done,
+    /// so none is done twice) and sends it with its own id: 1:1 through the outbox, to a group
+    /// as one MLS message. Ends the pending record once the message is on its way.
+    pub(crate) async fn finish_media(&mut self, id: &[u8; 16]) -> Result<()> {
+        let Some((chat, is_group, bytes, preview)) = self.store.pending_media_get(id)? else {
+            return Ok(());
+        };
+        let me = self.local.account;
+        let mut content = Content::decode(bytes.as_slice()).map_err(|_| Error::Malformed)?;
+        let count = match content.body.as_ref() {
+            Some(Body::Data(DataMessage {
+                kind: Some(data_message::Kind::Message(m)),
+                ..
+            })) => m.attachments.len(),
+            _ => return Err(Error::Malformed),
+        };
+        let mut fetches = None;
+        for i in 0..count {
+            let done = match content.body.as_ref() {
+                Some(Body::Data(DataMessage {
+                    kind: Some(data_message::Kind::Message(m)),
+                    ..
+                })) => m
+                    .attachments
+                    .get(i)
+                    .is_some_and(|p| !p.object_id.is_empty()),
+                _ => true,
+            };
+            if done {
+                continue;
+            }
+            let fetches = if let Some(f) = fetches {
+                f
+            } else {
+                let f = if is_group {
+                    self.group_devices(&chat)?.len().saturating_sub(1).max(1)
+                } else {
+                    let theirs = self.devices_of(&chat, false).await?.len();
+                    theirs + self.store.devices(&me)?.len().saturating_sub(1)
+                };
+                fetches = Some(f);
+                f
+            };
+            let idx = u32::try_from(i).map_err(|_| Error::Malformed)?;
+            let plain = self.store.file(&me, id, idx)?.ok_or(Error::Malformed)?;
+            let Some(Body::Data(DataMessage {
+                kind: Some(data_message::Kind::Message(m)),
+                ..
+            })) = content.body.as_mut()
+            else {
+                return Err(Error::Malformed);
+            };
+            let p = m.attachments.get_mut(i).ok_or(Error::Malformed)?;
+            let meta = crate::attachments::FileMeta {
+                content_type: p.content_type.clone(),
+                file_name: p.file_name.clone(),
+                width: p.width,
+                height: p.height,
+                duration_ms: p.duration_ms,
+                flags: p.flags,
+                waveform: p.waveform.clone(),
+                caption: p.caption.clone(),
+                blurhash: p.blurhash.clone(),
+            };
+            let (mut fresh, ct) = crate::attachments::encrypt(&plain, &meta)?;
+            let object = crate::attachments::upload(&self.net, &ct, fetches).await?;
+            fresh.object_id = object.to_vec();
+            fresh.uploaded_at_ms = now_ms();
+            *p = fresh;
+            self.store
+                .pending_media_update(id, &content.encode_to_vec())?;
+        }
+        let bytes = content.encode_to_vec();
+        self.store.set_content(&me, id, &bytes)?;
+        if is_group {
+            self.send_group_content(&chat, content, &preview).await?;
+            self.store.pending_media_done(id)?;
+        } else {
+            let idem = *random::<16>()?;
+            self.store.outbox_put(&idem, &chat, id, &bytes, now_ms())?;
+            // From here the outbox keeps it, with its own key for any resend.
+            self.store.pending_media_done(id)?;
+            match self.deliver(idem, &chat, id, &content).await {
+                Ok(()) | Err(Error::Network) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 
     /// The `idx`-th file of a stored message: from the store, or downloaded, verified and kept.
@@ -1171,8 +1335,21 @@ impl<N: Net> Messenger<N> {
         }
     }
 
-    /// Retries everything in the outbox (after a reconnect).
+    /// Retries everything in the outbox (after a reconnect): photo and file messages still to
+    /// upload first, in the order they were written, then the messages waiting to be sent.
     pub async fn flush_outbox(&mut self) -> Result<()> {
+        for id in self.store.pending_media()? {
+            match self.finish_media(&id).await {
+                Ok(()) => {}
+                // Still no connection: the rest waits too.
+                Err(Error::Network) => return Err(Error::Network),
+                Err(_) => {
+                    self.store.pending_media_done(&id)?;
+                    self.store
+                        .advance(&self.local.account, &id, Status::Failed)?;
+                }
+            }
+        }
         for (idem, chat, id, bytes) in self.store.outbox()? {
             let content = Content::decode(bytes.as_slice()).map_err(|_| Error::Malformed)?;
             self.deliver(idem, &chat, &id, &content).await?;
@@ -1985,18 +2162,26 @@ impl<N: Net> Messenger<N> {
             .into_iter()
             .find(|(d, _)| *d == device)
             .map(|(_, k)| k);
+        // A first message from a device this one doesn't know yet needs its identity key from
+        // the sender's signed device list. When that list can't be fetched just now, the
+        // message isn't dropped: the error keeps it on the server, so it comes again (found on
+        // two iPhones: the first of five photos to a new contact was lost for good).
+        let mut unreachable = None;
         if identity.is_none() {
-            identity = self
-                .devices_of(&account, true)
-                .await
-                .ok()
-                .and_then(|v| v.into_iter().find(|(d, _)| *d == device).map(|(_, k)| k));
+            match self.devices_of(&account, true).await {
+                Ok(v) => identity = v.into_iter().find(|(d, _)| *d == device).map(|(_, k)| k),
+                Err(e) if passing(&e) => unreachable = Some(e),
+                Err(_) => {}
+            }
         }
         let Ok(dec) = self
             .sessions
             .decrypt(&self.local, &mut self.prekeys, inner, identity)
         else {
-            return Ok(Received::Nothing);
+            return match unreachable {
+                Some(e) => Err(e),
+                None => Ok(Received::Nothing),
+            };
         };
         self.store
             .save_sessions(&self.sessions, &(account, device))?;
@@ -2232,6 +2417,26 @@ pub fn attachments_of(content: &[u8]) -> Vec<schema::AttachmentPointer> {
             ..
         })) => m.attachments,
         _ => Vec::new(),
+    }
+}
+
+/// The album a stored message belongs to (D-0186), when it is one of photos sent together.
+#[must_use]
+pub fn album_in(content: &[u8]) -> Option<crate::attachments::AlbumRef> {
+    let c = Content::decode(content).ok()?;
+    match c.body {
+        Some(Body::Data(DataMessage {
+            kind: Some(data_message::Kind::Message(m)),
+            ..
+        })) => {
+            let a = m.album?;
+            Some(crate::attachments::AlbumRef {
+                id: a.id.as_slice().try_into().ok()?,
+                index: a.index,
+                count: a.count,
+            })
+        }
+        _ => None,
     }
 }
 

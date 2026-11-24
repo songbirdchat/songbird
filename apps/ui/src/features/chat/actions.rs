@@ -156,7 +156,7 @@ fn menu(cv: Conv, at: MenuAt) -> AnyElement {
     // The message, lifted: the same bubble, made again for the overlay at
     // the frame it has in the list.
     let item: ItemMemo =
-        computed(move || s.message(chat, at.id).map(|m| Item { m, place: at.place }));
+        computed(move || s.message(chat, at.id).map(|m| Item::single(m, at.place)));
     let lifted = view()
         .absolute()
         .left(px(at.x.round()))

@@ -36,6 +36,8 @@ enum Kind {
     ViewOnce,
     Call,
     Deleted,
+    /// Photos and videos sent together (drawn on the album's last row).
+    Album,
 }
 
 impl Kind {
@@ -59,7 +61,10 @@ impl Kind {
     }
     /// Drawn edge to edge in the bubble (media).
     fn media(self) -> bool {
-        matches!(self, Kind::Image | Kind::Video | Kind::Location)
+        matches!(
+            self,
+            Kind::Image | Kind::Video | Kind::Location | Kind::Album
+        )
     }
 }
 
@@ -134,6 +139,16 @@ fn open_menu(cv: Conv, item: ItemMemo, frame: ElementRef) {
         return;
     };
     if cv.selecting.get_untracked() || id == 0 {
+        return;
+    }
+    // Holding an album selects all of it (WhatsApp): the selection bar acts on every item.
+    let album: Vec<crate::store::MsgId> = item.with_untracked(|i| {
+        i.as_ref()
+            .map(|i| i.album.iter().map(|t| t.id).filter(|&id| id != 0).collect())
+            .unwrap_or_default()
+    });
+    if !album.is_empty() {
+        cv.start_select_all(album);
         return;
     }
     spawn(async move {
@@ -232,7 +247,17 @@ pub(crate) fn bubble(cv: Conv, item: ItemMemo) -> View {
     let id = sel(item, |i| i.m.id);
     let at = sel(item, |i| i.m.at);
     let kind = computed(move || {
-        item.with(|i| i.as_ref().map(|i| Kind::of(&i.m.body)).unwrap_or_default())
+        item.with(|i| {
+            i.as_ref()
+                .map(|i| {
+                    if i.album.is_empty() {
+                        Kind::of(&i.m.body)
+                    } else {
+                        Kind::Album
+                    }
+                })
+                .unwrap_or_default()
+        })
     });
     let bare = move || kind.get() == Kind::Sticker;
     let inline = sel(item, |i| inline_meta(&i.m.body));
@@ -314,7 +339,7 @@ pub(crate) fn bubble(cv: Conv, item: ItemMemo) -> View {
         .child(quote(cv, item))
         .child(dynamic(move || {
             let k = kind.get();
-            Some(untracked(|| body(cv, item, k)))
+            Some(untracked(|| body(cv, item, k, frame)))
         }))
         .child(when(
             move || marked.get(),
@@ -659,6 +684,18 @@ fn status(cv: Conv, item: ItemMemo) -> AnyElement {
     let group = cv.is_group();
     let id = sel(item, |i| i.m.id);
     let failed = sel(item, |i| i.m.mine() && i.m.status == Tick::Failed);
+    // What Retry resends: the message, or an album's photos that failed.
+    let retry = sel(item, |i| {
+        if i.album.is_empty() {
+            vec![i.m.id]
+        } else {
+            i.album
+                .iter()
+                .filter(|t| t.failed && t.id != 0)
+                .map(|t| t.id)
+                .collect()
+        }
+    });
     let shown = move || {
         let id = id.get();
         failed.get() || (id != 0 && cv.latest_own.get() == Some(id))
@@ -684,7 +721,7 @@ fn status(cv: Conv, item: ItemMemo) -> AnyElement {
                 // Signal-style circles, its words kept for screen readers.
                 Some(untracked(move || {
                     if failed.get_untracked() {
-                        status_words(cv, w, failed, id)
+                        status_words(cv, w, failed, retry)
                     } else {
                         receipt_mark(cv, tk, w)
                     }
@@ -774,7 +811,7 @@ fn receipt_mark(cv: Conv, tick: Tick, words: String) -> View {
     mark.role(AccessibilityRole::Text).label(words)
 }
 
-fn status_words(cv: Conv, words: String, failed: Memo<bool>, id: Memo<u64>) -> View {
+fn status_words(cv: Conv, words: String, failed: Memo<bool>, retry: Memo<Vec<u64>>) -> View {
     let soft = if motion::reduced() {
         motion().entering(
             MotionSpec::new(super::timing(motion::BASE, Easing::EaseOut))
@@ -823,7 +860,11 @@ fn status_words(cv: Conv, words: String, failed: Memo<bool>, id: Memo<u64>) -> V
                     )
                     .child(
                         pressable()
-                            .on_press(move || cv.s.retry(cv.chat, id.get_untracked()))
+                            .on_press(move || {
+                                for id in retry.get_untracked() {
+                                    cv.s.retry(cv.chat, id);
+                                }
+                            })
                             .accessibility_label("Retry sending")
                             .px_1()
                             .rounded(move || radius::sm())
@@ -846,12 +887,12 @@ fn status_words(cv: Conv, words: String, failed: Memo<bool>, id: Memo<u64>) -> V
 
 // ---------------------------------------------------------------- bodies
 
-fn body(cv: Conv, item: ItemMemo, kind: Kind) -> AnyElement {
+fn body(cv: Conv, item: ItemMemo, kind: Kind, frame: ElementRef) -> AnyElement {
     let el = match kind {
         Kind::Text => text_body(cv, item),
-        Kind::Link => link_body(cv, item),
-        Kind::Image => image_body(cv, item),
-        Kind::Video => video_body(cv, item),
+        Kind::Link => link_body(cv, item, frame),
+        Kind::Image => image_body(cv, item, frame),
+        Kind::Video => video_body(cv, item, frame),
         Kind::Voice => voice_body(cv, item),
         Kind::File => file_body(cv, item),
         Kind::Poll => poll_body(cv, item),
@@ -862,6 +903,7 @@ fn body(cv: Conv, item: ItemMemo, kind: Kind) -> AnyElement {
         Kind::ViewOnce => view_once_body(cv, item),
         Kind::Call => call_body(cv, item),
         Kind::Deleted => deleted_body(cv, item),
+        Kind::Album => album_body(cv, item),
     };
     if kind.media() {
         view().p(px(INSET)).child(el).into_element()
@@ -955,7 +997,7 @@ fn text_body(cv: Conv, item: ItemMemo) -> AnyElement {
 
 /// A link with its on-device preview (made by the sender's device, never
 /// fetched by the server).
-fn link_body(cv: Conv, item: ItemMemo) -> AnyElement {
+fn link_body(cv: Conv, item: ItemMemo, frame: ElementRef) -> AnyElement {
     let ink = ink_of(cv, item);
     let t = sel(item, |i| match &i.m.body {
         Body::Link { text, .. } => text.clone(),
@@ -972,13 +1014,16 @@ fn link_body(cv: Conv, item: ItemMemo) -> AnyElement {
         .px(px(INSET))
         .pt(px(INSET))
         .child(
-            pressable()
-                .on_press(move || {
+            // A plain view taking the tap and the hold: a `pressable` would end a hold as a
+            // tap, so holding the card opened the link instead of the message menu.
+            view()
+                .role(AccessibilityRole::Link)
+                .focusable(true)
+                .on_press(move |_: &PressEvent| {
                     crate::features::open_link_or_url(&card.with_untracked(|c| c.0.clone()));
                 })
-                .accessibility_label(super::say(move || {
-                    card.with(|c| format!("Link preview: {}, {}", c.1, c.2))
-                }))
+                .on_long_press(move |_: &PressEvent| open_menu(cv, item, frame))
+                .label(move || card.with(|c| format!("Link preview: {}, {}", c.1, c.2)))
                 .flex_row()
                 .rounded(px(INNER))
                 .border_curve(BorderCurve::Continuous)
@@ -1027,7 +1072,11 @@ fn link_body(cv: Conv, item: ItemMemo) -> AnyElement {
 /// decrypted thumbnail, the same picture as in the viewer, chat info and
 /// the media grid (`portrait::photo`, seeded by the message id). The
 /// description is what screen readers say.
-fn photo_frame(shot: Memo<(String, u64, u32, u32)>, label: impl Fn() -> String + 'static) -> View {
+fn photo_frame(
+    shot: Memo<(String, u64, u32, u32)>,
+    label: impl Fn() -> String + 'static,
+    sending: impl Fn() -> bool + Copy + 'static,
+) -> View {
     let base = if is_desktop() { 280.0 } else { 240.0 };
     let ratio = move || shot.with(|s| (s.2.max(1) as f32 / s.3.max(1) as f32).clamp(0.6, 1.9));
     view()
@@ -1042,42 +1091,92 @@ fn photo_frame(shot: Memo<(String, u64, u32, u32)>, label: impl Fn() -> String +
         .justify_center()
         .role(AccessibilityRole::Image)
         .label(label)
-        .child(
-            image(move || {
-                shot.with(|s| {
-                    // A real photo: its bytes once this device has them (tracked, so a photo
-                    // still sending or downloading appears when it can; D-0183: a sent photo
-                    // stayed blank until tapped); the illustrations only in the demo.
-                    if let Some(src) = crate::backend::chat::media_src(s.1) {
-                        src
-                    } else if crate::backend::chat::is_media(s.1) || !crate::store::demo() {
-                        ImageSrc::from("")
-                    } else {
-                        portrait::photo(&s.0, s.1, s.2.max(1), s.3.max(1))
-                    }
-                })
+        .child(media_content(shot, sending, || false))
+}
+
+/// An album tile's corner: small, so the 2pt seams read as one grid inside the bubble's frame.
+const INNER_TILE: f32 = 6.0;
+
+/// The gap between an album's tiles.
+const ALBUM_GAP: f32 = 2.0;
+
+/// A square of media filled edge to edge (an album's tile).
+fn media_fill(
+    shot: Memo<(String, u64, u32, u32)>,
+    corner: f32,
+    sending: impl Fn() -> bool + Copy + 'static,
+    covered: impl Fn() -> bool + Copy + 'static,
+) -> View {
+    view()
+        .rounded(px(corner))
+        .border_curve(BorderCurve::Continuous)
+        .overflow_hidden()
+        .bg(move || c::foreground().opacity(0.07))
+        .items_center()
+        .justify_center()
+        .child(media_content(shot, sending, covered))
+}
+
+/// The picture and what it is doing (D-0186): while it is not on this device yet, its blurred
+/// stand-in; a spinner while it uploads (the user's) or downloads, and for an album place still
+/// on its way (`id` 0); else the download (or retry) button. Under an album's "+N" (`covered`)
+/// only the picture shows: the count says what is there.
+fn media_content(
+    shot: Memo<(String, u64, u32, u32)>,
+    sending: impl Fn() -> bool + Copy + 'static,
+    covered: impl Fn() -> bool + Copy + 'static,
+) -> View {
+    use crate::backend::chat::{blur_src, is_media, media_src, photo_failed, photo_loading};
+    let id = move || shot.with(|s| s.1);
+    let here = move || media_src(id()).is_some();
+    let busy = move || {
+        let id = id();
+        id == 0 || sending() || (is_media(id) && !here() && photo_loading(id))
+    };
+    // A real photo: its bytes once this device has them (tracked, so a photo still sending or
+    // downloading appears when it can; D-0183: a sent photo stayed blank until tapped); until
+    // then its sender's blurred stand-in; the illustrations only in the demo.
+    let source_of = move || {
+        shot.with(|s| {
+            media_src(s.1).or_else(|| blur_src(s.1)).or_else(|| {
+                (s.1 != 0 && !is_media(s.1) && crate::store::demo())
+                    .then(|| portrait::photo(&s.0, s.1, s.2.max(1), s.3.max(1)))
             })
-            .absolute()
-            .inset_0()
-            .object_fit(ResizeMode::Cover),
-        )
+        })
+    };
+    view()
+        .absolute()
+        .inset_0()
+        .items_center()
+        .justify_center()
+        // No image at all until there is something to draw: an empty source is an error on
+        // iOS (it logged one for every tile still waiting).
         .child(when(
+            move || source_of().is_some(),
             move || {
-                shot.with(|s| {
-                    crate::backend::chat::is_media(s.1)
-                        && crate::backend::chat::media_src(s.1).is_none()
-                })
+                image(move || source_of().unwrap_or_else(|| ImageSrc::from("")))
+                    .absolute()
+                    .inset_0()
+                    .object_fit(ResizeMode::Cover)
             },
+        ))
+        .child(when(move || busy() && !covered(), || media_spinner(40.0)))
+        .child(when(
+            move || !covered() && !busy() && is_media(id()) && !here(),
             move || {
                 let msg = shot.with_untracked(|s| s.1);
                 // A failed download says so and offers to try again.
                 dynamic(move || {
-                    Some(if crate::backend::chat::photo_failed(msg) {
-                        icon_btn(Icon::Refresh, "Couldn't download the photo. Try again", move || {
-                            crate::backend::chat::retry_photo(msg);
-                        })
+                    Some(if photo_failed(msg) {
+                        media_btn(
+                            Icon::Refresh,
+                            "Couldn't download the photo. Try again",
+                            move || {
+                                crate::backend::chat::retry_photo(msg);
+                            },
+                        )
                     } else {
-                        icon_btn(Icon::Download, "Download photo", move || {
+                        media_btn(Icon::Download, "Download photo", move || {
                             crate::backend::chat::retry_photo(msg);
                         })
                     })
@@ -1122,8 +1221,9 @@ fn caption(
     .into_element()
 }
 
-fn image_body(cv: Conv, item: ItemMemo) -> AnyElement {
+fn image_body(cv: Conv, item: ItemMemo, frame: ElementRef) -> AnyElement {
     let id = sel(item, |i| i.m.id);
+    let sending = sel(item, |i| i.m.mine() && i.m.status == Tick::Sending);
     let info = sel(item, |i| match &i.m.body {
         Body::Image { alt, hd, .. } => (alt.clone(), *hd),
         _ => (String::new(), false),
@@ -1138,10 +1238,19 @@ fn image_body(cv: Conv, item: ItemMemo) -> AnyElement {
     });
     view()
         .child(
-            pressable()
-                .on_press(move || media::open_viewer(cv.chat, id.get_untracked()))
-                .accessibility_label(super::say(move || info.with(|i| format!("Photo: {}", i.0))))
-                .child(photo_frame(shot, move || info.with(|i| i.0.clone())))
+            // The tap opens the viewer, the hold the message menu (a `pressable` ended a hold
+            // as a tap: found on an iPhone).
+            view()
+                .role(AccessibilityRole::Button)
+                .focusable(true)
+                .on_press(move |_: &PressEvent| media::open_viewer(cv.chat, id.get_untracked()))
+                .on_long_press(move |_: &PressEvent| open_menu(cv, item, frame))
+                .label(move || info.with(|i| format!("Photo: {}", i.0)))
+                .child(photo_frame(
+                    shot,
+                    move || info.with(|i| i.0.clone()),
+                    move || sending.get(),
+                ))
                 .child(when(
                     move || info.with(|i| i.1),
                     || {
@@ -1163,8 +1272,9 @@ fn image_body(cv: Conv, item: ItemMemo) -> AnyElement {
         .into_element()
 }
 
-fn video_body(cv: Conv, item: ItemMemo) -> AnyElement {
+fn video_body(cv: Conv, item: ItemMemo, frame: ElementRef) -> AnyElement {
     let id = sel(item, |i| i.m.id);
+    let sending = sel(item, |i| i.m.mine() && i.m.status == Tick::Sending);
     let secs = sel(item, |i| match &i.m.body {
         Body::Video { secs, .. } => *secs,
         _ => 0,
@@ -1180,13 +1290,14 @@ fn video_body(cv: Conv, item: ItemMemo) -> AnyElement {
     });
     view()
         .child(
-            pressable()
-                .on_press(move || media::open_viewer(cv.chat, id.get_untracked()))
-                .accessibility_label(super::say(move || {
-                    format!("Video, {}", logic::duration(secs.get()))
-                }))
+            view()
+                .role(AccessibilityRole::Button)
+                .focusable(true)
+                .on_press(move |_: &PressEvent| media::open_viewer(cv.chat, id.get_untracked()))
+                .on_long_press(move |_: &PressEvent| open_menu(cv, item, frame))
+                .label(move || format!("Video, {}", logic::duration(secs.get())))
                 .child(
-                    photo_frame(shot, || "Video".into()).child(
+                    photo_frame(shot, || "Video".into(), move || sending.get()).child(
                         view()
                             .absolute()
                             .size(px(48.0))
@@ -1213,6 +1324,129 @@ fn video_body(cv: Conv, item: ItemMemo) -> AnyElement {
             sel(item, |i| meta_room(&i.m)),
             ink_of(cv, item),
         ))
+        .into_element()
+}
+
+/// An album: up to four of its photos and videos in a 2×2 grid, the fourth saying how many more
+/// there are; each opens the viewer at itself, which steps through the rest.
+fn album_body(cv: Conv, item: ItemMemo) -> AnyElement {
+    let tiles = sel(item, |i| i.album.clone());
+    let side = if is_desktop() { 280.0 } else { 240.0 };
+    let cell = ((side - ALBUM_GAP) / 2.0).floor();
+    let tile = move |n: usize| {
+        let t = computed(move || tiles.with(|v| v.get(n).cloned()));
+        let shot = computed(move || {
+            t.with(|t| {
+                t.as_ref().map_or((String::new(), 0, 1, 1), |t| {
+                    (t.alt.clone(), t.id, t.w, t.h)
+                })
+            })
+        });
+        let more = move || {
+            tiles.with(|v| {
+                if n == 3 && v.len() > 4 {
+                    v.len() - 3
+                } else {
+                    0
+                }
+            })
+        };
+        let video = computed(move || t.with(|t| t.as_ref().and_then(|t| t.video)));
+        // A plain view taking both the tap and the hold: a `pressable` would take the press and
+        // end a hold as a tap, so the bubble's hold (select the album) would never fire.
+        view()
+            .size(px(cell))
+            .role(AccessibilityRole::Button)
+            .focusable(true)
+            .on_long_press(move |_: &PressEvent| {
+                if !cv.selecting.get_untracked() {
+                    cv.start_select_all(tiles.with_untracked(|v| {
+                        v.iter().map(|t| t.id).filter(|&id| id != 0).collect()
+                    }));
+                }
+            })
+            .on_press(move |_: &PressEvent| {
+                // A place still on its way opens nothing.
+                if let Some(id) = t
+                    .with_untracked(|t| t.as_ref().map(|t| t.id))
+                    .filter(|&id| id != 0)
+                {
+                    media::open_viewer(cv.chat, id);
+                }
+            })
+            .label(move || {
+                let kind = if video.get().is_some() {
+                    "Video"
+                } else {
+                    "Photo"
+                };
+                let total = tiles.with(Vec::len);
+                let waiting = t.with(|t| t.as_ref().is_some_and(|t| t.id == 0));
+                match more() {
+                    0 if waiting => format!("{kind} {} of {total}, still arriving", n + 1),
+                    0 => format!("{kind} {} of {total}", n + 1),
+                    m => format!("{kind}, and {m} more"),
+                }
+            })
+            .child(
+                media_fill(
+                    shot,
+                    INNER_TILE,
+                    move || t.with(|t| t.as_ref().is_some_and(|t| t.sending)),
+                    move || more() > 0,
+                )
+                .size(px(cell)),
+            )
+            .child(when(
+                move || video.get().is_some() && more() == 0,
+                move || {
+                    view()
+                        .absolute()
+                        .inset_0()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            view()
+                                .size(px(36.0))
+                                .rounded_full()
+                                .items_center()
+                                .justify_center()
+                                .bg(move || c::overlay())
+                                .text_color(move || c::on_avatar())
+                                .child(icon(Icon::Play, 16.0)),
+                        )
+                },
+            ))
+            .child(when(
+                move || more() > 0,
+                move || {
+                    view()
+                        .absolute()
+                        .inset_0()
+                        .rounded(px(INNER_TILE))
+                        .items_center()
+                        .justify_center()
+                        .bg(AdaptiveColor::rgb(0x0F0D1A, 0x0F0D1A).opacity(0.55))
+                        .child(
+                            text(move || format!("+{}", more()))
+                                .text_size(px(font::TITLE))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(AdaptiveColor::rgb(0xFFFFFF, 0xFFFFFF)),
+                        )
+                },
+            ))
+    };
+    let pair = move |a: usize| {
+        view()
+            .flex_row()
+            .gap(px(ALBUM_GAP))
+            .child(tile(a))
+            .child(tile(a + 1))
+    };
+    view()
+        .gap(px(ALBUM_GAP))
+        .child(pair(0))
+        .child(pair(2))
         .into_element()
 }
 
@@ -1741,7 +1975,7 @@ fn contact_body(cv: Conv, item: ItemMemo) -> AnyElement {
                                 .font_weight(FontWeight::SEMIBOLD),
                         )
                         .child(
-                            text(move || info.with(|i| format!("@{}", i.1)))
+                            text(move || info.with(|i| handle(&i.1)))
                                 .number_of_lines(1)
                                 .text_size(px(font::CAPTION))
                                 .text_color(move || c::bubble_meta()),

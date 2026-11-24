@@ -202,11 +202,7 @@ fn contact_info(chat: ChatId) -> AnyElement {
                 )),
         )
         .child(muted(move || {
-            peer.with(|p| {
-                p.as_ref()
-                    .map(|p| format!("@{}", p.username))
-                    .unwrap_or_default()
-            })
+            peer.with(|p| p.as_ref().map(|p| handle(&p.username)).unwrap_or_default())
         }))
         .child(muted(move || {
             peer.with(|p| {

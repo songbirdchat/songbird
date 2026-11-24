@@ -39,14 +39,16 @@ fn body(chat: ChatId, id: MsgId) -> AnyElement {
     };
     let cv = Conv::new(chat, s);
     let item: ItemMemo = computed(move || {
-        s.message(chat, id).map(|m| Item {
-            m,
-            place: Place {
-                day_break: false,
-                time: false,
-                first: true,
-                last: true,
-            },
+        s.message(chat, id).map(|m| {
+            Item::single(
+                m,
+                Place {
+                    day_break: false,
+                    time: false,
+                    first: true,
+                    last: true,
+                },
+            )
         })
     });
     // The message on the chat's own canvas (its theme), a hairline under
@@ -87,7 +89,13 @@ fn body(chat: ChatId, id: MsgId) -> AnyElement {
     let group_receipts: Vec<(u64, Option<Minutes>, Option<Minutes>)> = match &real {
         Some(r) if cv.is_group() => r
             .iter()
-            .map(|(who, d, rd, _)| (*who, d.map(|t| t.unwrap_or(m.at)), rd.map(|t| t.unwrap_or(m.at))))
+            .map(|(who, d, rd, _)| {
+                (
+                    *who,
+                    d.map(|t| t.unwrap_or(m.at)),
+                    rd.map(|t| t.unwrap_or(m.at)),
+                )
+            })
             .collect(),
         _ => m.receipts.clone(),
     };

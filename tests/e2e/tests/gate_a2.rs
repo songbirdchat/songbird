@@ -64,6 +64,10 @@ struct TestNet {
     addr: std::net::SocketAddr,
     ws: Arc<Client>,
     ws_addr: std::net::SocketAddr,
+    /// Fails the next device-list fetch as a dropped connection would.
+    fail_device_list: std::sync::atomic::AtomicBool,
+    /// Fails attachment uploads (no connection) while set.
+    offline_uploads: std::sync::atomic::AtomicBool,
 }
 
 impl Net for TestNet {
@@ -73,6 +77,20 @@ impl Net for TestNet {
         path: &str,
         body: Vec<u8>,
     ) -> songbird_app_core::Result<(u16, Vec<u8>)> {
+        if path == "/v1/devices/list/fetch"
+            && self
+                .fail_device_list
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(songbird_app_core::Error::Network);
+        }
+        if path == "/v1/attachments"
+            && self
+                .offline_uploads
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(songbird_app_core::Error::Network);
+        }
         let has_body = !body.is_empty();
         let (authz, hash) = self
             .api
@@ -241,6 +259,8 @@ async fn person(r: Registered, api: std::net::SocketAddr, ws: std::net::SocketAd
         ),
         ws: Arc::new(client),
         ws_addr: ws,
+        fail_device_list: std::sync::atomic::AtomicBool::new(false),
+        offline_uploads: std::sync::atomic::AtomicBool::new(false),
     };
     let local = Local {
         account: *r.n.account.as_bytes(),
@@ -788,6 +808,184 @@ async fn a_photo_goes_encrypted_and_arrives_verified() {
             .await
             .is_err()
     );
+}
+
+/// Photos picked together go one after another to someone never messaged before (the first one
+/// opens the session); every one must arrive, the first included (found on two iPhones: an
+/// album of five arrived as four).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn photos_sent_together_to_a_new_contact_all_arrive() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    let mut sent = Vec::new();
+    for n in 0..5u8 {
+        let photo: Vec<u8> = (0..20_000u32)
+            .map(|i| u8::try_from(i % 256).unwrap() ^ n)
+            .collect();
+        let meta = songbird_app_core::attachments::FileMeta {
+            content_type: "image/jpeg".into(),
+            file_name: format!("IMG_{n}.jpg"),
+            width: 1200,
+            height: 900,
+            ..Default::default()
+        };
+        sent.push(
+            alice
+                .core
+                .send_files(&bob.account, vec![(photo, meta)], "")
+                .await
+                .unwrap(),
+        );
+    }
+    let mut got = Vec::new();
+    while got.len() < sent.len() {
+        if let Received::Message(m) = pump(&mut bob).await {
+            got.push(m.id);
+        }
+    }
+    assert_eq!(got, sent, "every photo arrives, in order");
+}
+
+/// An album's items carry its id, their places and each photo's blurred stand-in to the other
+/// side (D-0186), whatever order they are read in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_album_arrives_with_its_places_and_stand_ins() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    let album = [7u8; 16];
+    for index in 0..4u32 {
+        let meta = songbird_app_core::attachments::FileMeta {
+            content_type: "image/jpeg".into(),
+            file_name: format!("IMG_{index}.jpg"),
+            width: 4,
+            height: 3,
+            blurhash: "LEHV6nWB2yk8pyo0adR*.7kCMdnj".into(),
+            ..Default::default()
+        };
+        let a = songbird_app_core::attachments::AlbumRef {
+            id: album,
+            index,
+            count: 4,
+        };
+        alice
+            .core
+            .send_files_in(
+                &bob.account,
+                vec![(vec![u8::try_from(index).unwrap(); 900], meta)],
+                "",
+                Some(a),
+            )
+            .await
+            .unwrap();
+    }
+    let mut places = Vec::new();
+    while places.len() < 4 {
+        if let Received::Message(m) = pump(&mut bob).await {
+            let a = songbird_app_core::messenger::album_in(&m.content).expect("an album item");
+            assert_eq!((a.id, a.count), (album, 4));
+            let p = songbird_app_core::messenger::attachments_of(&m.content);
+            assert_eq!(p[0].blurhash, "LEHV6nWB2yk8pyo0adR*.7kCMdnj");
+            places.push(a.index);
+        }
+    }
+    assert_eq!(places, vec![0, 1, 2, 3]);
+}
+
+/// A photo sent without a connection is kept (D-0186): stored as Sending with its own id and
+/// this device's copy, sent on the next flush with that same id, and only once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_photo_sent_offline_goes_later_with_its_own_id_once() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    // A first message, so sessions and device lists are in place.
+    alice.core.send_text(&bob.account, "hi").await.unwrap();
+    assert!(matches!(pump(&mut bob).await, Received::Message(_)));
+    alice
+        .core
+        .net()
+        .offline_uploads
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let photo = vec![42u8; 5000];
+    let meta = songbird_app_core::attachments::FileMeta {
+        content_type: "image/jpeg".into(),
+        file_name: "IMG_9.jpg".into(),
+        ..Default::default()
+    };
+    let id = alice
+        .core
+        .send_files(&bob.account, vec![(photo.clone(), meta)], "")
+        .await
+        .expect("kept, not refused");
+    let me = alice.account;
+    let row = alice.core.store.message(&me, &id).unwrap().unwrap();
+    assert_eq!(row.status, Status::Sending);
+    assert_eq!(
+        &*alice.core.store.file(&me, &id, 0).unwrap().unwrap(),
+        &photo
+    );
+    // Still offline: the flush leaves it waiting.
+    assert!(alice.core.flush_outbox().await.is_err());
+    // Back online: it goes, with the id it was written with.
+    alice
+        .core
+        .net()
+        .offline_uploads
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    alice.core.flush_outbox().await.unwrap();
+    let got = loop {
+        if let Received::Message(m) = pump(&mut bob).await {
+            break m;
+        }
+    };
+    assert_eq!(got.id, id);
+    assert_eq!(&*bob.core.file(&me, &id, 0).await.unwrap(), &photo);
+    // Nothing is left to send: another flush sends nothing more.
+    alice.core.flush_outbox().await.unwrap();
+    let again = tokio::time::timeout(Duration::from_millis(800), bob.events.recv()).await;
+    assert!(
+        !matches!(again, Ok(Some(Event::Deliver { .. }))),
+        "no second copy"
+    );
+}
+
+/// A first message whose sender's device list can't be fetched just then is kept (an error: not
+/// acknowledged, so the server sends it again), never dropped; the next try opens it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_message_survives_a_failed_device_list_fetch() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    let id = alice
+        .core
+        .send_text(&bob.account, "The first photo")
+        .await
+        .unwrap();
+    bob.core
+        .net()
+        .fail_device_list
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let envelope = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), bob.events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if let Event::Deliver { envelope, .. } = ev {
+            break envelope;
+        }
+    };
+    assert_eq!(
+        bob.core.receive(&envelope).await,
+        Err(songbird_app_core::Error::Network),
+        "kept for another try, not dropped"
+    );
+    // The server sends it again; this time the list comes and the message opens.
+    let Ok(Received::Message(m)) = bob.core.receive(&envelope).await else {
+        panic!("the message, on the second try")
+    };
+    assert_eq!(m.id, id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2326,6 +2524,8 @@ async fn linked(
         ),
         ws: Arc::new(client),
         ws_addr: ws,
+        fail_device_list: std::sync::atomic::AtomicBool::new(false),
+        offline_uploads: std::sync::atomic::AtomicBool::new(false),
     };
     let local = Local {
         account: *r.n.account.as_bytes(),

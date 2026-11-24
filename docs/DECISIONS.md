@@ -199,6 +199,103 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0186 — Photos sent together: albums that hold their shape, blurred stand-ins, loading spinners
+
+- Date: 2026-11-24
+- Status: accepted by the agent on the owner's request ("like WhatsApp": photos sent together
+  loaded "very weird" on the other phone), tested on two iPhones
+- Decided by: agent
+- Context: the app grouped photos into an album by time alone (four or more in a row from one
+  sender, a minute apart), drawn with zero-height hidden rows in the virtualized list. On two
+  iPhones the receiver saw single photos that folded into an album at the fourth, the list
+  jumping and briefly painting recycled cells, empty grey frames that popped into photos, and no
+  sign anything was loading. The first of five photos to a new contact was also lost for good:
+  app-core dropped a session-opening message whose sender's device list couldn't be fetched just
+  then (fixed here too).
+- Options considered: one message with many attachments (Signal: atomic, but no reply, reaction
+  or delete per photo, unlike WhatsApp) versus one message per photo carrying the album (chosen:
+  WhatsApp's behaviour, every photo still a message of its own). Byte-level upload and download
+  progress versus an honest spinner (chosen: NSH's HTTP client reports no progress, and NSH is not
+  changed for the app; a request to NSH). A small JPEG thumbnail in the pointer versus BlurHash
+  (chosen: the schema already had `blurhash`, a few dozen characters, no picture of the photo
+  leaves the device before the photo itself).
+- Decision:
+  1. **Protocol**: `Message.album` (`Album`: a 16-byte random id, `index`, `count` 2–100), valid
+     only with attachments and not view-once (PROTOCOL §5.4). Backward compatible: older apps
+     ignore it.
+  2. **The list has one row per album** (`logic::rows`), at the album's first item in the chat;
+     items join it in album order whatever order they arrive in, so nothing above or below moves.
+     Fewer than four stay single photos (as WhatsApp). An incoming album keeps a spinning place for
+     items still on their way for 5 minutes after its newest item; a deleted item leaves the album
+     without a place to wait for. Untagged photos from older apps keep the time rule.
+  3. **BlurHash** (`app-core::blurhash`, pure arithmetic, sampled at pixel centres so flat areas
+     come back flat; malformed hashes are refused): the sender computes it off the main thread
+     from a JPEG (`zune-jpeg`, already in the app through NSH) or a PNG (screenshots; `png`,
+     already in the lockfile, every colour type, transparency drawn on dark, at most 64 MiB of
+     pixels decoded), told apart by their bytes; the receiver draws it at once, as a 24 × 24 PNG
+     (a raw pixel source drew nothing on iOS). A tile mounts no image until it has a source.
+  4. **Spinners** (`ui::media_spinner`): over a photo uploading (the user's), downloading, or a
+     place still on its way; the album's status line is its worst photo's, and Retry resends
+     every failed photo of it. Download and retry buttons (`ui::media_btn`) sit on the same
+     dark disc, so they read on a light photo. Under an album's "+N" only the picture shows.
+     The viewer follows its photo (stand-in, spinner, retry, then the photo as it arrives; it
+     read the source once, so a photo opened before it had downloaded stayed black). Downloads
+     that failed try again by themselves on every reconnect, as sends do.
+  5. **Lost first messages**: app-core returns an error (not "nothing") when a message can't be
+     decrypted because the sender's device list couldn't be fetched for a passing reason
+     (network, 408, 429, 5xx); the app leaves it on the server and reconnects once after 20 s so
+     it comes again. Development builds print the kind of a failure to store (no content).
+  6. **Photos are written before any network** (app-core, schema 9: `pending_media`): the
+     message (its id fixed), its content with pointers still to upload, and this device's copy
+     of each file, all in the encrypted store; then uploads (each kept as done) and the send, 1:1
+     through the outbox with its idempotency key, to a group sealed for the current epoch. With
+     no connection it waits as Sending, survives a restart, and goes on the next flush (on every
+     reconnect and every 15 s) with the same id, so a retry never makes a second message.
+     Retry of a photo that failed for another reason reads its bytes back from the store.
+  7. **A send waits 15 s for the server's answer**, then the connection is made again (a
+     connection that died silently held sends for the client's 90 s idle limit); nothing
+     unconfirmed is lost or doubled (6). **An API call waits 20 s** (and its body's time at
+     32 KiB/s), not the system's 60 s idle limit (a username lookup on a dead connection spun
+     for a minute); a read that runs out goes once more on a fresh connection, a signed one
+     signed afresh (the server takes each signature once), and the username lookup counts as a
+     read. Uploads and downloads keep the system's idle limit, which resets whenever data moves:
+     a big file on a slow link takes long on purpose.
+  8. **Where and when a photo was taken stays on the device** (`app-core::metadata`): JPEG
+     EXIF, XMP, comments and other APPn segments, and PNG text, time and EXIF chunks, are
+     removed before a photo is stored or sent; the colour profile and Adobe's transform stay,
+     and the orientation is kept as a one-entry EXIF so photos stand the right way. Anything
+     not understood is sent unchanged (the parser never guesses).
+  9. **Holding a photo, a video or a link preview opens the message menu** (their own tap
+     targets ended a hold as a tap, opening the viewer or the link).
+  10. **A message request is named by its profile name** (the username of a stranger never
+      reaches the device; the card said only "@"), and "Message this username" says it is
+      finding them, with a spinner, and takes no second tap meanwhile. No screen shows a bare
+      "@": one helper (`ui::handle`) gives "@name" or nothing, for contacts known only by key
+      and for this account when its claim failed at sign-up, and an empty row subtitle draws no
+      line.
+- Consequences: true progress percentages wait on NSH. Photos picked at once go out in pick
+  order; a long album shows its spinners until each upload finishes. Group text messages still
+  have no outbox (a failed one is retried as a new message). RUSTSEC-2026-0592 (a stack
+  overflow in `url`'s `origin()` on nested `blob:` URLs), published while this was checked,
+  is fixed by `url` 2.5.9; its `cargo vet` exemption moves from 2.5.8 to 2.5.9, and
+  `form_urlencoded` 1.2.3 (6 lines changed, released with it) is exempted until the imported
+  audits cover both.
+- Evidence: `tests/e2e`: `a_photo_sent_offline_goes_later_with_its_own_id_once`,
+  `photos_sent_together_to_a_new_contact_all_arrive`,
+  `a_first_message_survives_a_failed_device_list_fetch` (fails without the fix),
+  `an_album_arrives_with_its_places_and_stand_ins`; `logic` row tests (order, waiting, small
+  albums, a message in between, deletion, senders, duplicates, the time rule); `blurhash` and
+  `metadata` tests with property tests (GPS, XMP and comments gone; orientation and colour
+  profile kept; malformed files unchanged); content validation tests; request naming tests;
+  stand-ins for every PNG colour type and depth; the API deadline. On two iPhones: albums whole
+  from the first item, chats opening at their end, four photos sent while the relay was down
+  going out by themselves when it came back; with the API cut and delivery up, every photo of
+  two albums (screenshots too) arriving as its blurred stand-in with a retry button, in the
+  chat and in the viewer, and becoming the photo on retry once the API was back; an upload
+  on a dead connection failing after the system's idle limit and going again by itself; a
+  username lookup on a dead connection answering in time; holding a single photo opening its
+  menu.
+
 ## D-0185 — PR #72's checks: reviewed CodeQL lines, Semgrep markers, the SQLite advisory
 
 - Date: 2026-11-22

@@ -341,6 +341,17 @@ pub struct Message {
     pub forwarded: bool,
     /// Per-member delivery for Message info in groups: (member, delivered, read).
     pub receipts: Vec<(ContactId, Option<Minutes>, Option<Minutes>)>,
+    /// Photos and videos sent together (D-0186): which album, and this one's place in it.
+    pub album: Option<AlbumTag>,
+}
+
+/// One of the photos and videos sent together (D-0186): the album's id, this item's place from
+/// 0 and how many the album has. The list draws an album from its first item that arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlbumTag {
+    pub id: [u8; 16],
+    pub index: u32,
+    pub count: u32,
 }
 
 impl Message {
