@@ -68,6 +68,11 @@ struct TestNet {
     fail_device_list: std::sync::atomic::AtomicBool,
     /// Fails attachment uploads (no connection) while set.
     offline_uploads: std::sync::atomic::AtomicBool,
+    /// Fails group sends before they leave (no connection) while set.
+    offline_groups: std::sync::atomic::AtomicBool,
+    /// Sends group messages but loses the server's answer (a connection that died after the
+    /// send) while set.
+    lose_group_answers: std::sync::atomic::AtomicBool,
 }
 
 impl Net for TestNet {
@@ -151,7 +156,14 @@ impl Net for TestNet {
         hints: SendHints,
         body: Vec<u8>,
     ) -> songbird_app_core::Result<SendStatus> {
-        self.ws
+        if self
+            .offline_groups
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(songbird_app_core::Error::Network);
+        }
+        let status = self
+            .ws
             .send_with(
                 idempotency_key,
                 hints,
@@ -161,7 +173,14 @@ impl Net for TestNet {
                 },
             )
             .await
-            .map_err(|_| songbird_app_core::Error::Network)
+            .map_err(|_| songbird_app_core::Error::Network)?;
+        if self
+            .lose_group_answers
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(songbird_app_core::Error::Network);
+        }
+        Ok(status)
     }
 
     async fn ephemeral(
@@ -261,6 +280,8 @@ async fn person(r: Registered, api: std::net::SocketAddr, ws: std::net::SocketAd
         ws_addr: ws,
         fail_device_list: std::sync::atomic::AtomicBool::new(false),
         offline_uploads: std::sync::atomic::AtomicBool::new(false),
+        offline_groups: std::sync::atomic::AtomicBool::new(false),
+        lose_group_answers: std::sync::atomic::AtomicBool::new(false),
     };
     let local = Local {
         account: *r.n.account.as_bytes(),
@@ -312,6 +333,12 @@ async fn pump(p: &mut Person) -> Received {
 }
 
 async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
+    let (app, alice, bob, _, stop) = stack3().await?;
+    Some((app, alice, bob, stop))
+}
+
+/// [`stack`] with a third person.
+async fn stack3() -> Option<(Arc<App>, Person, Person, Person, watch::Sender<bool>)> {
     let surreal = env("SONGBIRD_TEST_SURREALDB")?;
     let hot = env("SONGBIRD_TEST_VALKEY")?;
     let s3_addr = env("SONGBIRD_TEST_RUSTFS")?;
@@ -339,7 +366,11 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
         .await
         .unwrap();
     let registry = Arc::new(Registry::connect(db).await.unwrap());
-    let (alice, bob) = (register(&registry).await, register(&registry).await);
+    let (alice, bob, carol) = (
+        register(&registry).await,
+        register(&registry).await,
+        register(&registry).await,
+    );
     // The production send policy: franking stamps and the contact gate (requests, access keys).
     let secret = random32();
     let limits = songbird_send::RequestLimits::default();
@@ -596,9 +627,10 @@ async fn stack() -> Option<(Arc<App>, Person, Person, watch::Sender<bool>)> {
     KT_STORES.lock().unwrap().push((api_addr, akd_store));
     let alice = person(alice, api_addr, ws_addr).await;
     let bob = person(bob, api_addr, ws_addr).await;
-    // Let the directory follower see both profiles.
+    let carol = person(carol, api_addr, ws_addr).await;
+    // Let the directory follower see the profiles.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    Some((app, alice, bob, stop))
+    Some((app, alice, bob, carol, stop))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -949,6 +981,241 @@ async fn a_photo_sent_offline_goes_later_with_its_own_id_once() {
         !matches!(again, Ok(Some(Event::Deliver { .. }))),
         "no second copy"
     );
+}
+
+/// Nothing arrives at `p` for a while (no second copy of anything).
+async fn quiet(p: &mut Person) -> bool {
+    !matches!(
+        tokio::time::timeout(Duration::from_millis(800), p.events.recv()).await,
+        Ok(Some(Event::Deliver { .. }))
+    )
+}
+
+/// No message reaches `p` for a while (other traffic, such as a group's key update, may).
+async fn no_message(p: &mut Person) -> bool {
+    loop {
+        match tokio::time::timeout(Duration::from_millis(800), pump_app(p)).await {
+            Err(_) => return true,
+            Ok(Received::Message(_)) => return false,
+            Ok(_) => {}
+        }
+    }
+}
+
+/// A group with Alice and Bob, Bob having joined and read its title.
+async fn group_of_two(alice: &mut Person, bob: &mut Person) -> [u8; 16] {
+    let gid = alice
+        .core
+        .create_group("Trip", &[bob.account])
+        .await
+        .unwrap();
+    assert_eq!(pump_app(bob).await, Received::Joined { group: gid });
+    assert!(matches!(pump_app(bob).await, Received::GroupUpdated { .. }));
+    gid
+}
+
+/// A group message sent with no connection waits (Sending) and goes later once, with its own
+/// id (D-0187). The group moved on meanwhile (Carol joined), so it is sealed again for the new
+/// epoch: Carol, who has only that epoch's keys, can read it too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_message_sent_offline_goes_later_once_with_its_id() {
+    let Some((_app, mut alice, mut bob, mut carol, _stop)) = stack3().await else {
+        return;
+    };
+    let gid = group_of_two(&mut alice, &mut bob).await;
+    alice
+        .core
+        .net()
+        .offline_groups
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let id = alice
+        .core
+        .send_group_text(&gid, "Leaving at 8")
+        .await
+        .expect("kept, not refused");
+    let me = alice.account;
+    let row = alice.core.store.message(&me, &id).unwrap().unwrap();
+    assert_eq!(row.status, Status::Sending);
+    assert!(alice.core.flush_outbox().await.is_err(), "still offline");
+    // The group moves to a new epoch while it waits.
+    alice
+        .core
+        .add_members(&gid, &[carol.account])
+        .await
+        .unwrap();
+    assert_eq!(pump_app(&mut carol).await, Received::Joined { group: gid });
+    alice
+        .core
+        .net()
+        .offline_groups
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    alice.core.flush_outbox().await.unwrap();
+    let got = loop {
+        if let Received::Message(m) = pump_app(&mut bob).await {
+            break m;
+        }
+    };
+    assert_eq!((got.id, got.text.as_str()), (id, "Leaving at 8"));
+    let got = loop {
+        if let Received::Message(m) = pump_app(&mut carol).await {
+            break m;
+        }
+    };
+    assert_eq!(got.id, id, "sealed again for the epoch Carol joined in");
+    let row = alice.core.store.message(&me, &id).unwrap().unwrap();
+    assert_eq!(row.status, Status::Sent);
+    // Nothing is left to send.
+    alice.core.flush_outbox().await.unwrap();
+    assert!(no_message(&mut bob).await, "no second copy");
+}
+
+/// A group message the server took, whose answer was lost, goes again with the same
+/// idempotency key: the server keeps the one it has, and members see it once (D-0187).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_group_message_whose_answer_was_lost_is_not_doubled() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    let gid = group_of_two(&mut alice, &mut bob).await;
+    alice
+        .core
+        .net()
+        .lose_group_answers
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let id = alice.core.send_group_text(&gid, "Once").await.unwrap();
+    let me = alice.account;
+    assert_eq!(
+        alice.core.store.message(&me, &id).unwrap().unwrap().status,
+        Status::Sending
+    );
+    let Received::Message(m) = pump_app(&mut bob).await else {
+        panic!("a group message")
+    };
+    assert_eq!(m.id, id);
+    alice
+        .core
+        .net()
+        .lose_group_answers
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    alice.core.flush_outbox().await.unwrap();
+    assert_eq!(
+        alice.core.store.message(&me, &id).unwrap().unwrap().status,
+        Status::Sent
+    );
+    assert!(quiet(&mut bob).await, "no second copy");
+}
+
+/// A message deleted while it waits is never sent: not a photo still to upload, not a group
+/// message waiting for the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_message_deleted_while_waiting_is_never_sent() {
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    alice.core.send_text(&bob.account, "hi").await.unwrap();
+    assert!(matches!(pump(&mut bob).await, Received::Message(_)));
+    let gid = group_of_two(&mut alice, &mut bob).await;
+    let offline = |p: &Person, on: bool| {
+        let net = p.core.net();
+        net.offline_uploads
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+        net.offline_groups
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    };
+    offline(&alice, true);
+    let meta = songbird_app_core::attachments::FileMeta {
+        content_type: "image/jpeg".into(),
+        ..Default::default()
+    };
+    let photo = alice
+        .core
+        .send_files(&bob.account, vec![(vec![7u8; 3000], meta)], "")
+        .await
+        .unwrap();
+    let text = alice.core.send_group_text(&gid, "Oops").await.unwrap();
+    let me = alice.account;
+    alice.core.delete_for_me(&me, &photo).unwrap();
+    alice.core.delete_for_me(&me, &text).unwrap();
+    offline(&alice, false);
+    alice.core.flush_outbox().await.unwrap();
+    assert!(quiet(&mut bob).await, "nothing deleted is sent");
+}
+
+/// A photo can upload without the core (D-0187): the host takes each file to upload, uploads
+/// it with the core free for other work (here: receiving a message), records it, then sends.
+/// The receiver downloads the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_photo_uploads_while_the_core_does_other_work() {
+    use songbird_app_core::messenger::FileAt;
+    let Some((_app, mut alice, mut bob, _stop)) = stack().await else {
+        return;
+    };
+    alice.core.send_text(&bob.account, "hi").await.unwrap();
+    assert!(matches!(pump(&mut bob).await, Received::Message(_)));
+    let photos = [vec![1u8; 4000], vec![2u8; 6000]];
+    let meta = songbird_app_core::attachments::FileMeta {
+        content_type: "image/jpeg".into(),
+        ..Default::default()
+    };
+    let id = alice
+        .core
+        .prepare_files_in(
+            &bob.account,
+            photos.iter().map(|p| (p.clone(), meta.clone())).collect(),
+            "",
+            None,
+        )
+        .unwrap();
+    let job = alice
+        .core
+        .next_upload(&id)
+        .await
+        .unwrap()
+        .expect("a file to upload");
+    assert_eq!(job.message(), id);
+    // While it uploads, the core is free: Bob's message arrives.
+    let reply = bob.core.send_text(&alice.account, "Got it?").await.unwrap();
+    let m = loop {
+        if let Received::Message(m) = pump(&mut alice).await {
+            break m;
+        }
+    };
+    assert_eq!(m.id, reply);
+    let object = job.upload(alice.core.net()).await.unwrap();
+    alice.core.uploaded(job, object).unwrap();
+    // The second file, then nothing more to upload.
+    let job = alice
+        .core
+        .next_upload(&id)
+        .await
+        .unwrap()
+        .expect("the second file");
+    let object = job.upload(alice.core.net()).await.unwrap();
+    alice.core.uploaded(job, object).unwrap();
+    assert!(alice.core.next_upload(&id).await.unwrap().is_none());
+    alice.core.finish_media(&id).await.unwrap();
+    let got = loop {
+        if let Received::Message(m) = pump(&mut bob).await {
+            break m;
+        }
+    };
+    assert_eq!(got.id, id);
+    let me = alice.account;
+    for (i, p) in photos.iter().enumerate() {
+        let idx = u32::try_from(i).unwrap();
+        let FileAt::Fetch(pointer) = bob.core.file_here(&me, &id, idx).unwrap() else {
+            panic!("not downloaded yet")
+        };
+        let bytes = songbird_app_core::attachments::download(bob.core.net(), &pointer)
+            .await
+            .unwrap();
+        assert_eq!(&*bytes, p);
+        bob.core.keep_file(&me, &id, idx, &bytes).unwrap();
+        assert!(matches!(
+            bob.core.file_here(&me, &id, idx).unwrap(),
+            FileAt::Here(_)
+        ));
+    }
 }
 
 /// A first message whose sender's device list can't be fetched just then is kept (an error: not
@@ -2526,6 +2793,8 @@ async fn linked(
         ws_addr: ws,
         fail_device_list: std::sync::atomic::AtomicBool::new(false),
         offline_uploads: std::sync::atomic::AtomicBool::new(false),
+        offline_groups: std::sync::atomic::AtomicBool::new(false),
+        lose_group_answers: std::sync::atomic::AtomicBool::new(false),
     };
     let local = Local {
         account: *r.n.account.as_bytes(),

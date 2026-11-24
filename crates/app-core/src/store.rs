@@ -62,7 +62,7 @@ fn viewed_key(author: &[u8; 16], id: &[u8; 16]) -> String {
 }
 
 /// The schema version this code writes.
-pub const SCHEMA: i64 = 9;
+pub const SCHEMA: i64 = 10;
 
 /// Outgoing message status, as the UI shows it (`crates/content`'s levels, plus the local ones).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -197,6 +197,25 @@ pub type OutboxEntry = ([u8; 16], [u8; 16], [u8; 16], Vec<u8>);
 /// A pending photo or file message (D-0186): its chat, whether that is a group, its content and
 /// its preview.
 pub type PendingMedia = ([u8; 16], bool, Vec<u8>, String);
+
+/// A group message waiting for the server (D-0187): what was sealed and how it goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupOutboxEntry {
+    /// The message id.
+    pub message: [u8; 16],
+    /// The group.
+    pub gid: [u8; 16],
+    /// The delivery idempotency key the sealed body goes with.
+    pub idem: [u8; 16],
+    /// The MLS epoch it was sealed in.
+    pub epoch: u64,
+    /// The MLS message, as sealed.
+    pub body: Vec<u8>,
+    /// The franking commitment the server stamps (empty: none).
+    pub commitment: Vec<u8>,
+    /// The content, to seal again in a later epoch.
+    pub content: Vec<u8>,
+}
 
 /// The store.
 #[derive(Debug)]
@@ -404,6 +423,20 @@ impl Store {
                    is_group INTEGER NOT NULL, created_ms INTEGER NOT NULL, content BLOB NOT NULL,
                    preview TEXT NOT NULL);
                  PRAGMA user_version = 9;",
+            ))?;
+            db(tx.commit())?;
+        }
+        if v < 10 {
+            // Group messages not yet accepted by the server (D-0187), as the 1:1 outbox: the
+            // MLS message as sealed (its epoch, idempotency key and franking commitment), sent
+            // again unchanged while the group stays in that epoch, sealed afresh with the same
+            // message id once it has moved on.
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "CREATE TABLE group_outbox (message BLOB PRIMARY KEY, gid BLOB NOT NULL,
+                   created_ms INTEGER NOT NULL, idem BLOB NOT NULL, epoch INTEGER NOT NULL,
+                   body BLOB NOT NULL, commitment BLOB NOT NULL, content BLOB NOT NULL);
+                 PRAGMA user_version = 10;",
             ))?;
             db(tx.commit())?;
         }
@@ -882,7 +915,14 @@ impl Store {
                 params![&author[..], &id[..]],
             ))?;
         }
-        db(tx.execute("DELETE FROM outbox WHERE message = ?1", [&id[..]]))?;
+        // Nothing deleted is sent later: not a 1:1 or group message waiting for the server, and
+        // not a photo still to upload (it would have gone at the next flush).
+        for table in ["outbox", "group_outbox", "pending_media"] {
+            db(tx.execute(
+                &format!("DELETE FROM {table} WHERE message = ?1"),
+                [&id[..]],
+            ))?;
+        }
         // The list's preview never keeps a deleted message's text.
         if let Some(chat) = chat {
             db(tx.execute(
@@ -1790,6 +1830,68 @@ impl Store {
             .execute("DELETE FROM outbox WHERE idem = ?1", [&idem[..]]))
         .map(|_| ())
     }
+
+    /// Keeps (or replaces, when sealed again) a group message waiting for the server.
+    pub fn group_outbox_put(&self, e: &GroupOutboxEntry, now_ms: u64) -> Result<()> {
+        db(self.db.execute(
+            "INSERT INTO group_outbox (message, gid, created_ms, idem, epoch, body, commitment, content)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT (message) DO UPDATE SET idem = ?4, epoch = ?5, body = ?6,
+               commitment = ?7, content = ?8",
+            params![
+                &e.message[..],
+                &e.gid[..],
+                sql_ms(now_ms),
+                &e.idem[..],
+                i64::try_from(e.epoch).unwrap_or(i64::MAX),
+                e.body,
+                e.commitment,
+                e.content
+            ],
+        ))
+        .map(|_| ())
+    }
+
+    /// Group messages waiting for the server, oldest first.
+    pub fn group_outbox(&self) -> Result<Vec<GroupOutboxEntry>> {
+        let mut st = db(self.db.prepare(
+            "SELECT message, gid, idem, epoch, body, commitment, content FROM group_outbox
+             ORDER BY created_ms, rowid",
+        ))?;
+        let rows = db(st.query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Vec<u8>>(4)?,
+                r.get::<_, Vec<u8>>(5)?,
+                r.get::<_, Vec<u8>>(6)?,
+            ))
+        }))?;
+        rows.map(|r| {
+            let (m, g, i, epoch, body, commitment, content) = db(r)?;
+            Ok(GroupOutboxEntry {
+                message: arr16(&m)?,
+                gid: arr16(&g)?,
+                idem: arr16(&i)?,
+                epoch: u64::try_from(epoch).map_err(|_| Error::Storage)?,
+                body,
+                commitment,
+                content,
+            })
+        })
+        .collect()
+    }
+
+    /// A group message the server took (or refused for good): it waits no more.
+    pub fn group_outbox_done(&self, message: &[u8; 16]) -> Result<()> {
+        db(self.db.execute(
+            "DELETE FROM group_outbox WHERE message = ?1",
+            [&message[..]],
+        ))
+        .map(|_| ())
+    }
 }
 
 pub(crate) fn row_message(r: &rusqlite::Row<'_>) -> rusqlite::Result<Result<MessageRow>> {
@@ -1874,6 +1976,7 @@ mod tests {
              ALTER TABLE receipts DROP COLUMN played_ms;
              INSERT INTO receipts (author, id, account, level, ms) VALUES (x'01', x'02', x'03', 3, 77);
              DROP TABLE pending_media;
+             DROP TABLE group_outbox;
              PRAGMA user_version = 7;",
         )
         .unwrap();

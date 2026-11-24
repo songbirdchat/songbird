@@ -769,7 +769,15 @@ pub fn create_group(s: Store, title: String, members: Vec<ContactId>) -> ChatId 
                 let lock = core();
                 let mut guard = lock.lock().await;
                 match guard.as_mut() {
-                    Some(m) => m.create_group_with_id(gid, &title, &accounts).await.is_ok(),
+                    Some(m) => match m.create_group_with_id(gid, &title, &accounts).await {
+                        Ok(_) => true,
+                        Err(e) => {
+                            if crate::PREVIEW_BUILD {
+                                eprintln!("songbird: a group wasn't created ({})", error_kind(&e));
+                            }
+                            false
+                        }
+                    },
                     None => false,
                 }
             };
@@ -796,6 +804,24 @@ pub(super) fn account_of(chat: ChatId) -> Option<[u8; 16]> {
 #[derive(Debug)]
 pub struct AppNet;
 
+/// app-core's calls that only read, though sent as POSTs (D-0187). Fetching keys or key
+/// packages uses one up: a second try wastes one, which is refilled, rather than leave a
+/// conversation or a new group waiting on a dead connection (found on an iPhone: creating a
+/// group failed when its delivery key fetch hung).
+const POST_READS: &[&str] = &[
+    "/v1/communities/state",
+    "/v1/devices/identity",
+    "/v1/devices/list/fetch",
+    "/v1/groups/ds",
+    "/v1/groups/log",
+    "/v1/groups/state",
+    "/v1/keypackages/fetch",
+    "/v1/keys/fetch",
+    "/v1/kt/audit",
+    "/v1/kt/lookup",
+    "/v1/kt/roots",
+];
+
 /// How long a send waits for the server's answer before the connection is taken for dead.
 const SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -821,9 +847,33 @@ impl Net for AppNet {
     ) -> songbird_app_core::Result<(u16, Vec<u8>)> {
         let has_body = !body.is_empty();
         let json = body.first() == Some(&b'{');
-        super::signed(method, path, has_body.then_some(body), json)
-            .await
-            .map_err(|_| songbird_app_core::Error::Network)
+        // A read sent as a POST (its query stays out of URLs and logs) goes once more, signed
+        // afresh, when a dead connection runs it out of time; a write never does (D-0187).
+        let read = method == "POST" && POST_READS.contains(&path);
+        let sent = if read {
+            super::signed_read(method, path, has_body.then_some(body), json).await
+        } else {
+            super::signed(method, path, has_body.then_some(body), json).await
+        };
+        // Which call, not whose: the path without any id in it (hex segments go).
+        let at = || {
+            path.split('/')
+                .filter(|seg| seg.len() < 16 || !seg.bytes().all(|b| b.is_ascii_hexdigit()))
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        if crate::PREVIEW_BUILD
+            && let Ok((status, _)) = &sent
+            && *status >= 400
+        {
+            eprintln!("songbird: {method} {} answered {status}", at());
+        }
+        sent.map_err(|p| {
+            if crate::PREVIEW_BUILD {
+                eprintln!("songbird: {method} {} failed: {}", at(), p.0);
+            }
+            songbird_app_core::Error::Network
+        })
     }
 
     async fn upload(
@@ -1042,7 +1092,10 @@ pub async fn start() -> Result<(), super::Problem> {
     } else {
         let _ = m.refill_keys().await;
     }
-    let _ = m.flush_outbox().await;
+    // Texts and group messages waiting go now; photos still to upload go after, without
+    // holding app-core while they upload (D-0187).
+    let _ = m.flush_queued().await;
+    finish_pending();
     if let Some(s) = crate::store::try_store() {
         show_all(s, &m);
         // The account's groups, recorded for its other devices; ones it joined elsewhere,
@@ -1351,16 +1404,9 @@ fn with_file(msg: MsgId, then: impl FnOnce(Vec<u8>) + 'static) {
         return;
     };
     super::run(async move {
-        let lock = core();
-        let mut guard = lock.lock().await;
-        let m = guard
-            .as_mut()
-            .ok_or_else(|| super::problem("Not connected yet."))?;
-        let bytes = m
-            .file(&author, &id, 0)
+        let bytes = file_unlocked(author, id, 0)
             .await
             .map_err(|_| super::problem("The file couldn't be downloaded. Try again."))?;
-        drop(guard);
         then(bytes.to_vec());
         Ok(())
     });
@@ -1396,11 +1442,10 @@ pub fn save_to_library(msg: MsgId, quiet: bool) -> bool {
             .into_iter()
             .next()
             .ok_or_else(|| super::problem("There's nothing to save."))?;
-        let bytes = m
-            .file(&author, &id, 0)
+        drop(guard);
+        let bytes = file_unlocked(author, id, 0)
             .await
             .map_err(|_| super::problem("The file couldn't be downloaded. Try again."))?;
-        drop(guard);
         let video = pointer.content_type.starts_with("video/");
         let name = if pointer.file_name.is_empty() {
             format!(
@@ -1566,13 +1611,13 @@ pub fn open_view_once(s: Store, chat: ChatId, msg: MsgId) {
         return;
     };
     super::run(async move {
+        let bytes = file_unlocked(author, id, 0).await;
         let got = {
             let lock = core();
             let mut guard = lock.lock().await;
             let m = guard
                 .as_mut()
                 .ok_or_else(|| super::problem("Not connected yet."))?;
-            let bytes = m.file(&author, &id, 0).await;
             let video = m
                 .store
                 .message(&author, &id)
@@ -1702,14 +1747,10 @@ fn fetch_photo(msg: MsgId, asked: bool) {
     // Detached: the bubble that asked may scroll away before the file arrives.
     Owner::detached().run(|| {
         spawn(async move {
-            let got = {
-                let lock = core();
-                let mut guard = lock.lock().await;
-                match guard.as_mut() {
-                    Some(m) => m.file(&author, &id, 0).await.ok().map(|b| b.to_vec()),
-                    None => None,
-                }
-            };
+            let got = file_unlocked(author, id, 0)
+                .await
+                .ok()
+                .map(|b| b.to_vec());
             loading.update(|l| {
                 l.0.remove(&msg);
             });
@@ -1914,6 +1955,155 @@ pub fn send_picked(s: Store, chat: ChatId, files: Vec<nsh_core::picker::PickedFi
     }
 }
 
+thread_local! {
+    /// Photo and file messages (app-core ids) uploading now (D-0187): a flush never starts a
+    /// second upload of one.
+    static FINISHING: RefCell<std::collections::HashSet<[u8; 16]>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// A message marked as uploading while this lives (cleared even if its task is dropped).
+struct Finishing([u8; 16]);
+
+impl Finishing {
+    fn start(id: [u8; 16]) -> Option<Self> {
+        FINISHING
+            .with_borrow_mut(|f| f.insert(id))
+            .then_some(Self(id))
+    }
+}
+
+impl Drop for Finishing {
+    fn drop(&mut self) {
+        FINISHING.with_borrow_mut(|f| {
+            f.remove(&self.0);
+        });
+    }
+}
+
+/// Uploads a stored photo or file message and sends it, holding app-core's lock only for the
+/// short steps between uploads (D-0187): on a slow link a photo takes a while to upload, and
+/// holding the lock meanwhile held everything else too (messages arriving, receipts, other
+/// sends). A network failure leaves it waiting (Sending) for the next flush; any other gives
+/// up on it (Failed).
+async fn finish_unlocked(id: [u8; 16]) -> songbird_app_core::Result<()> {
+    let Some(_busy) = Finishing::start(id) else {
+        // Already on its way.
+        return Ok(());
+    };
+    let r = upload_and_send(id).await;
+    if let Err(e) = &r
+        && !matches!(e, songbird_app_core::Error::Network)
+    {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        if let Some(m) = guard.as_mut() {
+            let _ = m.abandon_media(&id);
+        }
+    }
+    r
+}
+
+async fn upload_and_send(id: [u8; 16]) -> songbird_app_core::Result<()> {
+    use songbird_app_core::Error;
+    loop {
+        let job = {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            guard
+                .as_mut()
+                .ok_or(Error::Network)?
+                .next_upload(&id)
+                .await?
+        };
+        let Some(job) = job else {
+            break;
+        };
+        // The upload itself, with the lock released.
+        let object = job.upload(&AppNet).await?;
+        let lock = core();
+        let mut guard = lock.lock().await;
+        guard
+            .as_mut()
+            .ok_or(Error::Network)?
+            .uploaded(job, object)?;
+    }
+    let lock = core();
+    let mut guard = lock.lock().await;
+    guard
+        .as_mut()
+        .ok_or(Error::Network)?
+        .finish_media(&id)
+        .await
+}
+
+/// Photo and file messages still waiting to upload (D-0186) go, one after another, each through
+/// [`finish_unlocked`]; the first network failure leaves the rest for the next flush.
+fn finish_pending() {
+    super::run(async move {
+        let (ids, me) = {
+            let lock = core();
+            let guard = lock.lock().await;
+            let Some(m) = guard.as_ref() else {
+                return Ok(());
+            };
+            (
+                m.store.pending_media().unwrap_or_default(),
+                m.local().account,
+            )
+        };
+        for id in ids {
+            let r = finish_unlocked(id).await;
+            let status = {
+                let lock = core();
+                let guard = lock.lock().await;
+                guard
+                    .as_ref()
+                    .and_then(|m| m.store.message(&me, &id).ok().flatten())
+                    .map(|row| row.status)
+            };
+            if let (Some(s), Some(status)) = (crate::store::try_store(), status) {
+                set_status(s, &id, status);
+            }
+            if matches!(r, Err(songbird_app_core::Error::Network)) {
+                break;
+            }
+        }
+        Ok(())
+    });
+}
+
+/// A message's file, downloaded (if this device hasn't it yet) with app-core's lock released
+/// (D-0187), as [`finish_unlocked`] uploads.
+async fn file_unlocked(
+    author: [u8; 16],
+    id: [u8; 16],
+    idx: u32,
+) -> songbird_app_core::Result<zeroize::Zeroizing<Vec<u8>>> {
+    use songbird_app_core::{Error, messenger::FileAt};
+    let at = {
+        let lock = core();
+        let mut guard = lock.lock().await;
+        guard
+            .as_mut()
+            .ok_or(Error::Network)?
+            .file_here(&author, &id, idx)?
+    };
+    match at {
+        FileAt::Here(b) => Ok(b),
+        FileAt::Fetch(pointer) => {
+            let bytes = songbird_app_core::attachments::download(&AppNet, &pointer).await?;
+            let lock = core();
+            let mut guard = lock.lock().await;
+            guard
+                .as_mut()
+                .ok_or(Error::Network)?
+                .keep_file(&author, &id, idx, &bytes)?;
+            Ok(bytes)
+        }
+    }
+}
+
 /// Sends one picked photo or file (and again on Retry or after a reconnect): its blurred
 /// stand-in first, then app-core encrypts, uploads and sends it. Its bytes stay in [`PENDING`]
 /// until it is sent.
@@ -1946,43 +2136,40 @@ fn send_media(s: Store, chat: ChatId, ui: MsgId, p: Pending) {
             .as_mut()
             .ok_or_else(|| super::problem("Not connected yet."))?;
         let me = m.local().account;
+        // Stored first, with no network (D-0186); then uploaded and sent without holding
+        // app-core (D-0187).
         let r = match (group, to) {
-            (Some(gid), _) => {
-                m.send_group_files_in(&gid, vec![(bytes, meta)], "", album)
-                    .await
-            }
-            (None, Some(to)) => m.send_files_in(&to, vec![(bytes, meta)], "", album).await,
+            (Some(gid), _) => m.prepare_group_files_in(&gid, vec![(bytes, meta)], "", album),
+            (None, Some(to)) => m.prepare_files_in(&to, vec![(bytes, meta)], "", album),
             (None, None) => Err(songbird_app_core::Error::NoSession),
         };
-        let st = r.as_ref().ok().and_then(|id| {
-            m.store
-                .message(&me, id)
-                .ok()
-                .flatten()
-                .map(|row| (*id, row.status))
-        });
         drop(guard);
-        match st {
-            Some((id, status)) => {
-                PENDING.with_borrow_mut(|m| m.remove(&ui));
-                OUTGOING.with_borrow_mut(|o| o.insert(ui, id));
-                IDS.with_borrow_mut(|x| x.insert(ui, (me, id)));
-                MEDIA.with_borrow_mut(|x| x.insert(ui, (me, id)));
-                set_status(s, &id, status);
-                Ok(())
-            }
-            None => {
-                s.fail(chat, ui);
-                // No connection: it goes again by itself once there is one.
-                if matches!(r, Err(songbird_app_core::Error::Network)) {
-                    resend_later(chat, ui);
-                    Err(super::problem(
-                        "Can't reach the server. The photo will be sent when you're back online.",
-                    ))
-                } else {
-                    Err(super::problem("The file couldn't be sent."))
-                }
-            }
+        let Ok(id) = r else {
+            s.fail(chat, ui);
+            return Err(super::problem("The file couldn't be sent."));
+        };
+        // From here it is this stored message, whatever the network does.
+        PENDING.with_borrow_mut(|m| m.remove(&ui));
+        OUTGOING.with_borrow_mut(|o| o.insert(ui, id));
+        IDS.with_borrow_mut(|x| x.insert(ui, (me, id)));
+        MEDIA.with_borrow_mut(|x| x.insert(ui, (me, id)));
+        set_status(s, &id, Status::Sending);
+        let sent = finish_unlocked(id).await;
+        let status = {
+            let lock = core();
+            let guard = lock.lock().await;
+            guard
+                .as_ref()
+                .and_then(|m| m.store.message(&me, &id).ok().flatten())
+                .map(|row| row.status)
+        };
+        if let Some(status) = status {
+            set_status(s, &id, status);
+        }
+        match sent {
+            // No connection: it waits (Sending) and goes by itself once there is one.
+            Ok(()) | Err(songbird_app_core::Error::Network) => Ok(()),
+            Err(_) => Err(super::problem("The file couldn't be sent.")),
         }
     });
 }
@@ -2500,7 +2687,10 @@ fn set_status(s: Store, core_id: &[u8; 16], status: Status) {
     let ui = OUTGOING
         .with_borrow(|o| o.iter().find(|(_, v)| *v == core_id).map(|(k, _)| *k))
         .unwrap_or_else(|| ui_id(core_id));
-    let chats: Vec<ChatId> = ACCOUNTS.with_borrow(|a| a.keys().copied().collect());
+    // 1:1 chats and groups (a group's photo or message ticks too: only 1:1 chats were looked
+    // in, so a group message's tick never moved).
+    let mut chats: Vec<ChatId> = ACCOUNTS.with_borrow(|a| a.keys().copied().collect());
+    chats.extend(GROUPS.with_borrow(|g| g.keys().copied().collect::<Vec<_>>()));
     for chat in chats {
         if s.message(chat, ui).is_some() {
             if status == Status::Failed {
@@ -2582,10 +2772,18 @@ pub fn send(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
             };
             match sent {
                 Ok(id) => {
+                    // Sent, or waiting in the group outbox with its id (D-0187): it goes by
+                    // itself once there is a connection, never as a second message.
+                    let status = m
+                        .store
+                        .message(&me, &id)
+                        .ok()
+                        .flatten()
+                        .map_or(Status::Sending, |r| r.status);
                     drop(guard);
                     OUTGOING.with_borrow_mut(|o| o.insert(ui_msg, id));
                     IDS.with_borrow_mut(|x| x.insert(ui_msg, (me, id)));
-                    s.advance(chat, ui_msg, Tick::Sent);
+                    set_status(s, &id, status);
                     Ok(())
                 }
                 Err(_) => {
@@ -3212,17 +3410,30 @@ fn sweep_expired() {
             };
             // Messages a budget or a busy server held back go out again (they wait in the
             // outbox, in order).
-            // Photo and file messages still to upload (D-0186) go first, then the outbox.
-            let mut waiting: Vec<[u8; 16]> = m.store.pending_media().unwrap_or_default();
+            // The 1:1 and group outboxes go here; photo and file messages still to upload
+            // (D-0186) go after, without holding app-core while they upload (D-0187).
+            let mut waiting: Vec<[u8; 16]> = m
+                .store
+                .outbox()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, _, id, _)| id)
+                .collect();
             waiting.extend(
                 m.store
-                    .outbox()
+                    .group_outbox()
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|(_, _, id, _)| id),
+                    .map(|e| e.message),
             );
-            if !waiting.is_empty() {
-                let _ = m.flush_outbox().await;
+            if !waiting.is_empty()
+                && let Err(e) = m.flush_queued().await
+                && crate::PREVIEW_BUILD
+            {
+                eprintln!("songbird: waiting messages didn't go ({})", error_kind(&e));
+            }
+            if !m.store.pending_media().unwrap_or_default().is_empty() {
+                finish_pending();
             }
             let me = m.local().account;
             let retried: Vec<([u8; 16], Status)> = waiting
@@ -3594,30 +3805,35 @@ pub fn send_voice(s: Store, chat: ChatId, rec: songbird_recorder::Recording) {
             .ok_or_else(|| super::problem("Not connected yet."))?;
         let me = m.local().account;
         let r = if m.is_group(&target) {
-            m.send_group_files(&target, vec![(bytes, meta)], "").await
+            m.prepare_group_files_in(&target, vec![(bytes, meta)], "", None)
         } else {
-            m.send_files(&target, vec![(bytes, meta)], "").await
+            m.prepare_files_in(&target, vec![(bytes, meta)], "", None)
         };
-        match r {
-            Ok(id) => {
-                let status = m
-                    .store
-                    .message(&me, &id)
-                    .ok()
-                    .flatten()
-                    .map_or(Status::Sent, |r| r.status);
-                drop(guard);
-                OUTGOING.with_borrow_mut(|o| o.insert(ui, id));
-                IDS.with_borrow_mut(|x| x.insert(ui, (me, id)));
-                MEDIA.with_borrow_mut(|x| x.insert(ui, (me, id)));
-                set_status(s, &id, status);
-                Ok(())
-            }
-            Err(_) => {
-                drop(guard);
-                s.fail(chat, ui);
-                Err(super::problem("The voice message couldn't be sent."))
-            }
+        drop(guard);
+        let Ok(id) = r else {
+            s.fail(chat, ui);
+            return Err(super::problem("The voice message couldn't be sent."));
+        };
+        OUTGOING.with_borrow_mut(|o| o.insert(ui, id));
+        IDS.with_borrow_mut(|x| x.insert(ui, (me, id)));
+        MEDIA.with_borrow_mut(|x| x.insert(ui, (me, id)));
+        set_status(s, &id, Status::Sending);
+        // Uploaded and sent without holding app-core (D-0187).
+        let sent = finish_unlocked(id).await;
+        let status = {
+            let lock = core();
+            let guard = lock.lock().await;
+            guard
+                .as_ref()
+                .and_then(|m| m.store.message(&me, &id).ok().flatten())
+                .map(|row| row.status)
+        };
+        if let Some(status) = status {
+            set_status(s, &id, status);
+        }
+        match sent {
+            Ok(()) | Err(songbird_app_core::Error::Network) => Ok(()),
+            Err(_) => Err(super::problem("The voice message couldn't be sent.")),
         }
     });
 }

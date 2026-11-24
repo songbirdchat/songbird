@@ -199,6 +199,66 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0187 — Uploads and downloads without holding app-core; a group outbox
+
+- Date: 2026-11-24
+- Status: accepted by the agent on the owner's request (the next alpha step after D-0186)
+- Decided by: agent
+- Context: the app holds app-core behind one lock. A photo's upload ran inside it, so on a slow
+  link everything else waited for the upload: messages arriving, receipts, other sends,
+  downloads. Downloads held it the same way. Group messages had no outbox: one that met a
+  network failure was deleted and sent again as a new message, so if the server had taken it
+  (its answer lost) members saw it twice. Two more faults turned up: a message deleted while
+  it waited to upload was still sent at the next flush, and a group message's tick never moved
+  on screen (the app looked for it only in 1:1 chats).
+- Options considered: a lock per chat in the app (a large change to every call into
+  app-core, and uploads would still block their own chat) versus app-core doing its network
+  work in steps a host runs between short locked calls (chosen: the network part needs only
+  `Net`, which the app can make anywhere). For groups: resend the stored MLS message always
+  (a member who joined later can't read it) versus seal again every time (a lost answer would
+  reach members twice) versus resend as sealed while the epoch holds and seal again once it has
+  moved (chosen).
+- Decision:
+  1. **Uploads in steps** (`Messenger::prepare_files_in`, `prepare_group_files_in`,
+     `next_upload`, `UploadJob::upload`, `uploaded`, `finish_media`): stored first with no
+     network (D-0186), then each file is encrypted under the lock, uploaded without it, and
+     recorded under it; the send is the last short step. The app runs them in
+     `finish_unlocked`, one upload of a message at a time (a flush never starts a second), so
+     the photos of an album upload side by side. `send_files` and `flush_outbox` still do
+     everything in one call for hosts that don't need this.
+  2. **Downloads in steps** (`file_here`, `attachments::download`, `keep_file`), the same way.
+  3. **A group outbox** (store schema 10, `group_outbox`): the sealed MLS message, its epoch,
+     idempotency key and franking commitment, kept until the server answers. With no
+     connection the message waits as Sending and goes on the next flush with the same id;
+     while the group is in the same epoch it goes as sealed with the same key, so a message
+     the server took is kept once; once the epoch has moved it is sealed again for the current
+     epoch (same message id: members who had it drop the repeat by its id). Refused for good,
+     or the group left, it is Failed. Every group send goes through it (texts, replies,
+     reactions, edits, polls, photos).
+  4. **Deleting a waiting message ends its wait** (1:1 outbox, group outbox, photo uploads).
+  5. **Ticks in groups**: the app finds a group's messages when their status changes.
+  6. **Reads sent as POSTs go once more** on a dead connection, signed afresh (D-0186's rule
+     for GETs): device lists, identity keys, key and key-package fetches, a group's delivery
+     key, state and change log, community state, key transparency. Found on an iPhone:
+     creating a group failed when its delivery-key fetch hung. A key fetch tried twice uses
+     up one more key, which is refilled. Writes are never repeated.
+  7. **Development builds name a failing call** (its method and path without ids, and the
+     status or the problem) and why a group wasn't created or waiting messages didn't go.
+- Consequences: a view-once photo still uploads under the lock (one file, sent rarely). The
+  core is still one lock: a slow device-list fetch or send (bounded: 20 s and 15 s, D-0186)
+  still holds it while it runs.
+- Evidence: `tests/e2e`: `a_photo_uploads_while_the_core_does_other_work` (a message arrives
+  between steps; the receiver downloads in steps), `a_group_message_sent_offline_goes_later_once_with_its_id`
+  (the group moves to a new epoch while it waits; Carol, who joined in it, reads the message),
+  `a_group_message_whose_answer_was_lost_is_not_doubled`,
+  `a_message_deleted_while_waiting_is_never_sent`; all 30 A2 tests pass. On the iPhones (the
+  sender's side; the receiver's screen wasn't reachable by the test tools, its receipts were):
+  with new API connections held 20 s, two photos spun while a text sent after them was
+  delivered within 3 s; an album sent with the server unreachable went by itself, delivered,
+  once it was back; photos whose uploads ran out of time went once the link was normal. Groups
+  couldn't be tried on the phones: the LAN test server runs without the API's send stack
+  (Iggy), which group creation needs; the end-to-end tests run the real one.
+
 ## D-0186 — Photos sent together: albums that hold their shape, blurred stand-ins, loading spinners
 
 - Date: 2026-11-24

@@ -206,6 +206,39 @@ pub enum Received {
     Nothing,
 }
 
+/// One file of a pending photo or file message, encrypted and ready to upload without the
+/// `Messenger` (D-0187): from [`Messenger::next_upload`], recorded by [`Messenger::uploaded`].
+#[derive(Debug)]
+pub struct UploadJob {
+    id: [u8; 16],
+    index: usize,
+    pointer: schema::AttachmentPointer,
+    ciphertext: Vec<u8>,
+    fetches: usize,
+}
+
+impl UploadJob {
+    /// The message it belongs to.
+    #[must_use]
+    pub fn message(&self) -> [u8; 16] {
+        self.id
+    }
+
+    /// Uploads it through `net`: the stored object's id.
+    pub async fn upload<N: Net>(&self, net: &N) -> Result<[u8; 32]> {
+        crate::attachments::upload(net, &self.ciphertext, self.fetches).await
+    }
+}
+
+/// Where a message's file is ([`Messenger::file_here`]).
+#[derive(Debug)]
+pub enum FileAt {
+    /// On this device.
+    Here(Zeroizing<Vec<u8>>),
+    /// To download with this pointer.
+    Fetch(schema::AttachmentPointer),
+}
+
 /// The client core: identity, keys, sessions and the store, over a network.
 #[derive(Debug)]
 pub struct Messenger<N> {
@@ -841,6 +874,19 @@ impl<N: Net> Messenger<N> {
         self.send_files_in(to, files, text, None).await
     }
 
+    /// [`Self::send_files_in`]'s first half, with no network (D-0187): see
+    /// `store_files_with`.
+    pub fn prepare_files_in(
+        &mut self,
+        to: &[u8; 16],
+        files: Vec<(Vec<u8>, crate::attachments::FileMeta)>,
+        text: &str,
+        album: Option<crate::attachments::AlbumRef>,
+    ) -> Result<[u8; 16]> {
+        let timer = self.store.timer(to)?;
+        self.store_files_with(to, false, timer, files, text, album)
+    }
+
     /// [`Self::send_files`], as one item of an album (D-0186).
     pub async fn send_files_in(
         &mut self,
@@ -860,6 +906,31 @@ impl<N: Net> Messenger<N> {
     /// Sending, and goes on the next [`Self::flush_outbox`] with the same id: nothing is lost on
     /// a restart and a retry never makes a second message.
     pub(crate) async fn send_files_with(
+        &mut self,
+        chat: &[u8; 16],
+        is_group: bool,
+        timer: u32,
+        files: Vec<(Vec<u8>, crate::attachments::FileMeta)>,
+        text: &str,
+        album: Option<crate::attachments::AlbumRef>,
+    ) -> Result<[u8; 16]> {
+        let id = self.store_files_with(chat, is_group, timer, files, text, album)?;
+        match self.finish_media(&id).await {
+            // Offline: it waits (Sending) and goes on the next flush, with this id.
+            Ok(()) | Err(Error::Network) => Ok(id),
+            Err(e) => {
+                self.abandon_media(&id)?;
+                Err(e)
+            }
+        }
+    }
+
+    /// The first half of [`Self::send_files_with`], with no network: the message, its files and
+    /// its pending record are stored and its id answered. A host that must not hold this
+    /// `Messenger` while files upload (its other work would wait, D-0187) then uploads them
+    /// itself ([`Self::next_upload`], [`UploadJob::upload`], [`Self::uploaded`]) and sends with
+    /// [`Self::finish_media`].
+    pub(crate) fn store_files_with(
         &mut self,
         chat: &[u8; 16],
         is_group: bool,
@@ -935,89 +1006,110 @@ impl<N: Net> Messenger<N> {
         }
         self.store
             .pending_media_put(&id, chat, is_group, &bytes, &shown, sent_at)?;
-        match self.finish_media(&id).await {
-            // Offline: it waits (Sending) and goes on the next flush, with this id.
-            Ok(()) | Err(Error::Network) => Ok(id),
-            Err(e) => {
-                self.store.pending_media_done(&id)?;
-                self.store.advance(&me, &id, Status::Failed)?;
-                Err(e)
-            }
-        }
+        Ok(id)
+    }
+
+    /// Gives up on a pending photo or file message (an error other than the network): it is
+    /// Failed and waits no more.
+    pub fn abandon_media(&mut self, id: &[u8; 16]) -> Result<()> {
+        self.store.pending_media_done(id)?;
+        self.store
+            .advance(&self.local.account, id, Status::Failed)
+            .map(|_| ())
+    }
+
+    /// The next file of pending message `id` still to upload, encrypted and ready to go
+    /// without this `Messenger` (D-0187); `None` once every file is uploaded or nothing is
+    /// pending. The only network here is learning, once, how many devices will fetch it.
+    pub async fn next_upload(&mut self, id: &[u8; 16]) -> Result<Option<UploadJob>> {
+        let Some((chat, is_group, bytes, _)) = self.store.pending_media_get(id)? else {
+            return Ok(None);
+        };
+        let me = self.local.account;
+        let content = Content::decode(bytes.as_slice()).map_err(|_| Error::Malformed)?;
+        let Some(Body::Data(DataMessage {
+            kind: Some(data_message::Kind::Message(m)),
+            ..
+        })) = content.body.as_ref()
+        else {
+            return Err(Error::Malformed);
+        };
+        let Some((index, p)) = m
+            .attachments
+            .iter()
+            .enumerate()
+            .find(|(_, p)| p.object_id.is_empty())
+        else {
+            return Ok(None);
+        };
+        let fetches = if is_group {
+            self.group_devices(&chat)?.len().saturating_sub(1).max(1)
+        } else {
+            let theirs = self.devices_of(&chat, false).await?.len();
+            theirs + self.store.devices(&me)?.len().saturating_sub(1)
+        };
+        let idx = u32::try_from(index).map_err(|_| Error::Malformed)?;
+        let plain = self.store.file(&me, id, idx)?.ok_or(Error::Malformed)?;
+        let meta = crate::attachments::FileMeta {
+            content_type: p.content_type.clone(),
+            file_name: p.file_name.clone(),
+            width: p.width,
+            height: p.height,
+            duration_ms: p.duration_ms,
+            flags: p.flags,
+            waveform: p.waveform.clone(),
+            caption: p.caption.clone(),
+            blurhash: p.blurhash.clone(),
+        };
+        let (pointer, ciphertext) = crate::attachments::encrypt(&plain, &meta)?;
+        Ok(Some(UploadJob {
+            id: *id,
+            index,
+            pointer,
+            ciphertext,
+            fetches,
+        }))
+    }
+
+    /// Records an upload done by [`UploadJob::upload`]: the file's pointer, with its object, in
+    /// the pending message (kept, so it is never uploaded twice). Nothing happens if the message
+    /// was deleted or sent meanwhile.
+    pub fn uploaded(&mut self, job: UploadJob, object: [u8; 32]) -> Result<()> {
+        let Some((_, _, bytes, _)) = self.store.pending_media_get(&job.id)? else {
+            return Ok(());
+        };
+        let mut content = Content::decode(bytes.as_slice()).map_err(|_| Error::Malformed)?;
+        let Some(Body::Data(DataMessage {
+            kind: Some(data_message::Kind::Message(m)),
+            ..
+        })) = content.body.as_mut()
+        else {
+            return Err(Error::Malformed);
+        };
+        let Some(p) = m.attachments.get_mut(job.index) else {
+            return Err(Error::Malformed);
+        };
+        let mut fresh = job.pointer;
+        fresh.object_id = object.to_vec();
+        fresh.uploaded_at_ms = now_ms();
+        *p = fresh;
+        self.store
+            .pending_media_update(&job.id, &content.encode_to_vec())
     }
 
     /// Uploads what a pending photo or file message still needs (each upload kept as it is done,
     /// so none is done twice) and sends it with its own id: 1:1 through the outbox, to a group
     /// as one MLS message. Ends the pending record once the message is on its way.
-    pub(crate) async fn finish_media(&mut self, id: &[u8; 16]) -> Result<()> {
+    pub async fn finish_media(&mut self, id: &[u8; 16]) -> Result<()> {
+        while let Some(job) = self.next_upload(id).await? {
+            let object = job.upload(&self.net).await?;
+            self.uploaded(job, object)?;
+        }
         let Some((chat, is_group, bytes, preview)) = self.store.pending_media_get(id)? else {
             return Ok(());
         };
         let me = self.local.account;
-        let mut content = Content::decode(bytes.as_slice()).map_err(|_| Error::Malformed)?;
-        let count = match content.body.as_ref() {
-            Some(Body::Data(DataMessage {
-                kind: Some(data_message::Kind::Message(m)),
-                ..
-            })) => m.attachments.len(),
-            _ => return Err(Error::Malformed),
-        };
-        let mut fetches = None;
-        for i in 0..count {
-            let done = match content.body.as_ref() {
-                Some(Body::Data(DataMessage {
-                    kind: Some(data_message::Kind::Message(m)),
-                    ..
-                })) => m
-                    .attachments
-                    .get(i)
-                    .is_some_and(|p| !p.object_id.is_empty()),
-                _ => true,
-            };
-            if done {
-                continue;
-            }
-            let fetches = if let Some(f) = fetches {
-                f
-            } else {
-                let f = if is_group {
-                    self.group_devices(&chat)?.len().saturating_sub(1).max(1)
-                } else {
-                    let theirs = self.devices_of(&chat, false).await?.len();
-                    theirs + self.store.devices(&me)?.len().saturating_sub(1)
-                };
-                fetches = Some(f);
-                f
-            };
-            let idx = u32::try_from(i).map_err(|_| Error::Malformed)?;
-            let plain = self.store.file(&me, id, idx)?.ok_or(Error::Malformed)?;
-            let Some(Body::Data(DataMessage {
-                kind: Some(data_message::Kind::Message(m)),
-                ..
-            })) = content.body.as_mut()
-            else {
-                return Err(Error::Malformed);
-            };
-            let p = m.attachments.get_mut(i).ok_or(Error::Malformed)?;
-            let meta = crate::attachments::FileMeta {
-                content_type: p.content_type.clone(),
-                file_name: p.file_name.clone(),
-                width: p.width,
-                height: p.height,
-                duration_ms: p.duration_ms,
-                flags: p.flags,
-                waveform: p.waveform.clone(),
-                caption: p.caption.clone(),
-                blurhash: p.blurhash.clone(),
-            };
-            let (mut fresh, ct) = crate::attachments::encrypt(&plain, &meta)?;
-            let object = crate::attachments::upload(&self.net, &ct, fetches).await?;
-            fresh.object_id = object.to_vec();
-            fresh.uploaded_at_ms = now_ms();
-            *p = fresh;
-            self.store
-                .pending_media_update(id, &content.encode_to_vec())?;
-        }
+        let content = Content::decode(bytes.as_slice()).map_err(|_| Error::Malformed)?;
         let bytes = content.encode_to_vec();
         self.store.set_content(&me, id, &bytes)?;
         if is_group {
@@ -1043,21 +1135,44 @@ impl<N: Net> Messenger<N> {
         id: &[u8; 16],
         idx: u32,
     ) -> Result<Zeroizing<Vec<u8>>> {
+        match self.file_here(author, id, idx)? {
+            FileAt::Here(b) => Ok(b),
+            FileAt::Fetch(pointer) => {
+                let bytes = crate::attachments::download(&self.net, &pointer).await?;
+                self.keep_file(author, id, idx, &bytes)?;
+                Ok(bytes)
+            }
+        }
+    }
+
+    /// The first half of [`Self::file`], with no network (D-0187): the file if this device has
+    /// it, else the pointer to download it with, without this `Messenger`
+    /// ([`crate::attachments::download`]), and keep with [`Self::keep_file`].
+    pub fn file_here(&mut self, author: &[u8; 16], id: &[u8; 16], idx: u32) -> Result<FileAt> {
         // A view-once file, once shown, is gone for good.
         if self.store.viewed(author, id)? {
             return Err(Error::Malformed);
         }
         if let Some(b) = self.store.file(author, id, idx)? {
-            return Ok(b);
+            return Ok(FileAt::Here(b));
         }
         let row = self.store.message(author, id)?.ok_or(Error::Malformed)?;
-        let pointer = attachments_of(&row.content)
+        attachments_of(&row.content)
             .into_iter()
             .nth(usize::try_from(idx).map_err(|_| Error::Malformed)?)
-            .ok_or(Error::Malformed)?;
-        let bytes = crate::attachments::download(&self.net, &pointer).await?;
-        self.store.put_file(author, id, idx, &bytes)?;
-        Ok(bytes)
+            .map(FileAt::Fetch)
+            .ok_or(Error::Malformed)
+    }
+
+    /// Keeps a downloaded file (verified and decrypted by [`crate::attachments::download`]).
+    pub fn keep_file(
+        &mut self,
+        author: &[u8; 16],
+        id: &[u8; 16],
+        idx: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.store.put_file(author, id, idx, bytes)
     }
 
     /// Sends an event about an earlier message (a reaction, an edit, a delete): franked like any
@@ -1343,18 +1458,20 @@ impl<N: Net> Messenger<N> {
                 Ok(()) => {}
                 // Still no connection: the rest waits too.
                 Err(Error::Network) => return Err(Error::Network),
-                Err(_) => {
-                    self.store.pending_media_done(&id)?;
-                    self.store
-                        .advance(&self.local.account, &id, Status::Failed)?;
-                }
+                Err(_) => self.abandon_media(&id)?,
             }
         }
+        self.flush_queued().await
+    }
+
+    /// [`Self::flush_outbox`] without the photos still to upload (a host uploads those itself,
+    /// without holding this `Messenger`, D-0187): the 1:1 outbox, then the group outbox.
+    pub async fn flush_queued(&mut self) -> Result<()> {
         for (idem, chat, id, bytes) in self.store.outbox()? {
             let content = Content::decode(bytes.as_slice()).map_err(|_| Error::Malformed)?;
             self.deliver(idem, &chat, &id, &content).await?;
         }
-        Ok(())
+        self.flush_group_outbox().await
     }
 
     async fn deliver(
