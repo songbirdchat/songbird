@@ -1399,6 +1399,7 @@ mod tests {
             pinned: false,
             forwarded: false,
             receipts: vec![],
+            album: None,
         }
     }
 

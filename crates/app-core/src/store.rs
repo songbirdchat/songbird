@@ -62,7 +62,7 @@ fn viewed_key(author: &[u8; 16], id: &[u8; 16]) -> String {
 }
 
 /// The schema version this code writes.
-pub const SCHEMA: i64 = 8;
+pub const SCHEMA: i64 = 9;
 
 /// Outgoing message status, as the UI shows it (`crates/content`'s levels, plus the local ones).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -193,6 +193,10 @@ pub type VoteHead = ([u8; 16], u64);
 pub type VoteRow = ([u8; 16], u64, Vec<u32>);
 /// An outbox entry: idempotency key, chat, message ID, content.
 pub type OutboxEntry = ([u8; 16], [u8; 16], [u8; 16], Vec<u8>);
+
+/// A pending photo or file message (D-0186): its chat, whether that is a group, its content and
+/// its preview.
+pub type PendingMedia = ([u8; 16], bool, Vec<u8>, String);
 
 /// The store.
 #[derive(Debug)]
@@ -387,6 +391,19 @@ impl Store {
                  UPDATE receipts SET read_ms = ms WHERE level = 3;
                  UPDATE receipts SET played_ms = ms WHERE level = 4;
                  PRAGMA user_version = 8;",
+            ))?;
+            db(tx.commit())?;
+        }
+        if v < 9 {
+            // Photo and file messages written but not yet sent (D-0186): their content before
+            // the uploads (pointers filled in as each upload is done), so they survive a restart
+            // and go with their own message id once there is a connection.
+            let tx = db(self.db.transaction())?;
+            db(tx.execute_batch(
+                "CREATE TABLE pending_media (message BLOB PRIMARY KEY, chat BLOB NOT NULL,
+                   is_group INTEGER NOT NULL, created_ms INTEGER NOT NULL, content BLOB NOT NULL,
+                   preview TEXT NOT NULL);
+                 PRAGMA user_version = 9;",
             ))?;
             db(tx.commit())?;
         }
@@ -1693,6 +1710,79 @@ impl Store {
         .collect()
     }
 
+    /// Keeps a photo or file message until its uploads are done and it is sent (D-0186).
+    pub fn pending_media_put(
+        &self,
+        message: &[u8; 16],
+        chat: &[u8; 16],
+        is_group: bool,
+        content: &[u8],
+        preview: &str,
+        now_ms: u64,
+    ) -> Result<()> {
+        db(self.db.execute(
+            "INSERT OR REPLACE INTO pending_media (message, chat, is_group, created_ms, content, preview)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![&message[..], &chat[..], i64::from(is_group), sql_ms(now_ms), content, preview],
+        ))
+        .map(|_| ())
+    }
+
+    /// A pending photo or file message: (chat, in a group, content, preview).
+    pub fn pending_media_get(&self, message: &[u8; 16]) -> Result<Option<PendingMedia>> {
+        let mut st = db(self.db.prepare(
+            "SELECT chat, is_group, content, preview FROM pending_media WHERE message = ?1",
+        ))?;
+        let mut rows = db(st.query([&message[..]]))?;
+        let Some(r) = db(rows.next())? else {
+            return Ok(None);
+        };
+        let chat: Vec<u8> = db(r.get(0))?;
+        let group: i64 = db(r.get(1))?;
+        Ok(Some((
+            arr16(&chat)?,
+            group != 0,
+            db(r.get(2))?,
+            db(r.get(3))?,
+        )))
+    }
+
+    /// The pending photo and file messages, oldest first.
+    pub fn pending_media(&self) -> Result<Vec<[u8; 16]>> {
+        let mut st = db(self
+            .db
+            .prepare("SELECT message FROM pending_media ORDER BY created_ms"))?;
+        let rows = db(st.query_map([], |r| r.get::<_, Vec<u8>>(0)))?;
+        rows.map(|r| arr16(&db(r)?)).collect()
+    }
+
+    /// Keeps a pending message's progress: its content with the uploads done so far.
+    pub fn pending_media_update(&self, message: &[u8; 16], content: &[u8]) -> Result<()> {
+        db(self.db.execute(
+            "UPDATE pending_media SET content = ?2 WHERE message = ?1",
+            params![&message[..], content],
+        ))
+        .map(|_| ())
+    }
+
+    /// Ends a pending message (sent, moved to the outbox, or given up).
+    pub fn pending_media_done(&self, message: &[u8; 16]) -> Result<()> {
+        db(self.db.execute(
+            "DELETE FROM pending_media WHERE message = ?1",
+            [&message[..]],
+        ))
+        .map(|_| ())
+    }
+
+    /// Replaces a stored message's content (a pending photo message, once its uploads are done).
+    pub fn set_content(&self, author: &[u8; 16], id: &[u8; 16], content: &[u8]) -> Result<()> {
+        db(self.db.execute(
+            "UPDATE messages SET content = ?3 WHERE author = ?1 AND id = ?2",
+            params![&author[..], &id[..], content],
+        ))
+        .map(|_| ())
+    }
+
     /// Removes an outbox entry (accepted, or given up).
     pub fn outbox_done(&self, idem: &[u8; 16]) -> Result<()> {
         db(self
@@ -1783,6 +1873,7 @@ mod tests {
              ALTER TABLE receipts DROP COLUMN read_ms;
              ALTER TABLE receipts DROP COLUMN played_ms;
              INSERT INTO receipts (author, id, account, level, ms) VALUES (x'01', x'02', x'03', 3, 77);
+             DROP TABLE pending_media;
              PRAGMA user_version = 7;",
         )
         .unwrap();

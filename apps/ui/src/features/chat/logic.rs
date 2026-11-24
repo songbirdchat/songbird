@@ -18,6 +18,166 @@ const GROUP_GAP: i64 = 10;
 /// trickles through the day had a label between nearly every run.
 pub const TIME_GAP: i64 = 60;
 
+/// Photos and videos sent together are drawn as one album (WhatsApp's rule): at least this many
+/// in a row from one sender, each within [`ALBUM_GAP`] of the one before, none captioned or
+/// quoting. Each stays its own message (receipts, reactions, deletion); only the list draws them
+/// together.
+pub const ALBUM_MIN: usize = 4;
+
+/// At most this long (minutes) between two of an album's items.
+const ALBUM_GAP: i64 = 1;
+
+fn album_item(m: &Message) -> bool {
+    m.reply_to.is_none()
+        && match &m.body {
+            Body::Image { caption, .. } | Body::Video { caption, .. } => caption.is_empty(),
+            _ => false,
+        }
+}
+
+fn joins_album(a: &Message, b: &Message) -> bool {
+    // Messages that say which album they are in are grouped by that (rows), never by time.
+    a.album.is_none()
+        && b.album.is_none()
+        && album_item(a)
+        && album_item(b)
+        && a.from == b.from
+        && a.forwarded == b.forwarded
+        && day_of(a.at) == day_of(b.at)
+        && (b.at - a.at).abs() <= ALBUM_GAP
+}
+
+/// How long (minutes) an incoming album keeps places for items still on their way: past it, an
+/// item that never came (deleted on this device, or never sent) leaves no place behind.
+pub const ALBUM_WAIT: i64 = 5;
+
+/// One row of the message list: a message on its own, or an album drawn at its first item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    /// The message the row stands at: an album's first item in the chat.
+    pub at: usize,
+    /// An album's items here, in album order; empty for a message on its own.
+    pub items: Vec<usize>,
+    /// The album's places: its items, and those still on their way (0 on its own).
+    pub count: u32,
+}
+
+impl Row {
+    fn single(at: usize) -> Self {
+        Self {
+            at,
+            items: Vec::new(),
+            count: 0,
+        }
+    }
+}
+
+/// The list's rows for the chat's messages `v` (oldest first) at `now`. Items that say which
+/// album they are in (D-0186) make one row at the first of them, in album order, whatever order
+/// they arrived in; an album of fewer than [`ALBUM_MIN`] stays as single messages (as
+/// WhatsApp). Older messages without an album fall back to [`album_span`].
+pub fn rows(v: &[Message], now: i64) -> Vec<Row> {
+    use std::collections::HashMap;
+    // Each tagged album's items, by (sender, album id).
+    let mut albums: HashMap<(Option<u64>, [u8; 16]), Vec<usize>> = HashMap::new();
+    // Every place an album's messages fill, deleted ones too: a deleted item leaves the album
+    // without leaving a place to wait for.
+    let mut seen: HashMap<(Option<u64>, [u8; 16]), std::collections::HashSet<u32>> = HashMap::new();
+    for (i, m) in v.iter().enumerate() {
+        let Some(a) = m.album else { continue };
+        seen.entry((m.from, a.id)).or_default().insert(a.index);
+        if a.count >= ALBUM_MIN as u32 && matches!(m.body, Body::Image { .. } | Body::Video { .. })
+        {
+            albums.entry((m.from, a.id)).or_default().push(i);
+        }
+    }
+    let mut out = Vec::with_capacity(v.len());
+    let mut i = 0;
+    while let Some(m) = v.get(i) {
+        // Only the album's photos and videos: a deleted item keeps its own row.
+        let tagged = m
+            .album
+            .and_then(|a| albums.get(&(m.from, a.id)))
+            .filter(|members| members.contains(&i));
+        if let Some(members) = tagged {
+            if members.first() == Some(&i) {
+                let mut items = members.clone();
+                items.sort_by_key(|&k| v.get(k).and_then(|x| x.album).map_or(0, |a| a.index));
+                items.dedup_by_key(|k| v.get(*k).and_then(|x| x.album).map_or(0, |a| a.index));
+                let declared = m.album.map_or(0, |a| a.count);
+                let present = items.len() as u32;
+                let filled = m
+                    .album
+                    .and_then(|a| seen.get(&(m.from, a.id)))
+                    .map_or(present, |s| s.len() as u32);
+                let newest = items
+                    .iter()
+                    .filter_map(|&k| v.get(k))
+                    .map(|x| x.at)
+                    .max()
+                    .unwrap_or(m.at);
+                let waiting = !m.mine() && now - newest <= ALBUM_WAIT;
+                let count = if waiting {
+                    present + declared.saturating_sub(filled)
+                } else {
+                    present
+                };
+                if count >= ALBUM_MIN as u32 {
+                    out.push(Row {
+                        at: i,
+                        items,
+                        count,
+                    });
+                } else {
+                    out.extend(items.into_iter().map(Row::single));
+                }
+            }
+            i += 1;
+            continue;
+        }
+        match album_span(v, i) {
+            Some((a, b)) if a == i => {
+                out.push(Row {
+                    at: i,
+                    items: (a..=b).collect(),
+                    count: (b - a + 1) as u32,
+                });
+                i = b + 1;
+            }
+            _ => {
+                out.push(Row::single(i));
+                i += 1;
+            }
+        }
+    }
+    // Rows go in the order of their first message, so an album never moves once drawn.
+    out.sort_by_key(|r| r.at);
+    out
+}
+
+/// The album the message at `index` belongs to, as its first and last index; `None` for a
+/// message drawn on its own.
+pub fn album_span(v: &[Message], index: usize) -> Option<(usize, usize)> {
+    if !album_item(v.get(index)?) {
+        return None;
+    }
+    let mut start = index;
+    while let (Some(p), Some(c)) = (start.checked_sub(1).and_then(|i| v.get(i)), v.get(start)) {
+        if !joins_album(p, c) {
+            break;
+        }
+        start -= 1;
+    }
+    let mut end = index;
+    while let (Some(c), Some(n)) = (v.get(end), v.get(end + 1)) {
+        if !joins_album(c, n) {
+            break;
+        }
+        end += 1;
+    }
+    (end - start + 1 >= ALBUM_MIN).then_some((start, end))
+}
+
 /// What a row shows around its message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Place {
@@ -367,6 +527,7 @@ mod tests {
             pinned: false,
             forwarded: false,
             receipts: Vec::new(),
+            album: None,
         }
     }
 
@@ -585,5 +746,161 @@ mod tests {
         assert_eq!(next_voice(&list, 0), Some(1));
         assert_eq!(next_voice(&list, 1), None);
         assert_eq!(next_voice(&list, 2), None);
+    }
+
+    fn tagged(id: u64, from: Option<u64>, at: i64, album: u8, index: u32, count: u32) -> Message {
+        let mut m = photo(id, from, at);
+        m.album = Some(crate::store::AlbumTag {
+            id: [album; 16],
+            index,
+            count,
+        });
+        m
+    }
+
+    fn shape(rows: &[Row]) -> Vec<(usize, Vec<usize>, u32)> {
+        rows.iter()
+            .map(|r| (r.at, r.items.clone(), r.count))
+            .collect()
+    }
+
+    #[test]
+    fn an_album_is_one_row_from_its_first_item() {
+        let v: Vec<Message> = (0..5)
+            .map(|i| tagged(i, Some(2), 0, 1, i as u32, 5))
+            .collect();
+        assert_eq!(shape(&rows(&v, 0)), vec![(0, vec![0, 1, 2, 3, 4], 5)]);
+    }
+
+    #[test]
+    fn items_out_of_order_are_put_in_album_order_and_the_rest_wait() {
+        // Places 2, 0 and 4 of 5 arrived (in that order); 1 and 3 are on their way.
+        let v = vec![
+            tagged(10, Some(2), 0, 1, 2, 5),
+            tagged(11, Some(2), 0, 1, 0, 5),
+            tagged(12, Some(2), 0, 1, 4, 5),
+        ];
+        assert_eq!(shape(&rows(&v, 1)), vec![(0, vec![1, 0, 2], 5)]);
+        // Long after, nothing is waited for: three photos are not an album.
+        assert_eq!(
+            shape(&rows(&v, 60)),
+            vec![(0, vec![], 0), (1, vec![], 0), (2, vec![], 0)]
+        );
+    }
+
+    #[test]
+    fn the_users_own_album_never_waits() {
+        let v: Vec<Message> = [0, 1, 2, 4]
+            .iter()
+            .enumerate()
+            .map(|(k, &i)| tagged(k as u64, None, 0, 1, i, 5))
+            .collect();
+        assert_eq!(shape(&rows(&v, 0)), vec![(0, vec![0, 1, 2, 3], 4)]);
+    }
+
+    #[test]
+    fn small_albums_stay_single_photos() {
+        let v: Vec<Message> = (0..3)
+            .map(|i| tagged(i, Some(2), 0, 1, i as u32, 3))
+            .collect();
+        assert_eq!(
+            shape(&rows(&v, 0)),
+            vec![(0, vec![], 0), (1, vec![], 0), (2, vec![], 0)]
+        );
+    }
+
+    #[test]
+    fn a_message_in_between_keeps_its_row_and_the_album_stays_whole() {
+        let mut v: Vec<Message> = (0..2)
+            .map(|i| tagged(i, Some(2), 0, 1, i as u32, 4))
+            .collect();
+        v.push(text(9, None, 0));
+        v.extend((2..4).map(|i| tagged(i, Some(2), 0, 1, i as u32, 4)));
+        assert_eq!(
+            shape(&rows(&v, 0)),
+            vec![(0, vec![0, 1, 3, 4], 4), (2, vec![], 0)]
+        );
+    }
+
+    #[test]
+    fn a_deleted_item_leaves_the_album_without_a_place_to_wait_for() {
+        let mut v: Vec<Message> = (0..5)
+            .map(|i| tagged(i, Some(2), 0, 1, i as u32, 5))
+            .collect();
+        v[2].body = Body::Deleted;
+        assert_eq!(
+            shape(&rows(&v, 0)),
+            vec![(0, vec![0, 1, 3, 4], 4), (2, vec![], 0)]
+        );
+    }
+
+    #[test]
+    fn albums_are_told_apart_by_sender_and_id_and_duplicates_count_once() {
+        let mut v: Vec<Message> = (0..4)
+            .map(|i| tagged(i, Some(2), 0, 1, i as u32, 4))
+            .collect();
+        v.extend((0..4).map(|i| tagged(10 + i, Some(3), 0, 1, i as u32, 4)));
+        v.push(tagged(20, Some(2), 0, 1, 3, 4));
+        let r = shape(&rows(&v, 0));
+        assert_eq!(r[0], (0, vec![0, 1, 2, 3], 4));
+        assert_eq!(r[1], (4, vec![4, 5, 6, 7], 4));
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn untagged_photos_still_group_by_time() {
+        let v: Vec<Message> = (0..4).map(|i| photo(i, Some(2), 0)).collect();
+        assert_eq!(shape(&rows(&v, 0)), vec![(0, vec![0, 1, 2, 3], 4)]);
+    }
+
+    fn photo(id: u64, from: Option<u64>, at: i64) -> Message {
+        msg(
+            id,
+            from,
+            at,
+            Body::Image {
+                caption: String::new(),
+                alt: String::new(),
+                w: 4,
+                h: 3,
+                hd: false,
+            },
+        )
+    }
+
+    #[test]
+    fn four_photos_sent_together_make_an_album() {
+        let v: Vec<Message> = (0..5).map(|i| photo(i, Some(2), -10)).collect();
+        for i in 0..5 {
+            assert_eq!(album_span(&v, i as usize), Some((0, 4)));
+        }
+        // Three are not enough.
+        assert_eq!(album_span(&v[..3], 1), None);
+    }
+
+    #[test]
+    fn albums_break_on_sender_pause_caption_quote_and_other_bodies() {
+        let mut v: Vec<Message> = (0..4).map(|i| photo(i, Some(2), -10)).collect();
+        v.push(photo(4, None, -10)); // the user's own, after theirs
+        v.extend((5..9).map(|i| photo(i, None, -10)));
+        assert_eq!(album_span(&v, 0), Some((0, 3)));
+        assert_eq!(album_span(&v, 4), Some((4, 8)));
+        // A pause of more than a minute splits.
+        let mut w: Vec<Message> = (0..4)
+            .map(|i| photo(i, Some(2), -10 + i as i64 * 2))
+            .collect();
+        assert_eq!(album_span(&w, 1), None);
+        // A caption or a quote takes a photo out; so does a text in between.
+        w = (0..5).map(|i| photo(i, Some(2), -10)).collect();
+        if let Body::Image { caption, .. } = &mut w[2].body {
+            *caption = "look".into();
+        }
+        assert_eq!(album_span(&w, 0), None);
+        w = (0..5).map(|i| photo(i, Some(2), -10)).collect();
+        w[2].reply_to = Some(1);
+        assert_eq!(album_span(&w, 4), None);
+        w = (0..5).map(|i| photo(i, Some(2), -10)).collect();
+        w.insert(2, text(9, Some(2), -10));
+        assert_eq!(album_span(&w, 0), None);
     }
 }

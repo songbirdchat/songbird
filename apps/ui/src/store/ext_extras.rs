@@ -543,8 +543,9 @@ impl Store {
         };
         let text = format!("[{topic}] {message}");
         crate::backend::run(async move {
-            let r = crate::backend::plans::open_ticket(kind, &text, logs.as_deref(), attach_account)
-                .await;
+            let r =
+                crate::backend::plans::open_ticket(kind, &text, logs.as_deref(), attach_account)
+                    .await;
             if r.is_ok() {
                 extras().update(|e| e.support_sent += 1);
             }

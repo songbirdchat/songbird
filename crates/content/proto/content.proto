@@ -148,6 +148,15 @@ message Message {
   EventCreate event = 9;
   bool view_once = 10;                        // attachments are shown once, then deleted
   repeated LinkPreview previews = 11;         // at most 4
+  Album album = 12;                           // photos and videos sent together (§5.4)
+}
+
+// One of the photos and videos sent together, each its own message (D-0186): the receiver
+// draws them as one album from the first that arrives.
+message Album {
+  bytes id = 1;       // 16 random bytes, the same for every item of the album
+  uint32 index = 2;   // this item's place, from 0
+  uint32 count = 3;   // how many the album has, 2 to 100
 }
 
 message Text {

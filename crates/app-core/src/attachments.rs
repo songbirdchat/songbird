@@ -42,6 +42,37 @@ pub struct FileMeta {
     pub waveform: Vec<u8>,
     /// Caption.
     pub caption: String,
+    /// The photo's blurred stand-in ([`crate::blurhash`]), at most 128 characters; empty for
+    /// none.
+    pub blurhash: String,
+}
+
+/// One of the photos and videos sent together (D-0186): the album's id, this item's place
+/// from 0, and how many the album has (2 to 100).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlbumRef {
+    /// 16 random bytes, the same for every item.
+    pub id: [u8; 16],
+    /// This item's place, from 0.
+    pub index: u32,
+    /// How many items the album has.
+    pub count: u32,
+}
+
+impl AlbumRef {
+    fn schema(self) -> songbird_content::schema::Album {
+        songbird_content::schema::Album {
+            id: self.id.to_vec(),
+            index: self.index,
+            count: self.count,
+        }
+    }
+}
+
+/// The album fields of a message about to go: none for a single photo.
+#[must_use]
+pub fn album_field(album: Option<AlbumRef>) -> Option<songbird_content::schema::Album> {
+    album.map(AlbumRef::schema)
 }
 
 fn hex(b: &[u8]) -> String {
@@ -79,7 +110,12 @@ pub fn encrypt(plaintext: &[u8], meta: &FileMeta) -> Result<(AttachmentPointer, 
         file_name: meta.file_name.clone(),
         width: meta.width,
         height: meta.height,
-        blurhash: String::new(),
+        // A longer one than the schema allows is left out, not sent (it would be refused).
+        blurhash: if meta.blurhash.len() <= 128 {
+            meta.blurhash.clone()
+        } else {
+            String::new()
+        },
         duration_ms: meta.duration_ms,
         flags: meta.flags,
         waveform: meta.waveform.clone(),

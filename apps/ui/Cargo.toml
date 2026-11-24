@@ -12,6 +12,12 @@ nsh-base = "0.6.0"
 env_logger = "0.11"
 # Theme variants (light, dark, high contrast) are built from theme.json at run time.
 serde_json = "1"
+# JPEG decoding for a sent photo's blurred stand-in (D-0186). Both are already in the build
+# through NSH (resvg); no new crate.
+zune-core = "0.5.3"
+zune-jpeg = "0.5.15"
+# A received photo's blurred stand-in, drawn as a PNG (D-0186); in the build through NSH.
+png = "0.18.1"
 serde = { version = "1", features = ["derive"] }
 log = "0.4"
 # The real backend (src/backend): the server's own crates, so wire formats

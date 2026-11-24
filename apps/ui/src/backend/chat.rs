@@ -57,6 +57,12 @@ thread_local! {
     static IDS: RefCell<HashMap<MsgId, ([u8; 16], [u8; 16])>> = RefCell::new(HashMap::new());
     /// Real media messages: UI message → (author, app-core message ID).
     static MEDIA: RefCell<HashMap<MsgId, ([u8; 16], [u8; 16])>> = RefCell::new(HashMap::new());
+    /// Photos and files on their way, kept until they are sent: Retry and the resend after a
+    /// reconnect send these bytes again (a failed photo used to be unsendable).
+    static PENDING: RefCell<HashMap<MsgId, Pending>> = RefCell::new(HashMap::new());
+    /// Messages whose sending failed for want of a connection: sent again, by themselves, once
+    /// it is back (what "sent when you're back online" promises).
+    static RESEND: RefCell<Vec<(ChatId, MsgId)>> = const { RefCell::new(Vec::new()) };
     /// Accounts whose profile was fetched this run.
     static PROFILED: RefCell<std::collections::HashSet<[u8; 16]>> = RefCell::new(std::collections::HashSet::new());
 }
@@ -131,6 +137,99 @@ thread_local! {
     static SWEEPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Real groups by UI chat ID (D-0146).
     static GROUPS: RefCell<HashMap<ChatId, [u8; 16]>> = RefCell::new(HashMap::new());
+}
+
+/// Sends again a photo or file that failed, from this device's copy in the store (after a
+/// restart the app keeps no bytes of its own): its kind, name, size, stand-in and album place
+/// come from the failed message, which is then removed.
+fn retry_stored(s: Store, chat: ChatId, ui: MsgId, author: [u8; 16], id: [u8; 16]) {
+    super::run(async move {
+        let found = {
+            let lock = core();
+            let mut guard = lock.lock().await;
+            let m = guard
+                .as_mut()
+                .ok_or_else(|| super::problem("Not connected yet."))?;
+            let row = m.store.message(&author, &id).ok().flatten();
+            let bytes = m.store.file(&author, &id, 0).ok().flatten();
+            let found = row.zip(bytes).and_then(|(row, bytes)| {
+                let p = songbird_app_core::messenger::attachments_of(&row.content)
+                    .into_iter()
+                    .next()?;
+                let meta = songbird_app_core::attachments::FileMeta {
+                    content_type: p.content_type,
+                    file_name: p.file_name,
+                    width: p.width,
+                    height: p.height,
+                    duration_ms: p.duration_ms,
+                    flags: p.flags,
+                    waveform: p.waveform,
+                    caption: p.caption,
+                    blurhash: p.blurhash,
+                };
+                let album = songbird_app_core::messenger::album_in(&row.content);
+                Some(Pending {
+                    bytes: bytes.to_vec(),
+                    meta,
+                    album,
+                })
+            });
+            if found.is_some() {
+                let _ = m.delete_for_me(&author, &id);
+            }
+            found
+        };
+        let Some(p) = found else {
+            s.fail(chat, ui);
+            return Err(super::problem("This photo is no longer on this device."));
+        };
+        MEDIA.with_borrow_mut(|m| m.remove(&ui));
+        IDS.with_borrow_mut(|m| m.remove(&ui));
+        PENDING.with_borrow_mut(|m| m.insert(ui, p.clone()));
+        send_media(s, chat, ui, p);
+        Ok(())
+    });
+}
+
+/// A photo or file being sent: its bytes, what it is, and its album place.
+#[derive(Clone)]
+struct Pending {
+    bytes: Vec<u8>,
+    meta: songbird_app_core::attachments::FileMeta,
+    album: Option<songbird_app_core::attachments::AlbumRef>,
+}
+
+/// Sends again what failed for want of a connection (called once connected): each message the
+/// user hasn't retried or deleted meanwhile, in the order it was written.
+pub fn resend_waiting() {
+    // Photos and messages app-core keeps go at once, not at the next sweep.
+    sweep_expired();
+    let Some(s) = crate::store::try_store() else {
+        return;
+    };
+    for (chat, id) in RESEND.with_borrow_mut(std::mem::take) {
+        if s.message(chat, id)
+            .is_some_and(|m| m.status == crate::ui::Tick::Failed)
+        {
+            s.retry(chat, id);
+        }
+    }
+    // Photos that couldn't download try again quietly, as sends do: a photo opened offline
+    // shouldn't need a tap once the connection is back (one try a reconnect, so one that is
+    // gone for good costs nothing more).
+    let failed =
+        global::<FailedMedia>().with_untracked(|f| f.0.iter().copied().collect::<Vec<_>>());
+    for msg in failed {
+        load_photo(msg);
+    }
+}
+
+fn resend_later(chat: ChatId, id: MsgId) {
+    RESEND.with_borrow_mut(|r| {
+        if !r.contains(&(chat, id)) {
+            r.push((chat, id));
+        }
+    });
 }
 
 /// Whether `chat` is a real chat (1:1 or group) app-core owns.
@@ -300,11 +399,7 @@ pub fn ensure_link(s: Store, chat: ChatId, fresh: bool) {
                     })?
             }
         };
-        let expires_ms = m
-            .group_link_limits(&gid)
-            .ok()
-            .flatten()
-            .map_or(0, |l| l.0);
+        let expires_ms = m.group_link_limits(&gid).ok().flatten().map_or(0, |l| l.0);
         drop(guard);
         s.edit_chat(chat, |c| c.invite_link = url);
         s.set_invite_settings(chat, |x| {
@@ -683,7 +778,9 @@ pub fn create_group(s: Store, title: String, members: Vec<ContactId>) -> ChatId 
                 // (D-0183: a failed creation left a chat whose every message failed).
                 GROUPS.with_borrow_mut(|g| g.remove(&chat));
                 s.delete_chat(chat);
-                crate::ui::toast("The group couldn't be created. Check your connection and try again.");
+                crate::ui::toast(
+                    "The group couldn't be created. Check your connection and try again.",
+                );
             }
         });
     });
@@ -698,6 +795,22 @@ pub(super) fn account_of(chat: ChatId) -> Option<[u8; 16]> {
 /// delivery client.
 #[derive(Debug)]
 pub struct AppNet;
+
+/// How long a send waits for the server's answer before the connection is taken for dead.
+const SEND_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// `send`, or a network failure when the server hasn't answered within [`SEND_DEADLINE`]: then
+/// the connection is made again (a connection that died without a word would otherwise hold
+/// the send until the client's 90 s idle limit). Nothing is lost or doubled: what wasn't
+/// confirmed stays queued (the outbox, pending photos) and goes again with the same key or id.
+async fn answered<T>(
+    send: impl std::future::Future<Output = songbird_app_core::Result<T>>,
+) -> songbird_app_core::Result<T> {
+    super::within(SEND_DEADLINE, send).await.unwrap_or_else(|| {
+        super::ws::connect();
+        Err(songbird_app_core::Error::Network)
+    })
+}
 
 impl Net for AppNet {
     async fn api(
@@ -749,17 +862,20 @@ impl Net for AppNet {
     ) -> songbird_app_core::Result<SendStatus> {
         let client = super::ws::client().ok_or(songbird_app_core::Error::Network)?;
         super::usage::count(super::usage::Lane::Messages, body.len() + 40, 0);
-        client
-            .send_with(
-                idempotency_key,
-                hints,
-                songbird_proto::frame::SendPayload::Shared {
-                    devices: Vec::new(),
-                    body: body.into(),
-                },
-            )
-            .await
-            .map_err(|_| songbird_app_core::Error::Network)
+        answered(async move {
+            client
+                .send_with(
+                    idempotency_key,
+                    hints,
+                    songbird_proto::frame::SendPayload::Shared {
+                        devices: Vec::new(),
+                        body: body.into(),
+                    },
+                )
+                .await
+                .map_err(|_| songbird_app_core::Error::Network)
+        })
+        .await
     }
 
     async fn ephemeral(
@@ -804,10 +920,13 @@ impl Net for AppNet {
                 envelope: e.into(),
             })
             .collect();
-        client
-            .send_hinted(idempotency_key, hints, r)
-            .await
-            .map_err(|_| songbird_app_core::Error::Network)
+        answered(async move {
+            client
+                .send_hinted(idempotency_key, hints, r)
+                .await
+                .map_err(|_| songbird_app_core::Error::Network)
+        })
+        .await
     }
 }
 
@@ -1140,7 +1259,18 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
         && songbird_app_core::packs::sticker_in(&row.content).is_some_and(|(_, _, img)| img));
     if media {
         MEDIA.with_borrow_mut(|m| m.insert(id, (row.author, row.id)));
+        // The photo's blurred stand-in, drawn until the photo itself is here (D-0186).
+        if !mine && let Some(p) = songbird_app_core::messenger::attachments_of(&row.content).first()
+        {
+            keep_blur(id, &p.blurhash);
+        }
     }
+    let album =
+        songbird_app_core::messenger::album_in(&row.content).map(|a| crate::store::AlbumTag {
+            id: a.id,
+            index: a.index,
+            count: a.count,
+        });
     s.messages.update(|m| {
         m.entry(chat).or_default().push(crate::store::Message {
             id,
@@ -1158,6 +1288,7 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
             pinned: false,
             forwarded: false,
             receipts: Vec::new(),
+            album,
         });
     });
     // Auto-download (Settings → Storage and data): what the user allowed,
@@ -1489,6 +1620,55 @@ pub fn photo_failed(msg: MsgId) -> bool {
     global::<FailedMedia>().with(|f| f.0.contains(&msg))
 }
 
+/// Media messages whose files are downloading now (a spinner over the photo, D-0186).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LoadingMedia(pub std::collections::HashSet<MsgId>);
+
+/// Whether `msg`'s file is downloading (tracked).
+pub fn photo_loading(msg: MsgId) -> bool {
+    global::<LoadingMedia>().with(|l| l.0.contains(&msg))
+}
+
+/// Received photos' blurred stand-ins (D-0186), drawn until the photo itself has downloaded.
+#[derive(Clone, Default)]
+pub struct Blurs(pub std::collections::HashMap<MsgId, nsh_core::element::ImageSrc>);
+
+/// The blurred stand-in of `msg`'s photo, while there is one (tracked).
+pub fn blur_src(msg: MsgId) -> Option<nsh_core::element::ImageSrc> {
+    global::<Blurs>().with(|b| b.0.get(&msg).cloned())
+}
+
+/// `rgba` (`w` × `h`, straight 8-bit) as a PNG.
+fn png_of(w: u32, h: u32, rgba: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut e = png::Encoder::new(&mut out, w, h);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let mut writer = e.write_header().ok()?;
+    writer.write_image_data(rgba).ok()?;
+    writer.finish().ok()?;
+    Some(out)
+}
+
+/// Keeps `msg`'s stand-in from the `hash` its sender computed (checked: a malformed one is
+/// simply not drawn).
+fn keep_blur(msg: MsgId, hash: &str) {
+    if hash.is_empty() {
+        return;
+    }
+    if let Some(px) = songbird_app_core::blurhash::decode(hash, 24, 24) {
+        // As a PNG, the way photos themselves are shown: a raw pixel source drew nothing on
+        // iOS (found on an iPhone: the tiles stayed grey).
+        let Some(png) = png_of(24, 24, &px) else {
+            return;
+        };
+        let src = nsh_core::element::ImageSrc::from(super::avatar::data_uri(&png));
+        global::<Blurs>().update(|b| {
+            b.0.insert(msg, src);
+        });
+    }
+}
+
 /// Shows a photo (downloading it if needed), quietly: an automatic download that fails leaves
 /// its bubble offering to try again.
 pub fn load_photo(msg: MsgId) {
@@ -1512,6 +1692,13 @@ fn fetch_photo(msg: MsgId, asked: bool) {
     failed.update(|f| {
         f.0.remove(&msg);
     });
+    let loading = global::<LoadingMedia>();
+    if loading.with_untracked(|l| l.0.contains(&msg)) {
+        return;
+    }
+    loading.update(|l| {
+        l.0.insert(msg);
+    });
     // Detached: the bubble that asked may scroll away before the file arrives.
     Owner::detached().run(|| {
         spawn(async move {
@@ -1523,6 +1710,9 @@ fn fetch_photo(msg: MsgId, asked: bool) {
                     None => None,
                 }
             };
+            loading.update(|l| {
+                l.0.remove(&msg);
+            });
             match got {
                 Some(bytes) => show_bytes(msg, &bytes),
                 None => {
@@ -1540,6 +1730,104 @@ fn fetch_photo(msg: MsgId, asked: bool) {
     });
 }
 
+/// A JPEG's or PNG's blurred stand-in (D-0186): decoded, averaged down to at most 32 pixels a
+/// side, then a few cosine components. Empty when it can't be decoded (the photo is still sent).
+fn blurhash_of(photo: &[u8]) -> String {
+    let Some((w, h, px)) = rgb_of(photo) else {
+        return String::new();
+    };
+    if w == 0 || h == 0 || px.len() < w * h * 3 {
+        return String::new();
+    }
+    let side = 32usize;
+    let (sw, sh) = if w >= h {
+        (side, (h * side).div_ceil(w).max(1))
+    } else {
+        ((w * side).div_ceil(h).max(1), side)
+    };
+    let mut small = Vec::with_capacity(sw * sh * 3);
+    for y in 0..sh {
+        let (y0, y1) = (y * h / sh, ((y + 1) * h / sh).max(y * h / sh + 1));
+        for x in 0..sw {
+            let (x0, x1) = (x * w / sw, ((x + 1) * w / sw).max(x * w / sw + 1));
+            let mut sum = [0u64; 3];
+            for yy in y0..y1.min(h) {
+                for xx in x0..x1.min(w) {
+                    let i = (yy * w + xx) * 3;
+                    for (s, v) in sum.iter_mut().zip(px.get(i..i + 3).unwrap_or(&[0, 0, 0])) {
+                        *s += u64::from(*v);
+                    }
+                }
+            }
+            let n = ((y1.min(h) - y0) * (x1.min(w) - x0)).max(1) as u64;
+            small.extend(sum.map(|s| u8::try_from(s / n).unwrap_or(255)));
+        }
+    }
+    let (cx, cy) = if sw >= sh { (4, 3) } else { (3, 4) };
+    songbird_app_core::blurhash::encode(cx, cy, sw as u32, sh as u32, &small).unwrap_or_default()
+}
+
+/// The largest picture decoded for its stand-in: 64 MiB of pixels (a 16-megapixel PNG with
+/// alpha). Anything bigger goes without one rather than holding that much memory.
+const MAX_DECODE: usize = 64 << 20;
+
+/// A JPEG's or PNG's pixels as width, height and RGB rows (3 bytes a pixel); `None` for any
+/// other kind, or one that doesn't decode. Screenshots are PNGs: without this they arrived as
+/// flat grey (found on an iPhone).
+fn rgb_of(photo: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    if photo.starts_with(&[0xFF, 0xD8]) {
+        use zune_core::{colorspace::ColorSpace, options::DecoderOptions};
+        let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGB);
+        let mut d = zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(photo), options);
+        let px = d.decode().ok()?;
+        let info = d.info()?;
+        return Some((usize::from(info.width), usize::from(info.height), px));
+    }
+    if !photo.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return None;
+    }
+    let mut d = png::Decoder::new_with_limits(
+        std::io::Cursor::new(photo),
+        png::Limits { bytes: MAX_DECODE },
+    );
+    // Palette, grey and 16-bit pictures all come out as 8-bit grey or colour, with or
+    // without alpha.
+    d.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = d.read_info().ok()?;
+    let size = reader.output_buffer_size()?;
+    if size > MAX_DECODE {
+        return None;
+    }
+    let mut buf = vec![0; size];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let (w, h) = (
+        usize::try_from(info.width).ok()?,
+        usize::try_from(info.height).ok()?,
+    );
+    let channels = match info.color_type {
+        png::ColorType::Grayscale => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        png::ColorType::Indexed => return None,
+    };
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for row in buf.chunks(info.line_size).take(h) {
+        for p in row.chunks_exact(channels).take(w) {
+            // Transparent parts are drawn on the bubble's dark tile: weigh colour by alpha.
+            let (c, a) = match *p {
+                [g] => ([g; 3], 255),
+                [g, a] => ([g; 3], a),
+                [r, g, b] => ([r, g, b], 255),
+                [r, g, b, a] => ([r, g, b], a),
+                _ => return None,
+            };
+            rgb.extend(c.map(|v| u8::try_from(u16::from(v) * u16::from(a) / 255).unwrap_or(v)));
+        }
+    }
+    Some((w, h, rgb))
+}
+
 /// Saves a real media message's file where the user chooses.
 pub fn save_media(msg: MsgId, name: String) {
     with_file(msg, move |b| crate::ui::save_file(name, b));
@@ -1553,6 +1841,17 @@ pub fn send_picked(s: Store, chat: ChatId, files: Vec<nsh_core::picker::PickedFi
     if group.is_none() && to.is_none() {
         return;
     }
+    // Photos and videos picked together go as one album (D-0186): each its own message, all
+    // with the album's id and their places, so the receiver draws the album from the first.
+    let media = |f: &nsh_core::picker::PickedFile| photos || f.mime.starts_with("video/");
+    let count = files
+        .iter()
+        .filter(|f| media(f) && !f.data.bytes().is_empty())
+        .count();
+    let album_id = (count >= 2)
+        .then(|| songbird_app_core::crypto::random::<16>().ok().map(|r| *r))
+        .flatten();
+    let mut place = 0u32;
     for f in files {
         let bytes = f.data.bytes().to_vec();
         if bytes.is_empty() {
@@ -1578,7 +1877,27 @@ pub fn send_picked(s: Store, chat: ChatId, files: Vec<nsh_core::picker::PickedFi
                 kind: kind_of(&f.mime),
             }
         };
+        let album = album_id.filter(|_| media(&f)).map(|id| {
+            let a = songbird_app_core::attachments::AlbumRef {
+                id,
+                index: place,
+                count: u32::try_from(count).unwrap_or(u32::MAX),
+            };
+            place += 1;
+            a
+        });
         let ui = s.push_message(chat, None, body);
+        if let Some(a) = album {
+            s.set_album(
+                chat,
+                ui,
+                crate::store::AlbumTag {
+                    id: a.id,
+                    index: a.index,
+                    count: a.count,
+                },
+            );
+        }
         if photos {
             show_bytes(ui, &bytes);
         }
@@ -1589,41 +1908,83 @@ pub fn send_picked(s: Store, chat: ChatId, files: Vec<nsh_core::picker::PickedFi
             height: u32::try_from(f.size.height.0).unwrap_or(0),
             ..Default::default()
         };
-        super::run(async move {
-            let lock = core();
-            let mut guard = lock.lock().await;
-            let m = guard
-                .as_mut()
-                .ok_or_else(|| super::problem("Not connected yet."))?;
-            let me = m.local().account;
-            let r = match (group, to) {
-                (Some(gid), _) => m.send_group_files(&gid, vec![(bytes, meta)], "").await,
-                (None, Some(to)) => m.send_files(&to, vec![(bytes, meta)], "").await,
-                (None, None) => Err(songbird_app_core::Error::NoSession),
-            };
-            let st = r.as_ref().ok().and_then(|id| {
-                m.store
-                    .message(&me, id)
-                    .ok()
-                    .flatten()
-                    .map(|row| (*id, row.status))
-            });
-            drop(guard);
-            match st {
-                Some((id, status)) => {
-                    OUTGOING.with_borrow_mut(|o| o.insert(ui, id));
-                    IDS.with_borrow_mut(|x| x.insert(ui, (me, id)));
-                    MEDIA.with_borrow_mut(|x| x.insert(ui, (me, id)));
-                    set_status(s, &id, status);
-                    Ok(())
+        let p = Pending { bytes, meta, album };
+        PENDING.with_borrow_mut(|m| m.insert(ui, p.clone()));
+        send_media(s, chat, ui, p);
+    }
+}
+
+/// Sends one picked photo or file (and again on Retry or after a reconnect): its blurred
+/// stand-in first, then app-core encrypts, uploads and sends it. Its bytes stay in [`PENDING`]
+/// until it is sent.
+fn send_media(s: Store, chat: ChatId, ui: MsgId, p: Pending) {
+    let group = group_of(chat);
+    let to = account_of(chat);
+    let Pending {
+        bytes,
+        mut meta,
+        album,
+    } = p;
+    super::run(async move {
+        // The blurred stand-in the receiver draws at once, off the main thread.
+        // By the bytes themselves (JPEG or PNG), whatever the picker called them.
+        if meta.content_type.starts_with("image/") && meta.blurhash.is_empty() {
+            let copy = bytes.clone();
+            meta.blurhash = blocking(move || blurhash_of(&copy))
+                .await
+                .unwrap_or_default();
+            let hash = meta.blurhash.clone();
+            PENDING.with_borrow_mut(|m| {
+                if let Some(p) = m.get_mut(&ui) {
+                    p.meta.blurhash = hash;
                 }
-                None => {
-                    s.fail(chat, ui);
+            });
+        }
+        let lock = core();
+        let mut guard = lock.lock().await;
+        let m = guard
+            .as_mut()
+            .ok_or_else(|| super::problem("Not connected yet."))?;
+        let me = m.local().account;
+        let r = match (group, to) {
+            (Some(gid), _) => {
+                m.send_group_files_in(&gid, vec![(bytes, meta)], "", album)
+                    .await
+            }
+            (None, Some(to)) => m.send_files_in(&to, vec![(bytes, meta)], "", album).await,
+            (None, None) => Err(songbird_app_core::Error::NoSession),
+        };
+        let st = r.as_ref().ok().and_then(|id| {
+            m.store
+                .message(&me, id)
+                .ok()
+                .flatten()
+                .map(|row| (*id, row.status))
+        });
+        drop(guard);
+        match st {
+            Some((id, status)) => {
+                PENDING.with_borrow_mut(|m| m.remove(&ui));
+                OUTGOING.with_borrow_mut(|o| o.insert(ui, id));
+                IDS.with_borrow_mut(|x| x.insert(ui, (me, id)));
+                MEDIA.with_borrow_mut(|x| x.insert(ui, (me, id)));
+                set_status(s, &id, status);
+                Ok(())
+            }
+            None => {
+                s.fail(chat, ui);
+                // No connection: it goes again by itself once there is one.
+                if matches!(r, Err(songbird_app_core::Error::Network)) {
+                    resend_later(chat, ui);
+                    Err(super::problem(
+                        "Can't reach the server. The photo will be sent when you're back online.",
+                    ))
+                } else {
                     Err(super::problem("The file couldn't be sent."))
                 }
             }
-        });
-    }
+        }
+    });
 }
 
 fn human_size(n: usize) -> String {
@@ -2000,9 +2361,24 @@ pub async fn receive(envelope: &[u8]) -> bool {
             true
         }
         Ok(_) => true,
-        // A store failure: leave it on the server, it comes again.
-        Err(_) => false,
+        // A store failure: leave it on the server, it comes again. Development builds say which
+        // kind of failure (no content, ids or keys: invariant 6), so a stuck envelope is found.
+        Err(e) => {
+            if crate::PREVIEW_BUILD {
+                eprintln!("songbird: an envelope wasn't stored ({})", error_kind(&e));
+            }
+            false
+        }
     }
+}
+
+/// The name of an app-core error's kind, without the data some variants carry.
+fn error_kind(e: &songbird_app_core::Error) -> String {
+    let s = format!("{e:?}");
+    s.split(|c: char| !c.is_alphanumeric())
+        .next()
+        .unwrap_or("Error")
+        .to_string()
 }
 
 /// Shows a real 1:1 chat as a message request while the user hasn't written to its account or
@@ -2302,6 +2678,7 @@ pub fn send(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
                         "This person's safety number changed. Open it from their profile to continue."
                     }
                     songbird_app_core::Error::Network => {
+                        resend_later(chat, ui_msg);
                         "Can't reach the server. The message will be sent when you're back online."
                     }
                     _ => "The message couldn't be sent.",
@@ -2329,6 +2706,18 @@ fn quoted_of(s: Store, chat: ChatId, ui_msg: MsgId) -> Option<Quoted> {
 /// Sends a failed message again: the failed copy app-core kept (if any) goes, and the same
 /// bubble is sent anew, its ticks following the new send.
 pub fn retry(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
+    // A photo or file that failed before a restart: its bytes are in the store.
+    let stored = matches!(
+        body,
+        Body::Image { .. } | Body::Video { .. } | Body::File { .. }
+    ) && !PENDING.with_borrow(|m| m.contains_key(&ui_msg));
+    if let Some((author, id)) = MEDIA
+        .with_borrow(|m| m.get(&ui_msg).copied())
+        .filter(|_| stored)
+    {
+        retry_stored(s, chat, ui_msg, author, id);
+        return;
+    }
     let old = OUTGOING.with_borrow_mut(|o| o.remove(&ui_msg));
     IDS.with_borrow_mut(|x| x.remove(&ui_msg));
     if let Some(id) = old {
@@ -2342,17 +2731,19 @@ pub fn retry(s: Store, chat: ChatId, ui_msg: MsgId, body: &Body) {
             Ok(())
         });
     }
+    // A photo or file: its own bytes again, with its album place.
+    if let Some(p) = PENDING.with_borrow(|m| m.get(&ui_msg).cloned()) {
+        send_media(s, chat, ui_msg, p);
+        return;
+    }
     send(s, chat, ui_msg, body);
 }
 
 /// Deletes messages of a real chat from this device's store too, so they don't come back at
 /// the next start. Nobody else is told.
 pub fn delete_for_me(ids: &[MsgId]) {
-    let keys: Vec<([u8; 16], [u8; 16])> = IDS.with_borrow(|x| {
-        ids.iter()
-            .filter_map(|id| x.get(id).copied())
-            .collect()
-    });
+    let keys: Vec<([u8; 16], [u8; 16])> =
+        IDS.with_borrow(|x| ids.iter().filter_map(|id| x.get(id).copied()).collect());
     if keys.is_empty() {
         return;
     }
@@ -2821,13 +3212,15 @@ fn sweep_expired() {
             };
             // Messages a budget or a busy server held back go out again (they wait in the
             // outbox, in order).
-            let waiting: Vec<[u8; 16]> = m
-                .store
-                .outbox()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(_, _, id, _)| id)
-                .collect();
+            // Photo and file messages still to upload (D-0186) go first, then the outbox.
+            let mut waiting: Vec<[u8; 16]> = m.store.pending_media().unwrap_or_default();
+            waiting.extend(
+                m.store
+                    .outbox()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(_, _, id, _)| id),
+            );
             if !waiting.is_empty() {
                 let _ = m.flush_outbox().await;
             }
@@ -3088,7 +3481,12 @@ pub fn send_sticker(
 /// One recipient's receipts for a real message, as Message info shows them: who, and when it
 /// was delivered, read and played (UI minutes). `Some(None)`: reached, at a time this device
 /// didn't keep (receipts from before it kept each time).
-pub type ReceiptTimes = (ContactId, Option<Option<i64>>, Option<Option<i64>>, Option<Option<i64>>);
+pub type ReceiptTimes = (
+    ContactId,
+    Option<Option<i64>>,
+    Option<Option<i64>>,
+    Option<Option<i64>>,
+);
 
 /// The receipts app-core keeps for one of the user's real messages (D-0184); `None` for a
 /// message that isn't real or while app-core is busy.
@@ -3385,7 +3783,8 @@ async fn start_with(username: &str, link: Option<[u8; 16]>) -> Result<ChatId, su
         q["link"] = serde_json::Value::String(wire::hex(&h));
     }
     let body = q.to_string().into_bytes();
-    let (status, answer) = super::signed("POST", "/v1/username/lookup", Some(body), true).await?;
+    let (status, answer) =
+        super::signed_read("POST", "/v1/username/lookup", Some(body), true).await?;
     if status == 404 {
         return Err(super::problem("No one on Songbird has that username."));
     }
@@ -3537,5 +3936,93 @@ mod tests {
         assert_eq!(tick(Status::Sending), Tick::Sending);
         assert_eq!(tick(Status::Read), Tick::Read);
         assert_eq!(tick(Status::Failed), Tick::Failed);
+    }
+}
+
+#[cfg(test)]
+mod blurhash_tests {
+    #[test]
+    fn a_jpeg_gets_a_stand_in_that_decodes() {
+        let hash = super::blurhash_of(include_bytes!("testdata/photo.jpg"));
+        assert!(!hash.is_empty(), "a stand-in for a real JPEG");
+        let px = songbird_app_core::blurhash::decode(&hash, 24, 24).unwrap();
+        // Drawn as a PNG (the way photos are shown on iOS).
+        let png = super::png_of(24, 24, &px).unwrap();
+        assert!(png.starts_with(b"\x89PNG"));
+    }
+
+    #[test]
+    fn what_isnt_a_photo_gets_none() {
+        assert!(super::blurhash_of(b"not a photo").is_empty());
+        assert!(super::blurhash_of(b"\x89PNG\r\n\x1a\nbroken").is_empty());
+        assert!(super::blurhash_of(&[0xFF, 0xD8, 0xFF]).is_empty());
+    }
+
+    /// A PNG of `w` × `h` in `color` at `depth`, from `data`.
+    fn png(w: u32, h: u32, color: png::ColorType, depth: png::BitDepth, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut e = png::Encoder::new(&mut out, w, h);
+        e.set_color(color);
+        e.set_depth(depth);
+        if color == png::ColorType::Indexed {
+            e.set_palette(vec![200, 40, 90, 10, 10, 10]);
+        }
+        let mut writer = e.write_header().unwrap();
+        writer.write_image_data(data).unwrap();
+        writer.finish().unwrap();
+        out
+    }
+
+    /// The stand-in's average colour, decoded at 8 × 8.
+    fn mean(hash: &str) -> [u32; 3] {
+        let px = songbird_app_core::blurhash::decode(hash, 8, 8).unwrap();
+        let mut sum = [0u32; 3];
+        for p in px.as_chunks::<4>().0 {
+            for (s, v) in sum.iter_mut().zip(p) {
+                *s += u32::from(*v);
+            }
+        }
+        sum.map(|s| s / 64)
+    }
+
+    fn near(a: [u32; 3], b: [u32; 3]) -> bool {
+        a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 4)
+    }
+
+    #[test]
+    fn every_kind_of_png_gets_its_colour() {
+        use png::{BitDepth::*, ColorType::*};
+        let (w, h) = (40u32, 20u32);
+        let n = usize::try_from(w * h).unwrap();
+        let rgb: Vec<u8> = (0..n).flat_map(|_| [200u8, 40, 90]).collect();
+        let rgba: Vec<u8> = (0..n).flat_map(|_| [200u8, 40, 90, 255]).collect();
+        let grey = vec![128u8; n];
+        let wide: Vec<u8> = (0..n).flat_map(|_| [200u8, 0, 40, 0, 90, 0]).collect();
+        let indexed = vec![0u8; n];
+        for (bytes, want) in [
+            (png(w, h, Rgb, Eight, &rgb), [200, 40, 90]),
+            (png(w, h, Rgba, Eight, &rgba), [200, 40, 90]),
+            (png(w, h, Grayscale, Eight, &grey), [128, 128, 128]),
+            (png(w, h, Rgb, Sixteen, &wide), [200, 40, 90]),
+            (png(w, h, Indexed, Eight, &indexed), [200, 40, 90]),
+        ] {
+            let hash = super::blurhash_of(&bytes);
+            assert!(!hash.is_empty());
+            assert!(near(mean(&hash), want), "{:?} for {want:?}", mean(&hash));
+        }
+    }
+
+    #[test]
+    fn a_transparent_png_is_dark_where_it_is_clear() {
+        let n = 16 * 16;
+        let clear: Vec<u8> = (0..n).flat_map(|_| [255u8, 255, 255, 0]).collect();
+        let hash = super::blurhash_of(&png(
+            16,
+            16,
+            png::ColorType::Rgba,
+            png::BitDepth::Eight,
+            &clear,
+        ));
+        assert!(near(mean(&hash), [0, 0, 0]));
     }
 }

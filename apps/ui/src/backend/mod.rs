@@ -232,8 +232,41 @@ pub fn set_endpoint(endpoint: Endpoint) {
     live().update(|l| l.endpoint = endpoint);
 }
 
-/// Erases what this device keeps of a deleted account: the encrypted message
-/// store, its key, the photo and the account's local keys.
+/// What this device keeps of one account, apart from the device itself (its server address,
+/// app lock, icon, network usage and device-only settings stay): erased when the account is
+/// deleted or forgotten here, so a next account on this device starts with nothing of it, its
+/// device identity included (found on two iPhones: Forget kept the old profile, username and
+/// synced settings, and the next account reused the old app-core device identity).
+const ACCOUNT_KEYS: &[&str] = &[
+    "sb.core.db_key",
+    "sb.core.device_identity",
+    "sb.device_identity_seed",
+    "sb.me",
+    "sb.avatar",
+    "sb.username",
+    "sb.username_link",
+    "sb.profile_key",
+    "sb.profile_version",
+    "sb.records",
+    "sb.contact_names",
+    "sb.device_names",
+    "sb.recovery_secret",
+    "sb.backup_seen",
+    "sb.backup_config",
+    "sb.vault_passes",
+    "sb.subscriber",
+    "sb.store_proof",
+    "sb.token_pin",
+    "sb.family",
+    "sb.family_seat",
+    "sb.tickets",
+    "sb.next_token",
+    "sb.support_pin",
+    "sb.my_invites",
+];
+
+/// Erases what this device keeps of a deleted (or forgotten) account: the encrypted message
+/// store, its key, the photo and every key of [`ACCOUNT_KEYS`].
 pub fn erase_local() {
     if let Some(d) = data_dir() {
         for f in [
@@ -245,14 +278,7 @@ pub fn erase_local() {
             let _ = std::fs::remove_file(d.join(f));
         }
     }
-    for k in [
-        "sb.core.db_key",
-        "sb.core.device_identity",
-        "sb.avatar",
-        "sb.username_link",
-        "sb.profile_key",
-        "sb.profile_version",
-    ] {
+    for k in ACCOUNT_KEYS {
         Storage::remove_item(k);
     }
     rules::forget();
@@ -264,8 +290,18 @@ pub fn forget() {
     disconnect();
     chat::stop();
     chat::erase_store();
+    // Everything of the account on this device, not only its keys (see `ACCOUNT_KEYS`).
+    erase_local();
     for k in [K_IDENTITY, K_DEVICE_SEED, K_ACCOUNT, K_DEVICE, K_USERNAME] {
         Storage::remove_item(k);
+    }
+    // Its profile leaves the screen too: the next account starts with an empty one.
+    if let Some(s) = crate::store::try_store() {
+        s.me.update(|me| {
+            me.name.clear();
+            me.username.clear();
+            me.about.clear();
+        });
     }
     live().update(|l| {
         l.account = None;
@@ -354,7 +390,66 @@ fn endpoint() -> Endpoint {
     live().with_untracked(|l| l.endpoint.clone())
 }
 
+/// `f`'s output, or `None` when it hasn't finished within `d` (then `f` is dropped, which
+/// cancels a request in flight).
+pub(crate) async fn within<F: std::future::Future>(
+    d: std::time::Duration,
+    f: F,
+) -> Option<F::Output> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    Owner::detached().run(|| {
+        set_timeout(d, move || {
+            let _ = tx.send(());
+        });
+    });
+    match futures_util::future::select(std::pin::pin!(f), rx).await {
+        futures_util::future::Either::Left((out, _)) => Some(out),
+        futures_util::future::Either::Right(_) => None,
+    }
+}
+
+/// How long an API call may take: 20 s, and its body's time at a slow 32 KiB/s. A connection
+/// that died without a word (a NAT that forgot it, Wi-Fi handing over to cellular) would
+/// otherwise hold a lookup for the system's 60 s idle limit (found on an iPhone: a username
+/// lookup spun for a minute). Uploads and downloads ([`transfer`]) have no deadline of their
+/// own: a big file on a slow link takes long on purpose, and the system's idle limit, which
+/// resets whenever data moves, is the right one for them.
+fn deadline_of(request: &HttpRequest) -> std::time::Duration {
+    let body = match &request.body {
+        nsh_core::platform::HttpBody::Bytes(b) => b.len(),
+        _ => 0,
+    };
+    std::time::Duration::from_secs(20 + u64::try_from(body / (32 << 10)).unwrap_or(u64::MAX / 2))
+}
+
+/// What [`send`] says when the server didn't answer in time.
+const TIMED_OUT: &str = "The server didn't answer in time. Check your connection and try again.";
+
+/// An API call, within [`deadline_of`]. An unsigned read that runs out of time goes once more:
+/// the one that hung is cancelled, which closes its dead connection, so the second gets a
+/// fresh one. A signed one is signed again by [`signed`] (the server takes each signature
+/// once), and anything else isn't repeated (it may not be safe to do twice).
 async fn send(request: HttpRequest) -> Result<(u16, Vec<u8>), Problem> {
+    let d = deadline_of(&request);
+    let again = (matches!(request.method.as_str(), "GET" | "HEAD")
+        && !request
+            .headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("authorization")))
+    .then(|| request.clone());
+    if let Some(r) = within(d, transfer(request)).await {
+        return r;
+    }
+    if let Some(request) = again
+        && let Some(r) = within(d, transfer(request)).await
+    {
+        return r;
+    }
+    Err(problem(TIMED_OUT))
+}
+
+/// A request with no deadline but the system's idle limit (uploads and downloads).
+async fn transfer(request: HttpRequest) -> Result<(u16, Vec<u8>), Problem> {
     let lane = usage::lane_of(&request.url);
     // The request's line, headers and body, roughly as they go out.
     let body = match &request.body {
@@ -395,6 +490,41 @@ async fn send(request: HttpRequest) -> Result<(u16, Vec<u8>), Problem> {
 
 /// A request signed by this device (`authorization: Songbird …`).
 pub(crate) async fn signed(
+    method: &str,
+    path: &str,
+    body: Option<Vec<u8>>,
+    json: bool,
+) -> Result<(u16, Vec<u8>), Problem> {
+    let read = body.is_none() && method.eq_ignore_ascii_case("GET");
+    signed_retrying(method, path, body, json, read).await
+}
+
+/// [`signed`] for a call that only reads, whatever its method (a lookup sent as a POST, so its
+/// query stays out of logs): it goes once more, signed afresh, when it runs out of time.
+pub(crate) async fn signed_read(
+    method: &str,
+    path: &str,
+    body: Option<Vec<u8>>,
+    json: bool,
+) -> Result<(u16, Vec<u8>), Problem> {
+    signed_retrying(method, path, body, json, true).await
+}
+
+async fn signed_retrying(
+    method: &str,
+    path: &str,
+    body: Option<Vec<u8>>,
+    json: bool,
+    again: bool,
+) -> Result<(u16, Vec<u8>), Problem> {
+    match signed_once(method, path, body.clone(), json).await {
+        // Signed afresh: the server takes each signature once (see [`send`]).
+        Err(p) if again && p.0 == TIMED_OUT => signed_once(method, path, body, json).await,
+        r => r,
+    }
+}
+
+async fn signed_once(
     method: &str,
     path: &str,
     body: Option<Vec<u8>>,
@@ -460,7 +590,7 @@ pub(crate) async fn signed_upload(
         .header("content-type", "application/octet-stream")
         .header("content-length", body.len().to_string())
         .body(body);
-    send(req).await
+    transfer(req).await
 }
 
 /// An unsigned request to an api path (downloads and their confirmations
@@ -471,7 +601,7 @@ pub(crate) async fn unsigned(method: &str, path: &str) -> Result<(u16, Vec<u8>),
     } else {
         format!("{}{path}", endpoint().api)
     };
-    send(HttpRequest::new(method, url)).await
+    transfer(HttpRequest::new(method, url)).await
 }
 
 pub(crate) fn ok_json(status: u16, body: &[u8]) -> Result<Value, Problem> {
@@ -546,17 +676,33 @@ pub async fn register(invite: Option<String>, username: Option<String>) -> Resul
             l.account = Some(account.into());
             l.device = Some(device.into());
         });
-        if let Some(name) = username.filter(|n| !n.trim().is_empty()) {
-            claim_username(&name).await?;
-        }
         Ok(())
     }
     .await;
+    // The account exists once the server said so: it connects whatever happens to the username
+    // after, and a username that couldn't be claimed is said as such (found on an iPhone: the
+    // claim failed on a flaky network, the account stayed offline and the profile showed a
+    // username nobody could find).
+    let result = match result {
+        Ok(()) => {
+            connect();
+            match username.filter(|n| !n.trim().is_empty()) {
+                Some(name) => {
+                    busy(Some("Saving your username…"));
+                    claim_username(&name).await.map_err(|p| {
+                        problem(format!(
+                            "Your account is ready, but the username wasn't saved: {} Try again from your profile.",
+                            p.0
+                        ))
+                    })
+                }
+                None => Ok(()),
+            }
+        }
+        Err(p) => Err(p),
+    };
     busy(None);
     live().update(|l| l.problem = result.as_ref().err().map(|p| p.0.clone()));
-    if result.is_ok() {
-        connect();
-    }
     result
 }
 
@@ -802,4 +948,23 @@ pub fn run(job: impl std::future::Future<Output = Result<(), Problem>> + 'static
             }
         })
     });
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::{HttpRequest, deadline_of};
+    use std::time::Duration;
+
+    #[test]
+    fn a_call_has_twenty_seconds_and_its_bodys_time() {
+        assert_eq!(
+            deadline_of(&HttpRequest::new("GET", "https://x/")),
+            Duration::from_secs(20)
+        );
+        let small = HttpRequest::post("https://x/", vec![0; 900]);
+        assert_eq!(deadline_of(&small), Duration::from_secs(20));
+        // 1 MiB at 32 KiB/s is 32 s more.
+        let big = HttpRequest::post("https://x/", vec![0; 1 << 20]);
+        assert_eq!(deadline_of(&big), Duration::from_secs(52));
+    }
 }

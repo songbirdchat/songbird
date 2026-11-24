@@ -88,10 +88,18 @@ pub fn roles_page(chat: ChatId) {
         // (moderators and admins), not by its policy: shown, not switchable (D-0184).
         let real = crate::backend::chat::owns(chat);
         let row = move |p: &'static Permission| {
-            let fixed = real && matches!(p.title, "Pin messages" | "Admins can delete others' messages");
+            let fixed = real
+                && matches!(
+                    p.title,
+                    "Pin messages" | "Admins can delete others' messages"
+                );
             switch_row(
                 p.title,
-                if fixed { "Set by Songbird for every group: admins pin and delete others' messages." } else { p.explain },
+                if fixed {
+                    "Set by Songbird for every group: admins pin and delete others' messages."
+                } else {
+                    p.explain
+                },
                 move || ch.with(|c| c.as_ref().is_some_and(|c| (p.get)(&c.permissions))),
                 move || manage() && !fixed,
                 move |v| {

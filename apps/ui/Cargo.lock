@@ -4086,6 +4086,7 @@ dependencies = [
  "nsh-platform-macos",
  "nsh-platform-windows",
  "nsh-testing",
+ "png 0.18.1",
  "prost",
  "qrcode",
  "serde",
@@ -4107,6 +4108,8 @@ dependencies = [
  "songbird-types",
  "tokio",
  "zeroize",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

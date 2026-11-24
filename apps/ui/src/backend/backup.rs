@@ -924,6 +924,7 @@ pub fn apply(s: Store, r: &Restored) {
                     pinned: false,
                     forwarded: false,
                     receipts: vec![],
+                    album: None,
                 });
             }
             _ => {}

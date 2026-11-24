@@ -132,7 +132,6 @@ pub fn upload_progress(
         )
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

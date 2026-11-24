@@ -167,6 +167,23 @@ pub struct Message {
     pub view_once: bool,
     #[prost(message, repeated, tag = "11")]
     pub previews: Vec<LinkPreview>,
+    #[prost(message, optional, tag = "12")]
+    pub album: Option<Album>,
+}
+
+/// One of the photos and videos sent together, each its own message (D-0186).
+#[derive(Clone, PartialEq, ::prost::Message)]
+#[prost(skip_debug)]
+pub struct Album {
+    /// 16 random bytes, the same for every item of the album.
+    #[prost(bytes = "vec", tag = "1")]
+    pub id: Vec<u8>,
+    /// This item's place, from 0.
+    #[prost(uint32, tag = "2")]
+    pub index: u32,
+    /// How many items the album has, 2 to [`crate::validate::MAX_ALBUM`].
+    #[prost(uint32, tag = "3")]
+    pub count: u32,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -833,6 +850,7 @@ pub struct CallLinkCard {
 
 redacted_debug!(
     Plaintext,
+    Album,
     Content,
     content::Body,
     MessageRef,

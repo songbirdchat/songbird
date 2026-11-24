@@ -1249,12 +1249,3 @@ mod tests {
         assert!(!can_act_on(None, Role::Member));
     }
 }
-
-/// "@name", or nothing for a contact whose username this account never learned.
-fn handle(username: &str) -> String {
-    if username.is_empty() {
-        String::new()
-    } else {
-        format!("@{username}")
-    }
-}

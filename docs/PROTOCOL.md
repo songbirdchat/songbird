@@ -946,7 +946,7 @@ the chat's disappearing timer the sender applied. Exactly one kind:
 
 | Kind | Rules |
 | --- | --- |
-| `Message` | Text with spans; up to 32 attachments (voice notes and video notes are attachments with a flag; voice notes carry a waveform); a quote (`MessageRef`, a 2 KiB preview, a thumbnail); a forward counter; up to 8 contact cards; a location pin (degrees × 10⁷); a sticker reference (pack ID, pack key, sticker ID); a poll; an event; `view_once`; up to 4 link previews. At least one visible part. |
+| `Message` | Text with spans; up to 32 attachments (voice notes and video notes are attachments with a flag; voice notes carry a waveform); a quote (`MessageRef`, a 2 KiB preview, a thumbnail); a forward counter; up to 8 contact cards; a location pin (degrees × 10⁷); a sticker reference (pack ID, pack key, sticker ID); a poll; an event; `view_once`; up to 4 link previews; an album (`Album`). At least one visible part. |
 | `Reaction` | One per reactor and message; add, replace (a new emoji) or remove. The reactor's highest `counter` wins (§5.5). |
 | `Edit` | The sender's own message, within **24 hours** (D-0058); the highest `revision` is shown and every revision is kept as history. |
 | `Delete` | Delete for everyone, the sender's own message, within **24 hours** (D-0058); group admins delete others' (Prompt 5). |
@@ -957,6 +957,14 @@ the chat's disappearing timer the sender applied. Exactly one kind:
 | `CallEvent` | A call's outcome in the chat (Prompt 7). |
 | `GroupUpdate` | A group or channel system message written by a client from what changed (Prompt 5 orders the changes themselves). |
 | `ChatPolicy` | Restricted chat (§5.9). |
+
+**Albums** (D-0186). Photos and videos sent together go one message each, so each can be
+answered, reacted to, forwarded or deleted on its own, and each carries the same `Album`: a
+16-byte random ID, its `index` from 0 and the album's `count` (2 to 100). Receivers draw the
+album from the first item that arrives, with a place for each one still to come, in `index`
+order whatever order they arrive in. An item may never arrive (its sender deleted it before it
+was sent): apps show the album with what they have. The `Album` of a view-once message, or of a
+message with no attachment, is invalid.
 
 **Forwarding.** Forwarding a message sets `forward_count` to the original's plus one (a message
 first forwarded has 1). From 5 the app shows "forwarded many times" and lets it be forwarded to

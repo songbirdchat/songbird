@@ -221,6 +221,8 @@ pub(crate) struct Conv {
     /// Messages that arrived while scrolled up.
     pub unseen: Signal<u32>,
     pub list: ElementRef,
+    /// The list's rows: each message, or an album at its first item (D-0186).
+    pub rows: Memo<Vec<logic::Row>>,
     pub input: ElementRef,
     pub rec: Signal<Option<Rec>>,
     pub rec_secs: Signal<u32>,
@@ -275,6 +277,14 @@ impl Conv {
             following: signal(true),
             unseen: signal(0),
             list: element_ref(),
+            rows: computed(move || {
+                let now = crate::store::now();
+                s.messages.with(|m| {
+                    m.get(&chat)
+                        .map(|v| logic::rows(v, now))
+                        .unwrap_or_default()
+                })
+            }),
             input: element_ref(),
             rec: signal(None),
             rec_secs: signal(0),
@@ -305,7 +315,7 @@ impl Conv {
 
     /// Scrolls to message `id` and flashes it.
     pub fn jump_to(self, id: MsgId) {
-        let Some(index) = self.s.index_of(self.chat, id) else {
+        let Some(index) = self.row_of(id) else {
             toast("That message is no longer in this chat");
             return;
         };
@@ -318,6 +328,15 @@ impl Conv {
                 highlight.set(None);
             }
         });
+    }
+
+    /// The list row that shows message `id`: its own, or its album's.
+    pub fn row_of(self, id: MsgId) -> Option<usize> {
+        let index = self.s.index_of(self.chat, id)?;
+        self.rows.with_untracked(|r| {
+            r.iter()
+                .position(|row| row.at == index || row.items.contains(&index))
+        })
     }
 
     /// Back to the newest message.
@@ -412,13 +431,27 @@ impl Conv {
         self.s.set_draft(self.chat, draft);
     }
 
-    pub fn toggle_selected(self, id: MsgId) {
+    /// Selects every one of `ids`, or unselects them all when they all are (an album).
+    pub fn toggle_all(self, ids: Vec<MsgId>) {
         self.selected.update(|v| {
-            if let Some(i) = v.iter().position(|x| *x == id) {
-                v.remove(i);
+            if ids.iter().all(|x| v.contains(x)) {
+                v.retain(|x| !ids.contains(x));
             } else {
-                v.push(id);
+                for id in ids {
+                    if !v.contains(&id) {
+                        v.push(id);
+                    }
+                }
             }
+        });
+    }
+
+    /// Starts selecting with `ids` chosen (holding an album selects all of it, as WhatsApp).
+    pub fn start_select_all(self, ids: Vec<MsgId>) {
+        batch(|| {
+            self.menu.set(None);
+            self.selected.set(ids);
+            self.selecting.set(true);
         });
     }
 
@@ -751,7 +784,8 @@ pub fn conversation(chat: ChatId) -> AnyElement {
                         .iter()
                         .filter_map(|f| crate::features::desktop::file_path(&f.uri))
                         .filter(|p| {
-                            let ok = std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() <= max);
+                            let ok =
+                                std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.len() <= max);
                             if !ok {
                                 toast("That file can't be sent: files are up to 256 MB.");
                             }
@@ -765,7 +799,8 @@ pub fn conversation(chat: ChatId) -> AnyElement {
                             u32::try_from(paths.len()).unwrap_or(u32::MAX),
                         ),
                     );
-                    let photos = !picked.is_empty() && picked.iter().all(|f| f.mime.starts_with("image/"));
+                    let photos =
+                        !picked.is_empty() && picked.iter().all(|f| f.mime.starts_with("image/"));
                     crate::backend::chat::send_picked(s, chat, picked, photos);
                     return;
                 }

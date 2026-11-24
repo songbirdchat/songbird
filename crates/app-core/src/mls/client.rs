@@ -539,44 +539,20 @@ impl<N: Net> Messenger<N> {
         files: Vec<(Vec<u8>, crate::attachments::FileMeta)>,
         text: &str,
     ) -> Result<[u8; 16]> {
-        let fetches = self.group_devices(gid)?.len().saturating_sub(1).max(1);
-        let mut pointers = Vec::with_capacity(files.len());
-        let mut preview = String::new();
-        for (bytes, meta) in &files {
-            let (mut p, ct) = crate::attachments::encrypt(bytes, meta)?;
-            let id = crate::attachments::upload(&self.net, &ct, fetches).await?;
-            p.object_id = id.to_vec();
-            p.uploaded_at_ms = now_ms();
-            if preview.is_empty() {
-                preview = crate::messenger::attachment_label(&p);
-            }
-            pointers.push(p);
-        }
-        let message = songbird_content::schema::Message {
-            text: (!text.is_empty()).then(|| Text {
-                body: text.into(),
-                spans: Vec::new(),
-            }),
-            attachments: pointers,
-            ..Default::default()
-        };
-        let data = DataMessage {
-            group_id: gid.to_vec(),
-            kind: Some(data_message::Kind::Message(message)),
-            ..Default::default()
-        };
-        let shown = if text.is_empty() {
-            preview
-        } else {
-            text.to_owned()
-        };
-        let id = self.send_group_data(gid, data, &shown).await?;
-        let me = self.local.account;
-        for (i, (bytes, _)) in files.iter().enumerate() {
-            self.store
-                .put_file(&me, &id, u32::try_from(i).unwrap_or(u32::MAX), bytes)?;
-        }
-        Ok(id)
+        self.send_group_files_in(gid, files, text, None).await
+    }
+
+    /// [`Self::send_group_files`], as one item of an album (D-0186): written first, then
+    /// uploaded and sent with its id, waiting for a connection if there is none
+    /// (`Messenger::send_files_with`).
+    pub async fn send_group_files_in(
+        &mut self,
+        gid: &[u8; 16],
+        files: Vec<(Vec<u8>, crate::attachments::FileMeta)>,
+        text: &str,
+        album: Option<crate::attachments::AlbumRef>,
+    ) -> Result<[u8; 16]> {
+        self.send_files_with(gid, true, 0, files, text, album).await
     }
 
     /// The accounts' devices in a group, as this device sees them.
@@ -632,14 +608,30 @@ impl<N: Net> Messenger<N> {
         preview: &str,
     ) -> Result<[u8; 16]> {
         let id = *random::<16>()?;
-        let sent_at = now_ms();
         let content = Content {
             version: songbird_content::VERSION,
             required_version: 1,
             message_id: id.to_vec(),
-            sent_at_ms: sent_at,
+            sent_at_ms: now_ms(),
             body: Some(Body::Data(data)),
         };
+        self.send_group_content(gid, content, preview).await
+    }
+
+    /// Sends `content` to a group with its own message id (stored once as Sending, so sending
+    /// it again after a failure is the same message): one MLS message, sealed for the group's
+    /// current epoch.
+    pub(crate) async fn send_group_content(
+        &mut self,
+        gid: &[u8; 16],
+        content: Content,
+        preview: &str,
+    ) -> Result<[u8; 16]> {
+        let id: [u8; 16] = content
+            .message_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Malformed)?;
         let franking = *random::<32>()?;
         let (padded, commitment) =
             songbird_content::seal(&content, Some(franking)).map_err(|_| Error::Malformed)?;

@@ -165,7 +165,9 @@ fn attach_sheet(cv: Conv) -> AnyElement {
                 open.set(false);
                 // Where the sheet tells no `Close` (no exit to wait for), the choice still runs.
                 Owner::detached().run(|| {
-                    set_timeout(std::time::Duration::from_millis(450), move || run_chosen(chosen, cv));
+                    set_timeout(std::time::Duration::from_millis(450), move || {
+                        run_chosen(chosen, cv)
+                    });
                 });
             }
         }
@@ -184,7 +186,7 @@ fn attach_sheet(cv: Conv) -> AnyElement {
                         let (s, chat) = (cv.s, cv.chat);
                         let hd = s.settings.with_untracked(|x| x.hd_uploads);
                         spawn(async move {
-                            let mut r = nsh_core::picker::PickRequest::new(true, 10);
+                            let mut r = nsh_core::picker::PickRequest::new(true, 30);
                             // Standard quality scales photos down; HD keeps them.
                             if !hd {
                                 r.max_dimension = Some(DevicePixels(1600));
@@ -499,7 +501,7 @@ fn contact_sheet(cv: Conv) -> AnyElement {
                 let (name, username, seed) = (p.name.clone(), p.username.clone(), p.id);
                 Row::new(p.name.clone())
                     .leading(avatar(p.name.clone(), seed, 36.0))
-                    .subtitle(format!("@{}", p.username))
+                    .subtitle(handle(&p.username))
                     .on_press(move || {
                         open.set(false);
                         cv.send_body(Body::Contact {
@@ -570,7 +572,9 @@ fn camera_sheet(cv: Conv) -> AnyElement {
                                             shoot.take_photo(move |result| {
                                                 let _ = busy.try_set(false);
                                                 match result {
-                                                    Ok(still) if crate::backend::chat::owns(cv.chat) => {
+                                                    Ok(still)
+                                                        if crate::backend::chat::owns(cv.chat) =>
+                                                    {
                                                         open.set(false);
                                                         // A real chat: the JPEG is encrypted and uploaded as
                                                         // an attachment (Prompt 6, D-0184).
@@ -578,9 +582,16 @@ fn camera_sheet(cv: Conv) -> AnyElement {
                                                         let f = nsh_core::picker::PickedFile::new(
                                                             "Photo.jpg",
                                                             still.mime,
-                                                            nsh_core::image::ImageData::new(still.bytes),
+                                                            nsh_core::image::ImageData::new(
+                                                                still.bytes,
+                                                            ),
                                                         );
-                                                        crate::backend::chat::send_picked(cv.s, cv.chat, vec![f], true);
+                                                        crate::backend::chat::send_picked(
+                                                            cv.s,
+                                                            cv.chat,
+                                                            vec![f],
+                                                            true,
+                                                        );
                                                     }
                                                     Ok(still) => {
                                                         open.set(false);
@@ -1109,7 +1120,9 @@ mod attach_tests {
     fn AttachProbe() -> impl IntoElement {
         let s = Store::new();
         crate::store::install(s);
-        view().flex_1().child(crate::features::chat::conversation(1))
+        view()
+            .flex_1()
+            .child(crate::features::chat::conversation(1))
     }
 
     /// Each picker the share sheet opens after closing itself shows (found on an iPhone: Poll

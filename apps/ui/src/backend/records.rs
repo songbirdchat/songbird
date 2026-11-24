@@ -26,8 +26,8 @@ use songbird_proto::storage::{self as wire, Head, ID_LEN, Ids, Record, Write};
 use songbird_sync::{Remote, Replica, StorageKey, SyncError, WriteOutcome};
 
 use crate::store::{
-    Audience, Broadcast, Disappear, LockAfter, MESSAGE_TONES, RINGTONES, Settings, SettingsExt, Store,
-    ThemeChoice,
+    Audience, Broadcast, Disappear, LockAfter, MESSAGE_TONES, RINGTONES, Settings, SettingsExt,
+    Store, ThemeChoice,
 };
 
 const K_STATE: &str = "sb.records";
@@ -260,7 +260,12 @@ pub const SYNCED: &[(&str, Get, Set)] = &[
     field!("s/lists", x.lists, |v: Vec<String>| list(&v), p_list),
     // The profile's links and the broadcast lists follow the account (D-0184).
     field!("s/links", x.links, |v: Vec<String>| list(&v), p_list),
-    field!("s/broadcasts", x.broadcasts, |v: Vec<Broadcast>| broadcasts(&v), p_broadcasts),
+    field!(
+        "s/broadcasts",
+        x.broadcasts,
+        |v: Vec<Broadcast>| broadcasts(&v),
+        p_broadcasts
+    ),
 ];
 
 /// Broadcast lists as a record: id, name and members (contacts are named by account-derived

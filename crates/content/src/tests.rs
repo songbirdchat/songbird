@@ -211,3 +211,37 @@ fn a_storage_sync_carries_no_key_or_a_whole_one() {
     assert!(validate::content(&with(vec![7; KEY_LEN])).is_ok());
     assert!(validate::content(&with(vec![7; 31])).is_err());
 }
+
+#[test]
+fn albums_are_checked() {
+    use crate::schema::{Album, AttachmentPointer};
+    let photo = || AttachmentPointer {
+        object_id: vec![1; 32],
+        key: vec![2; 64],
+        digest: vec![3; 32],
+        size: 10,
+        content_type: "image/jpeg".into(),
+        ..Default::default()
+    };
+    let album = |id: usize, index: u32, count: u32| Album {
+        id: vec![9; id],
+        index,
+        count,
+    };
+    let check = |m: Message| validate::message_for_tests(&m);
+    let with = |a: Album, attachments: Vec<AttachmentPointer>, view_once: bool| Message {
+        attachments,
+        view_once,
+        album: Some(a),
+        ..Default::default()
+    };
+    assert!(check(with(album(16, 0, 2), vec![photo()], false)).is_ok());
+    assert!(check(with(album(16, 99, 100), vec![photo()], false)).is_ok());
+    // A short id, an index past the end, one item or too many, no photo, view once.
+    assert!(check(with(album(15, 0, 2), vec![photo()], false)).is_err());
+    assert!(check(with(album(16, 2, 2), vec![photo()], false)).is_err());
+    assert!(check(with(album(16, 0, 1), vec![photo()], false)).is_err());
+    assert!(check(with(album(16, 0, 101), vec![photo()], false)).is_err());
+    assert!(check(with(album(16, 0, 2), Vec::new(), false)).is_err());
+    assert!(check(with(album(16, 0, 2), vec![photo()], true)).is_err());
+}

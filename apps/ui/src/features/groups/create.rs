@@ -203,10 +203,7 @@ pub(crate) fn contact_pick_row(
                         contact.with(|c| {
                             // A contact whose username this account never learned shows none,
                             // not a bare "@".
-                            c.as_ref()
-                                .filter(|c| !c.username.is_empty())
-                                .map(|c| format!("@{}", c.username))
-                                .unwrap_or_default()
+                            c.as_ref().map(|c| handle(&c.username)).unwrap_or_default()
                         })
                     })
                     .text_size(px(font::SMALL))
@@ -326,11 +323,7 @@ fn details_page(base: usize, community: Option<ChatId>, picked: Signal<Vec<Conta
             let c = s.contact(id);
             Row::new(s.contact_name(Some(id)))
                 .leading(avatar(s.contact_name(Some(id)), id, 36.0))
-                .subtitle(
-                    c.filter(|c| !c.username.is_empty())
-                        .map(|c| format!("@{}", c.username))
-                        .unwrap_or_default(),
-                )
+                .subtitle(c.map(|c| handle(&c.username)).unwrap_or_default())
                 .build()
         })
         .collect();
