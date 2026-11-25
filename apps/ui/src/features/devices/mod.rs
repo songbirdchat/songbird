@@ -152,8 +152,7 @@ fn safety_body(contact: ContactId) -> AnyElement {
                         .child(btn_with_icon("Copy", Some(Icon::Copy), Variant::Ghost, BtnSize::Md, {
                             let number = person.safety_number.clone();
                             move || {
-                                set_clipboard(number.clone());
-                                toast("Safety number copied");
+                                crate::ui::copy(number.clone(), "Safety number copied");
                             }
                         })),
                 ),

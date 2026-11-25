@@ -277,6 +277,8 @@ fn body() -> impl IntoElement {
                         ))
                         .child(view().flex_row().child(
                             btn("Register this device", Variant::Primary, BtnSize::Md, register)
+                                // Screen readers hear that registering runs (NSH 0.7 `busy`, D-0188).
+                                .busy(move || state.with(|l| l.busy.is_some()))
                                 .disabled(move || !on() || state.with(|l| l.busy.is_some())),
                         ))
                         .child(crate::features::settings::foot(

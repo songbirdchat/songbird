@@ -609,6 +609,7 @@ fn camera_sheet(cv: Conv) -> AnyElement {
                                             });
                                         },
                                     )
+                                    .busy(move || busy.get())
                                     .disabled(move || busy.get()),
                                 )
                         }))

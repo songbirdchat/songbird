@@ -7,8 +7,12 @@ publish = false
 [workspace]
 
 [dependencies]
-nsh-core = "0.6.0"
-nsh-base = "0.6.0"
+# NSH's official modules (D-0188), the same release as nsh-core: `push` (the APNs token from
+# NSH's app delegate, iOS) and `location` (CoreLocation, macOS and iOS), which replaced the
+# device crate's own. Listed in nsh.json `dependencies` too, so packaged apps run its entry.
+nsh-extra = { version = "0.7.0", features = ["push", "location"] }
+nsh-core = "0.7.0"
+nsh-base = "0.7.0"
 env_logger = "0.11"
 # Theme variants (light, dark, high contrast) are built from theme.json at run time.
 serde_json = "1"
@@ -59,21 +63,25 @@ qrcode = { version = "0.14.1", default-features = false }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nsh-platform-linux = { version = "0.6.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
+nsh-platform-linux = { version = "0.7.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nsh-platform-macos = { version = "0.6.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
+nsh-platform-macos = { version = "0.7.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
 
 # The camera's native preview registers here (`#[native_components(ios)]`, D-0110).
 [target.'cfg(target_os = "ios")'.dependencies]
-nsh-platform-ios = { version = "0.6.0", default-features = false }
+nsh-platform-ios = { version = "0.7.0", default-features = false }
+
+# The camera's preview and call video register here (`#[native_components(android)]`, D-0188).
+[target.'cfg(target_os = "android")'.dependencies]
+nsh-platform-android = { version = "0.7.0", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-nsh-platform-windows = { version = "0.6.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
+nsh-platform-windows = { version = "0.7.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
 
 [dev-dependencies]
 # The real engine, headless, for tests of the reactive wiring (NSH testing guide).
-nsh-engine = { version = "0.6.0", default-features = false }
-nsh-testing = { version = "0.6.0", default-features = false }
+nsh-engine = { version = "0.7.0", default-features = false }
+nsh-testing = { version = "0.7.0", default-features = false }
 # Building `Content` in the backup tests.
 prost = { version = "0.14.5", default-features = false, features = ["std"] }

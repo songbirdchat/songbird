@@ -709,8 +709,7 @@ pub fn family_page() -> Screen {
                                         .when(link.is_some(), move |v| {
                                             let link = link.clone().unwrap_or_default();
                                             v.child(icon_btn(Icon::Copy, copy_label.clone(), move || {
-                                                set_clipboard(link.clone());
-                                                toast("Link copied. Send it to them yourself.");
+                                                crate::ui::copy(link.clone(), "Link copied. Send it to them yourself.");
                                             })
                                             .text_color(move || c::muted_fg()))
                                         })

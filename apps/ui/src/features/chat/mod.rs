@@ -500,13 +500,15 @@ impl Conv {
                 })
                 .unwrap_or_default()
         });
-        set_clipboard(text);
         self.menu.set(None);
-        toast(if ids.len() > 1 {
-            "Messages copied"
-        } else {
-            "Message copied"
-        });
+        crate::ui::copy(
+            text,
+            if ids.len() > 1 {
+                "Messages copied"
+            } else {
+                "Message copied"
+            },
+        );
     }
 
     /// Closes the topmost thing open (Escape).

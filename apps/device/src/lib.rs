@@ -9,8 +9,9 @@
 //! - [`icon`]: the app's icon, chosen by the person (alternate icons, the Dock, the taskbar).
 //! - [`passkeys`]: the platform's passkeys (WebAuthn), for the account's second factor.
 //! - [`photos`]: saving a photo or video the person chose (or received, with "Save to photos").
-//! - [`push`]: the device's push token (APNs, FCM).
-//! - [`location`]: one position, when the person asks to share where they are.
+//! - [`push`]: the device's push token on Android (UnifiedPush; iOS: `nsh-extra`, D-0188).
+//! - [`location`]: one position, when the person asks to share where they are (Android,
+//!   Windows, Linux; macOS and iOS: `nsh-extra`, D-0188).
 //! - [`store`]: buying a plan through the App Store (StoreKit 2) or Google Play.
 //! - [`share`]: the phone's screen in a call (MediaProjection, a ReplayKit extension).
 //! - [`screen`]: keeping the app's windows out of screenshots and screen recording.

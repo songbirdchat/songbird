@@ -482,8 +482,7 @@ fn share_sheet(s: Store, created: Signal<Option<ChatId>>, base: usize) -> View {
                         Variant::Secondary,
                         BtnSize::Md,
                         move || {
-                            set_clipboard(link());
-                            toast("Link copied");
+                            crate::ui::copy(link(), "Link copied");
                         },
                     )
                     .flex_1(),

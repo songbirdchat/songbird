@@ -4,6 +4,7 @@
 //! side implements [`Backend`] by calling its static methods, and receives its results through
 //! the `native*` methods below. QR codes are decoded here, on the device, with `rqrr` (no ML
 //! Kit, no Play Services): the Y plane of each analysis frame goes to a [`Scanner`].
+//! The preview and call video are NSH components this side makes ([`register`], D-0188).
 //!
 //! `unsafe` here: the exported JNI entry points (`#[unsafe(no_mangle)]`), and reading the direct
 //! byte buffers CameraX hands over, which are valid for the duration of the call (Java closes
@@ -531,4 +532,125 @@ pub(crate) fn video_clear(feed: u64) {
     call_void("videoClear", "(J)V", |_| {
         Some(vec![JValueOwned::Long(feed)])
     });
+}
+
+// ------------------------------------------------------------ the native components (D-0188)
+
+/// Registers `songbird/camera` (CameraX's preview of a session, its `session` prop) and
+/// `songbird/video` (a call participant's frames, its `feed` prop) with NSH's own activity:
+/// NSH 0.7 lets an app's crate make Android components (`#[native_components(android)]`), so
+/// Songbird has no activity of its own to register them in.
+pub fn register(components: &nsh::Components) {
+    components.register(
+        "songbird/camera",
+        std::rc::Rc::new(|cx| {
+            JavaView::make(
+                &cx,
+                "chat/songbird/camera/CameraPreview",
+                "session",
+                "setSession",
+            )
+        }),
+    );
+    components.register(
+        "songbird/video",
+        std::rc::Rc::new(|cx| {
+            JavaView::make(
+                &cx,
+                "chat/songbird/camera/VideoFrameView",
+                "feed",
+                "setFeed",
+            )
+        }),
+    );
+}
+
+/// A component whose Java object (`view()`, `<setter>(long)`, `destroy()`) does the work.
+struct JavaView {
+    /// The Java object; `None` when it couldn't be made (then `view` is an empty `View`).
+    object: Option<GlobalRef>,
+    view: GlobalRef,
+    /// The one prop, a number, and the Java method taking it.
+    prop: &'static str,
+    setter: &'static str,
+}
+
+impl JavaView {
+    fn make(
+        cx: &nsh::ComponentContext,
+        class: &'static str,
+        prop: &'static str,
+        setter: &'static str,
+    ) -> Box<dyn nsh::NativeComponent> {
+        let context = cx.android_context().clone();
+        // Called on the UI thread from NSH's Java, so the app's class loader finds `class`.
+        let made = cx.with_env(|env| {
+            let object = env.new_object(
+                class,
+                "(Landroid/content/Context;)V",
+                &[JValue::Object(context.as_obj())],
+            )?;
+            let view = env
+                .call_method(&object, "view", "()Landroid/view/View;", &[])?
+                .l()?;
+            Ok((env.new_global_ref(&object)?, env.new_global_ref(&view)?))
+        });
+        let (object, view) = match made {
+            Ok((object, view)) => (Some(object), view),
+            Err(e) => {
+                log::error!("{class}: {e}");
+                // An empty view in its place: the screen around it says the camera is out.
+                let empty = cx.with_env(|env| {
+                    let view = env.new_object(
+                        "android/view/View",
+                        "(Landroid/content/Context;)V",
+                        &[JValue::Object(context.as_obj())],
+                    )?;
+                    env.new_global_ref(&view)
+                });
+                match empty {
+                    Ok(view) => (None, view),
+                    // NSH catches this and puts an empty view there itself.
+                    Err(e) => panic!("{class}: not even an empty view: {e}"),
+                }
+            }
+        };
+        Box::new(Self {
+            object,
+            view,
+            prop,
+            setter,
+        })
+    }
+}
+
+impl nsh::NativeComponent for JavaView {
+    fn view(&self) -> &GlobalRef {
+        &self.view
+    }
+
+    fn set_prop(&mut self, env: &mut JNIEnv<'_>, name: &str, value: Option<&serde_json::Value>) {
+        if name != self.prop {
+            return;
+        }
+        let Some(object) = &self.object else {
+            return;
+        };
+        // Ids are whole numbers; none (or not a number) is -1: no session, no feed.
+        let id = value.and_then(serde_json::Value::as_i64).unwrap_or(-1);
+        if env
+            .call_method(object, self.setter, "(J)V", &[JValue::Long(id)])
+            .is_err()
+        {
+            let _ = env.exception_clear();
+        }
+    }
+
+    fn destroy(&mut self, env: &mut JNIEnv<'_>) {
+        if let Some(object) = self.object.take()
+            && env.call_method(&object, "destroy", "()V", &[]).is_err()
+        {
+            let _ = env.exception_clear();
+        }
+    }
 }

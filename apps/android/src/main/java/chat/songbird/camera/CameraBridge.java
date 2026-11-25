@@ -136,7 +136,7 @@ public final class CameraBridge {
                 return;
             }
             prefs(a).edit().putBoolean("asked", true).apply();
-            a.requestPermissions(new String[] {Manifest.permission.CAMERA}, REQUEST_CAMERA);
+            chat.songbird.app.Results.ask(a, new String[] {Manifest.permission.CAMERA}, REQUEST_CAMERA);
         });
     }
 

@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Songbird's Android host (D-0113). The same as what NSH packaging writes for Android for
-  the app (permissions, the Rust flag, the files provider, the activity's flags), with
-  Songbird's own activity in place of NSH's AppActivity, and the camera.
+  Songbird's Android host (D-0113, D-0188). The same as what NSH packaging writes for Android
+  for the app (permissions, the Rust flag, the files provider, NSH's AppActivity and its flags),
+  with what NSH packaging can't hold: the Maven libraries Gradle resolves (CameraX, UnifiedPush,
+  Play Billing), Songbird's services, and the icon aliases.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -52,6 +53,12 @@
             android:exported="false"
             android:grantUriPermissions="true" />
 
+        <!-- The camera and device bridges follow NSH's activity (D-0188); it serves no data. -->
+        <provider
+            android:name="chat.songbird.app.Startup"
+            android:authorities="chat.songbird.app.startup"
+            android:exported="false" />
+
         <!-- Sharing the screen in a call (D-0180). -->
         <service
             android:name="chat.songbird.share.ScreenShareService"
@@ -68,7 +75,7 @@
         </service>
 
         <activity
-            android:name="chat.songbird.app.SongbirdActivity"
+            android:name="com.longbridge.nsh.AppActivity"
             android:exported="true"
             android:configChanges="locale|keyboard|keyboardHidden|navigation|orientation|screenLayout|uiMode|screenSize|smallestScreenSize|density|layoutDirection|fontScale"
             android:windowSoftInputMode="adjustResize" />
@@ -76,7 +83,7 @@
         <!-- The app icon the person chose (D-0179): one launcher alias per icon, one enabled. -->
         <activity-alias
             android:name=".IconSongbird"
-            android:targetActivity="chat.songbird.app.SongbirdActivity"
+            android:targetActivity="com.longbridge.nsh.AppActivity"
             android:icon="@mipmap/icon_songbird"
             android:roundIcon="@mipmap/icon_songbird"
             android:enabled="true"
@@ -88,7 +95,7 @@
         </activity-alias>
         <activity-alias
             android:name=".IconNight"
-            android:targetActivity="chat.songbird.app.SongbirdActivity"
+            android:targetActivity="com.longbridge.nsh.AppActivity"
             android:icon="@mipmap/icon_night"
             android:roundIcon="@mipmap/icon_night"
             android:enabled="false"
@@ -100,7 +107,7 @@
         </activity-alias>
         <activity-alias
             android:name=".IconPaper"
-            android:targetActivity="chat.songbird.app.SongbirdActivity"
+            android:targetActivity="com.longbridge.nsh.AppActivity"
             android:icon="@mipmap/icon_paper"
             android:roundIcon="@mipmap/icon_paper"
             android:enabled="false"
@@ -112,7 +119,7 @@
         </activity-alias>
         <activity-alias
             android:name=".IconLavender"
-            android:targetActivity="chat.songbird.app.SongbirdActivity"
+            android:targetActivity="com.longbridge.nsh.AppActivity"
             android:icon="@mipmap/icon_lavender"
             android:roundIcon="@mipmap/icon_lavender"
             android:enabled="false"

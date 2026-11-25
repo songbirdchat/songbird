@@ -22,7 +22,6 @@ block2 = "0.6.2"
 dispatch2 = "0.3.1"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSError", "NSString", "NSObject", "NSArray", "NSData", "NSDate", "NSValue", "NSNotification", "NSThread", "NSURL", "NSUUID", "NSSet", "NSBundle", "NSDictionary", "NSFileManager"] }
 objc2-local-authentication = { version = "0.3.2", default-features = false, features = ["std", "block2", "LAContext", "LAError", "LABiometryType"] }
-objc2-core-location = { version = "0.3.2", default-features = false, features = ["std", "CLLocation", "CLLocationManager", "CLLocationManagerDelegate", "CLError"] }
 objc2-authentication-services = { version = "0.3.2", default-features = false, features = ["std", "block2", "ASAuthorizationPlatformPublicKeyCredentialProvider", "ASAuthorizationPlatformPublicKeyCredentialRegistrationRequest", "ASAuthorizationPlatformPublicKeyCredentialAssertionRequest", "ASAuthorizationPlatformPublicKeyCredentialDescriptor", "ASAuthorizationPublicKeyCredentialAssertionRequest", "ASAuthorizationPublicKeyCredentialRegistrationRequest", "ASAuthorizationPublicKeyCredentialDescriptor", "ASAuthorizationController", "ASAuthorizationRequest", "ASAuthorization", "ASAuthorizationError"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
