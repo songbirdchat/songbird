@@ -258,8 +258,7 @@ fn group_links(s: Store) -> View {
                                 {
                                     let url = url.clone();
                                     move || {
-                                        set_clipboard(url.clone());
-                                        toast("Link copied");
+                                        crate::ui::copy(url.clone(), "Link copied");
                                     }
                                 },
                             ))
@@ -690,8 +689,7 @@ fn link_sheet(s: Store, open: Signal<bool>) -> nsh_base::SheetElement {
                                 .flex_row()
                                 .gap_2()
                                 .child(view().flex_1().child(btn_with_icon("Copy link", Some(Icon::Copy), Variant::Secondary, BtnSize::Lg, move || {
-                                    set_clipboard(url.clone());
-                                    toast("Link copied");
+                                    crate::ui::copy(url.clone(), "Link copied");
                                 })))
                                 .child(view().flex_1().child(btn_with_icon("Join call", Some(Icon::Video), Variant::Primary, BtnSize::Lg, {
                                     let url = link.url.clone();

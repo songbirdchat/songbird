@@ -190,8 +190,7 @@ fn content() -> AnyElement {
                                     .flex_wrap()
                                     .gap_2()
                                     .child(btn_with_icon("Copy link", Some(Icon::Copy), Variant::Outline, BtnSize::Sm, move || {
-                                        set_clipboard(link_url.get_untracked());
-                                        toast("Link copied");
+                                        crate::ui::copy(link_url.get_untracked(), "Link copied");
                                     }))
                                     .child(btn_with_icon("Reset", Some(Icon::Refresh), Variant::Outline, BtnSize::Sm, move || {
                                         confirm(

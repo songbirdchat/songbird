@@ -69,6 +69,8 @@ fn username_action(
                     .font_weight(FontWeight::MEDIUM),
             ),
     )
+    // Screen readers hear that the lookup runs (NSH 0.7 `busy`, D-0188).
+    .busy(busy)
 }
 
 fn action(glyph: Icon, label: &'static str, on_press: impl Fn() + 'static) -> impl IntoElement {
@@ -482,8 +484,7 @@ fn scan() -> impl IntoElement {
                                     .text_size(px(font::SMALL + 1.0)),
                             )
                             .child(icon_btn(Icon::Copy, "Copy your link", move || {
-                                set_clipboard(link.clone());
-                                toast("Your link is copied");
+                                crate::ui::copy(link.clone(), "Your link is copied");
                             })),
                     )
             })),

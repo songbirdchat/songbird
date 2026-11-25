@@ -7,9 +7,6 @@ import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.view.View;
 
-import com.longbridge.nsh.NshComponent;
-import com.longbridge.nsh.NshComponentContext;
-
 import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -19,9 +16,10 @@ import java.util.Set;
 /**
  * The native component {@code songbird/video} (D-0183): another participant's call video, the
  * feed its {@code feed} prop names, drawn from a reused bitmap (aspect fill). Frames come from
- * Rust's decoder thread ({@link CameraBridge#videoFrame}), not through the UI engine.
+ * Rust's decoder thread ({@link CameraBridge#videoFrame}), not through the UI engine. Made and
+ * driven by the Rust component the camera crate registers with NSH (D-0188); UI thread.
  */
-public final class VideoFrameView implements NshComponent {
+public final class VideoFrameView {
     private static final Object LOCK = new Object();
     /** Each feed's latest frame, and the views showing it. */
     private static final Map<Long, Bitmap> FRAMES = new HashMap<>();
@@ -30,24 +28,22 @@ public final class VideoFrameView implements NshComponent {
     private final Surface view;
     private long feed = -1;
 
-    public VideoFrameView(NshComponentContext context) {
-        view = new Surface(context.getContext());
+    public VideoFrameView(Context context) {
+        view = new Surface(context);
     }
 
-    @Override
     public View view() {
         return view;
     }
 
-    @Override
-    public void setProp(String name, Object value) {
-        if (!"feed".equals(name)) return;
+    /** The {@code feed} prop; less than 0 shows none. */
+    public void setFeed(long id) {
         unregister();
-        if (!(value instanceof Number)) {
+        if (id < 0) {
             view.postInvalidate();
             return;
         }
-        feed = ((Number) value).longValue();
+        feed = id;
         synchronized (LOCK) {
             VIEWS.computeIfAbsent(feed, k -> new HashSet<>()).add(view);
         }
@@ -55,7 +51,6 @@ public final class VideoFrameView implements NshComponent {
         view.postInvalidate();
     }
 
-    @Override
     public void destroy() {
         unregister();
     }

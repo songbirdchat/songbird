@@ -242,27 +242,65 @@ pub fn map(center: Signal<(f64, f64)>, zoom: Signal<f64>, interactive: bool) -> 
 /// Centres the picker on where the device is (D-0174): asked once, now; the system asks the
 /// person's permission the first time.
 fn locate(center: Signal<(f64, f64)>, zoom: Signal<f64>) {
+    spawn(async move {
+        match here().await {
+            Ok((latitude, longitude)) => {
+                center.try_set((latitude, longitude));
+                zoom.try_set(16.0);
+            }
+            Err(Here::Denied) => {
+                toast(
+                    "Songbird isn't allowed to use your location. Allow it in your device's settings.",
+                );
+            }
+            Err(Here::Unavailable) => {
+                toast("Your location isn't available right now. Move the map instead.");
+            }
+        }
+    });
+}
+
+/// Why there's no position.
+enum Here {
+    /// The person (or device management) said no.
+    Denied,
+    /// Location services are off, or no fix came.
+    Unavailable,
+}
+
+/// One position, about a hundred metres precise (a place on a map, not a track): CoreLocation
+/// through NSH 0.7's `nsh-extra` on macOS and iOS (D-0188), the device crate elsewhere. A fix
+/// that hasn't come in 30 s is none, once the person has answered the system's prompt.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+async fn here() -> Result<(f64, f64), Here> {
+    use nsh_extra::location::{self, Authorization, LocationError, LocationRequest};
+    // Asked first, without a deadline: the person may take their time with the prompt.
+    match location::request_authorization().await {
+        Ok(a) if a.allows_reading() => {}
+        Ok(Authorization::Denied | Authorization::Restricted) => return Err(Here::Denied),
+        _ => return Err(Here::Unavailable),
+    }
+    let mut request = LocationRequest::default();
+    request.timeout = Some(std::time::Duration::from_secs(30));
+    match location::current(request).await {
+        Ok(p) => Ok((p.latitude, p.longitude)),
+        Err(e) if e.code == LocationError::DENIED => Err(Here::Denied),
+        Err(_) => Err(Here::Unavailable),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+async fn here() -> Result<(f64, f64), Here> {
     use songbird_device::location::{self, Failure};
     let (tx, rx) = tokio::sync::oneshot::channel();
     location::current(Box::new(move |r| {
         let _ = tx.send(r);
     }));
-    spawn(async move {
-        match rx.await.unwrap_or(Err(Failure::Unavailable)) {
-            Ok(p) => {
-                center.try_set((p.latitude, p.longitude));
-                zoom.try_set(16.0);
-            }
-            Err(Failure::Denied) => {
-                toast(
-                    "Songbird isn't allowed to use your location. Allow it in your device's settings.",
-                );
-            }
-            Err(Failure::Unavailable) => {
-                toast("Your location isn't available right now. Move the map instead.");
-            }
-        }
-    });
+    match rx.await.unwrap_or(Err(Failure::Unavailable)) {
+        Ok(p) => Ok((p.latitude, p.longitude)),
+        Err(Failure::Denied) => Err(Here::Denied),
+        Err(Failure::Unavailable) => Err(Here::Unavailable),
+    }
 }
 
 /// The location picker: move the map under the pin, then send that place.

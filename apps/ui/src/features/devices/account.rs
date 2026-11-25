@@ -76,8 +76,7 @@ fn body() -> AnyElement {
                     .gap_2()
                     .pl(px(42.0))
                     .child(btn_with_icon("Copy", Some(Icon::Copy), Variant::Secondary, BtnSize::Sm, move || {
-                        set_clipboard(extra.with_untracked(|a| a.username_link.clone()));
-                        toast("Username link copied");
+                        crate::ui::copy(extra.with_untracked(|a| a.username_link.clone()), "Username link copied");
                     }))
                     .child(btn_with_icon("Reset link", Some(Icon::Refresh), Variant::Ghost, BtnSize::Sm, move || {
                         confirm(

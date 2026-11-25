@@ -37,7 +37,14 @@ pub async fn apply(i: u8) -> bool {
     let i = usize::from(i).min(NAMES.len() - 1);
     let (tx, rx) = tokio::sync::oneshot::channel();
     let name = (i > 0).then_some(NAMES[i]);
-    songbird_device::icon::set(name, PNGS[i], Box::new(move |ok| drop(tx.send(ok))));
+    songbird_device::icon::set(
+        name,
+        PNGS[i],
+        Box::new(move |ok| {
+            // Nobody waits any more when the screen that asked has gone.
+            let _ = tx.send(ok);
+        }),
+    );
     let ok = rx.await.unwrap_or(false);
     if ok {
         super::put(K_APPLIED, &i.to_string());

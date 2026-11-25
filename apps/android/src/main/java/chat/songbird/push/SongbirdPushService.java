@@ -9,7 +9,7 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.util.Base64;
 
-import chat.songbird.app.SongbirdActivity;
+import com.longbridge.nsh.AppActivity;
 import chat.songbird.device.DeviceBridge;
 
 import org.unifiedpush.android.connector.FailedReason;
@@ -49,7 +49,7 @@ public final class SongbirdPushService extends PushService {
         nm.createNotificationChannel(new NotificationChannel(CHANNEL, "New activity",
                 NotificationManager.IMPORTANCE_HIGH));
         PendingIntent open = PendingIntent.getActivity(this, 0,
-                new Intent(this, SongbirdActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                new Intent(this, AppActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         Notification n = new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(android.R.drawable.stat_notify_chat)
