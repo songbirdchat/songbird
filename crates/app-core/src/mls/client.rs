@@ -19,6 +19,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use openmls::prelude::tls_codec::Deserialize as _;
 use openmls::prelude::*;
+use prost::Message as _;
 use songbird_content::schema::{
     Content, DataMessage, Text, content::Body, data_message, group_update,
 };
@@ -555,6 +556,18 @@ impl<N: Net> Messenger<N> {
         self.send_files_with(gid, true, 0, files, text, album).await
     }
 
+    /// [`Self::send_group_files_in`]'s first half, with no network (D-0187): see
+    /// `Messenger::store_files_with`.
+    pub fn prepare_group_files_in(
+        &mut self,
+        gid: &[u8; 16],
+        files: Vec<(Vec<u8>, crate::attachments::FileMeta)>,
+        text: &str,
+        album: Option<crate::attachments::AlbumRef>,
+    ) -> Result<[u8; 16]> {
+        self.store_files_with(gid, true, 0, files, text, album)
+    }
+
     /// The accounts' devices in a group, as this device sees them.
     pub fn group_devices(&self, gid: &[u8; 16]) -> Result<Vec<[u8; 16]>> {
         let group = MlsGroup::load(self.mls.storage(), &GroupId::from_slice(gid))
@@ -618,9 +631,35 @@ impl<N: Net> Messenger<N> {
         self.send_group_content(gid, content, preview).await
     }
 
-    /// Sends `content` to a group with its own message id (stored once as Sending, so sending
-    /// it again after a failure is the same message): one MLS message, sealed for the group's
-    /// current epoch.
+    /// `content` sealed for the group's current epoch: the MLS message, its franking
+    /// commitment, and the epoch.
+    fn seal_group(
+        &mut self,
+        gid: &[u8; 16],
+        content: &Content,
+    ) -> Result<(Vec<u8>, Option<[u8; 32]>, u64)> {
+        let franking = *random::<32>()?;
+        let (padded, commitment) =
+            songbird_content::seal(content, Some(franking)).map_err(|_| Error::Malformed)?;
+        let mut payload = Zeroizing::new(Vec::with_capacity(16 + padded.len()));
+        payload.extend_from_slice(&self.local.account);
+        payload.extend_from_slice(&padded);
+        let mut group = MlsGroup::load(self.mls.storage(), &GroupId::from_slice(gid))
+            .map_err(|_| Error::Storage)?
+            .ok_or(Error::NoSession)?;
+        let epoch = group.epoch().as_u64();
+        let msg = group
+            .create_message(&self.mls, &self.mls_signer, &payload)
+            .map_err(|_| Error::Malformed)?;
+        self.save_mls()?;
+        Ok((tls(&msg)?, commitment, epoch))
+    }
+
+    /// Sends `content` to a group with its own message id: one MLS message, sealed for the
+    /// group's current epoch, kept in the group outbox until the server takes it (D-0187). With
+    /// no connection it waits as Sending and goes on the next [`Self::flush_outbox`] with the same
+    /// id and idempotency key, so a message the server did take (its answer lost) is never sent
+    /// twice; only a later epoch seals it again, and then members drop the repeat by its id.
     pub(crate) async fn send_group_content(
         &mut self,
         gid: &[u8; 16],
@@ -632,20 +671,7 @@ impl<N: Net> Messenger<N> {
             .as_slice()
             .try_into()
             .map_err(|_| Error::Malformed)?;
-        let franking = *random::<32>()?;
-        let (padded, commitment) =
-            songbird_content::seal(&content, Some(franking)).map_err(|_| Error::Malformed)?;
-        let mut payload = Zeroizing::new(Vec::with_capacity(16 + padded.len()));
-        payload.extend_from_slice(&self.local.account);
-        payload.extend_from_slice(&padded);
-        let mut group = MlsGroup::load(self.mls.storage(), &GroupId::from_slice(gid))
-            .map_err(|_| Error::Storage)?
-            .ok_or(Error::NoSession)?;
-        let msg = group
-            .create_message(&self.mls, &self.mls_signer, &payload)
-            .map_err(|_| Error::Malformed)?;
-        self.save_mls()?;
-        let body = tls(&msg)?;
+        let (body, commitment, epoch) = self.seal_group(gid, &content)?;
         if matches!(
             &content.body,
             Some(Body::Data(DataMessage {
@@ -653,30 +679,89 @@ impl<N: Net> Messenger<N> {
                 ..
             }))
         ) {
-            let row = data_row(
+            let mut row = data_row(
                 &content,
                 content_data(&content)?,
                 *gid,
                 self.local.account,
                 Status::Sending,
             )?;
-            let mut row = row;
             row.text = preview.into();
             self.store.insert_message(&row, false)?;
         }
+        let entry = crate::store::GroupOutboxEntry {
+            message: id,
+            gid: *gid,
+            idem: *random::<16>()?,
+            epoch,
+            body,
+            commitment: commitment.map(|c| c.to_vec()).unwrap_or_default(),
+            content: content.encode_to_vec(),
+        };
+        self.store.group_outbox_put(&entry, now_ms())?;
+        match self.deliver_group(&entry).await {
+            // Offline: it waits in the group outbox (Sending) and goes on the next flush.
+            Ok(()) | Err(Error::Network) => Ok(id),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Sends a waiting group message (D-0187): as sealed while the group is in that epoch, else
+    /// sealed again for the current one (same message id, a new idempotency key). The server's
+    /// answer ends its wait: taken, it is Sent; refused, Failed. A network failure leaves it
+    /// waiting.
+    async fn deliver_group(&mut self, entry: &crate::store::GroupOutboxEntry) -> Result<()> {
+        let me = self.local.account;
+        let group = match self.load_group(&entry.gid) {
+            Ok(g) => g,
+            // No longer in the group: it can't be sent.
+            Err(Error::NoSession) => {
+                self.store.group_outbox_done(&entry.message)?;
+                self.store.advance(&me, &entry.message, Status::Failed)?;
+                return Err(Error::NoSession);
+            }
+            Err(e) => return Err(e),
+        };
+        let mut entry = entry.clone();
+        if group.epoch().as_u64() != entry.epoch {
+            let content =
+                Content::decode(entry.content.as_slice()).map_err(|_| Error::Malformed)?;
+            let (body, commitment, epoch) = self.seal_group(&entry.gid, &content)?;
+            entry.body = body;
+            entry.commitment = commitment.map(|c| c.to_vec()).unwrap_or_default();
+            entry.epoch = epoch;
+            entry.idem = *random::<16>()?;
+            self.store.group_outbox_put(&entry, now_ms())?;
+        }
         let hints = SendHints {
-            group: Some(*gid),
-            commitment,
+            group: Some(entry.gid),
+            commitment: entry.commitment.as_slice().try_into().ok(),
             ..SendHints::default()
         };
-        if self.net.send_group(*random::<16>()?, hints, body).await? == SendStatus::Accepted {
-            self.store.advance(&self.local.account, &id, Status::Sent)?;
-            Ok(id)
+        let status = self
+            .net
+            .send_group(entry.idem, hints, entry.body.clone())
+            .await?;
+        self.store.group_outbox_done(&entry.message)?;
+        if status == SendStatus::Accepted {
+            self.store.advance(&me, &entry.message, Status::Sent)?;
+            Ok(())
         } else {
-            self.store
-                .advance(&self.local.account, &id, Status::Failed)?;
+            self.store.advance(&me, &entry.message, Status::Failed)?;
             Err(Error::Server(0))
         }
+    }
+
+    /// Sends every group message waiting for the server, oldest first (D-0187). Stops at the
+    /// first network failure: the rest wait too.
+    pub(crate) async fn flush_group_outbox(&mut self) -> Result<()> {
+        for entry in self.store.group_outbox()? {
+            // Refused or no longer possible: already marked, the rest go on.
+            if let Err(Error::Network) = self.deliver_group(&entry).await {
+                return Err(Error::Network);
+            }
+        }
+        Ok(())
     }
 
     /// Sends any content to a group (a call signal): one MLS message, not stored as a message.
