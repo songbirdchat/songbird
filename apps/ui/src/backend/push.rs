@@ -5,7 +5,7 @@
 use std::cell::Cell;
 
 use nsh_core::prelude::*;
-use songbird_device::push::{self, Token};
+use songbird_device::push::Token;
 
 use super::wire;
 
@@ -49,10 +49,12 @@ pub fn install() {
         return;
     }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Token>();
-    let asked = push::register(Box::new(move |t| {
+    #[cfg(target_os = "ios")]
+    ask_apns(tx);
+    #[cfg(not(target_os = "ios"))]
+    if !songbird_device::push::register(Box::new(move |t| {
         let _ = tx.send(t);
-    }));
-    if !asked {
+    })) {
         return;
     }
     Owner::detached().run(|| {
@@ -83,6 +85,38 @@ pub fn install() {
                         }
                     }
                 }
+            }
+        });
+    });
+}
+
+/// iOS: the APNs token through NSH 0.7's push module (`nsh-extra`, D-0188), which hears it from
+/// NSH's own app delegate; every registration reports it, and so does a new one the system
+/// issues later.
+#[cfg(target_os = "ios")]
+fn ask_apns(tx: tokio::sync::mpsc::UnboundedSender<Token>) {
+    use nsh_extra::push::{ForegroundPresentation, PushEvent};
+    // The wake-up the Notification Service Extension shows (thread `songbird`, D-0099) says
+    // nothing the open app doesn't have already over its connection, where its own notifier
+    // decides what to show: in front it neither shows nor sounds.
+    nsh_extra::push::set_thread_presentation(
+        "songbird",
+        Some(
+            ForegroundPresentation::default()
+                .banner(false)
+                .list(false)
+                .sound(false),
+        ),
+    );
+    nsh_extra::push::on_event(move |event| {
+        if let PushEvent::Token(token) = event {
+            let _ = tx.send(Token::Apns(token.as_bytes().to_vec()));
+        }
+    });
+    Owner::detached().run(|| {
+        spawn(async {
+            if let Err(e) = nsh_extra::push::register().await {
+                log::info!("push registration: {e}");
             }
         });
     });

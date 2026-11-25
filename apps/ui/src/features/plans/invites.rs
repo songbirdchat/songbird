@@ -90,8 +90,7 @@ fn invites_page() -> Screen {
                                         .style_when(move || code.used, |st| st.hidden())
                                         .child(
                                             icon_btn(Icon::Copy, format!("Copy {value}"), move || {
-                                                set_clipboard(copy_value.clone());
-                                                toast("Invite code copied");
+                                                crate::ui::copy(copy_value.clone(), "Invite code copied");
                                             })
                                             .text_color(move || c::muted_fg()),
                                         )
@@ -174,8 +173,7 @@ fn invite_link_page() -> Screen {
                 .flex_row()
                 .gap_3()
                 .child(btn_with_icon("Copy link", Some(Icon::Copy), Variant::Secondary, BtnSize::Md, move || {
-                    set_clipboard(copy_url.clone());
-                    toast("Link copied");
+                    crate::ui::copy(copy_url.clone(), "Link copied");
                 }))
                 .child(btn_with_icon("Share…", Some(Icon::Share), Variant::Primary, BtnSize::Md, move || {
                     share_text(shared.get_untracked())

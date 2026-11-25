@@ -109,7 +109,13 @@ pub fn decide(event: &Event, chat: &Chat, settings: &Settings, focus: Focus) -> 
     })
 }
 
-/// The app's focus, kept by [`install`].
+/// Follows the focus of the app's window `w` (`desktop::app_window`, D-0188).
+pub fn follow_focus(w: &nsh_core::element::desktop::WindowRef) {
+    let focused = global::<AppFocused>();
+    w.on_focus_change(move |f| focused.set(AppFocused(f)));
+}
+
+/// The app's focus, kept by [`follow_focus`].
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 struct AppFocused(bool);
 
@@ -121,7 +127,6 @@ pub fn install(focus_of: impl Fn() -> Option<u64> + 'static) {
     let s = store();
     let focused = global::<AppFocused>();
     focused.set(AppFocused(true));
-    nsh_core::element::desktop::main_window().on_focus_change(move |f| focused.set(AppFocused(f)));
     // The badge follows the unread count.
     effect(move || {
         let n = s.total_unread();
@@ -218,7 +223,7 @@ pub fn demo_from_env() {
         return;
     };
     let after = std::time::Duration::from_secs(secs);
-    set_timeout(after, || nsh_core::element::desktop::main_window().hide());
+    set_timeout(after, crate::features::desktop::hide_main_window);
     set_timeout(after + std::time::Duration::from_secs(2), move || {
         s.push_message(
             chat,

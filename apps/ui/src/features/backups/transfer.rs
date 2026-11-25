@@ -286,8 +286,7 @@ pub(super) fn transfer_body() -> AnyElement {
                                                 .child(qr_code_live(move || qr.get(), 4.0)),
                                         )
                                         .child(btn_with_icon("Copy code", Some(Icon::Copy), Variant::Ghost, BtnSize::Sm, move || {
-                                            set_clipboard(qr.get_untracked());
-                                            toast("Code copied. It works once, for the next few minutes.");
+                                            crate::ui::copy(qr.get_untracked(), "Code copied. It works once, for the next few minutes.");
                                         }))
                                 },
                             ).otherwise(|| busy_bar("Getting ready"))),

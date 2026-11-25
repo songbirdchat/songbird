@@ -2,9 +2,8 @@
 //! token goes to Songbird's api sealed to the push service's key (PROTOCOL §9); what a push
 //! carries is nothing but "fetch your mail".
 //!
-//! - **iOS**: APNs. NSH's app delegate doesn't take the token callbacks, so they are added to its
-//!   class at run time (`class_addMethod`: added, never replacing NSH's own), then UIKit is asked
-//!   to register.
+//! - **iOS**: APNs, through NSH 0.7's `nsh-extra` push module, which the app calls (D-0188); it
+//!   hears the token from NSH's app delegate. [`register`] answers `false` there.
 //! - **Android**: UnifiedPush through the user's own distributor (no Google services): its Web
 //!   Push endpoint and the keys the connector made.
 
@@ -42,8 +41,6 @@ pub type OnToken = Box<dyn Fn(Token) + Send + Sync>;
 /// are allowed. `false` where this platform's push isn't reached this way.
 #[must_use]
 pub fn register(on_token: OnToken) -> bool {
-    #[cfg(target_os = "ios")]
-    return crate::apple::register_push(on_token);
     #[cfg(target_os = "android")]
     return crate::android::register_push(on_token);
     #[allow(unreachable_code, reason = "other platforms")]

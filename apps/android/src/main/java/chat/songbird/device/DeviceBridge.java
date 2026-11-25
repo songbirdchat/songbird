@@ -207,7 +207,7 @@ public final class DeviceBridge {
             }
             WAITING.add(id);
             if (WAITING.size() == 1) {
-                a.requestPermissions(new String[] {
+                chat.songbird.app.Results.ask(a, new String[] {
                         android.Manifest.permission.ACCESS_FINE_LOCATION,
                         android.Manifest.permission.ACCESS_COARSE_LOCATION}, LOCATION_REQUEST);
             }
@@ -310,7 +310,7 @@ public final class DeviceBridge {
             }
             if (a.checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
                     != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                MAIN.post(() -> a.requestPermissions(
+                MAIN.post(() -> chat.songbird.app.Results.ask(a,
                         new String[] {android.Manifest.permission.WRITE_EXTERNAL_STORAGE}, STORAGE_REQUEST));
                 return false;
             }
@@ -341,7 +341,7 @@ public final class DeviceBridge {
         if (a == null) return -1;
         if (a.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
                 == android.content.pm.PackageManager.PERMISSION_GRANTED) return 1;
-        MAIN.post(() -> a.requestPermissions(
+        MAIN.post(() -> chat.songbird.app.Results.ask(a,
                 new String[] {android.Manifest.permission.RECORD_AUDIO}, MIC_REQUEST));
         return 0;
     }
@@ -536,7 +536,7 @@ public final class DeviceBridge {
         if (a == null) return false;
         android.media.projection.MediaProjectionManager mpm =
                 a.getSystemService(android.media.projection.MediaProjectionManager.class);
-        a.runOnUiThread(() -> a.startActivityForResult(mpm.createScreenCaptureIntent(), REQUEST_SCREEN));
+        a.runOnUiThread(() -> chat.songbird.app.Results.start(a, mpm.createScreenCaptureIntent(), REQUEST_SCREEN));
         return true;
     }
 
@@ -544,7 +544,7 @@ public final class DeviceBridge {
         chat.songbird.share.ScreenShareService.stopFromApp();
     }
 
-    /** From the activity: the person's answer to the capture prompt. */
+    /** From {@link chat.songbird.app.Results}: the person's answer to the capture prompt. */
     public static void onActivityResult(int request, int result, android.content.Intent data) {
         if (request != REQUEST_SCREEN) return;
         Activity a = activity.get();

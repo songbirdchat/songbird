@@ -199,6 +199,114 @@ newest first. Performance decisions cite the benchmark run (hardware, kernel, co
 
 ## Decisions
 
+## D-0188 — NSH 0.7 throughout, and what it replaces
+
+- Date: 2026-11-25
+- Status: accepted by the agent on the owner's request ("use NSH 0.7 at full power, and cut the
+  Swift/Kotlin host code it now covers")
+- Decided by: agent
+- Context: NSH 0.7.0 shipped on 2026-11-25 (606 pull requests since 0.6). The app, the camera
+  crate and the dev-dependencies were on 0.6.0. Several app workarounds cite NSH limits, and
+  the iOS and Android hosts carried code of Songbird's own around NSH.
+- Evidence read: the v0.7.0 release notes; the 0.6.0 and 0.7.0 sources of `nsh-core`,
+  `nsh-base`, `nsh-platform-{ios,apple,macos,android}`; `nsh-extra` 0.7.0; nsh.dev's nshm,
+  packaging, Android and native-component pages.
+- Options considered: for each 0.7 feature, adopt it or keep the app's own code. For the new
+  `nsh-*` crates on crates.io, the release's own (`nsh-extra`, longbridge/nsh, Apache-2.0) versus
+  the third-party SuperNSH ones (`nsh-http`, `nsh-secure-storage`, `nsh-biometrics`,
+  `nsh-background`, `nsh-share`, `nsh-permissions`, `nsh-firebase-*`: one author, first
+  published the day before, not part of the release): refused, Songbird's own audited code
+  stays. For Android: NSH packaging alone (it takes prebuilt jar/AAR/dex and a few manifest
+  elements, but compiles no Java, resolves no Maven libraries and declares no
+  `<activity-alias>`) versus keeping the Gradle host for those and dropping only Songbird's own
+  activity (chosen).
+- Decision:
+  1. **NSH 0.7.0 everywhere**: `nsh-core`, `nsh-base`, the platform crates, `nsh-engine` and
+     `nsh-testing` in `apps/ui`; the platform crates in `apps/camera`. Building needs the 0.7
+     `nsh` command. A stale `apps/ui/.nsh` from another `nsh` version breaks the generated
+     workspace (`no matching package named …-hack`): delete it.
+  2. **Nothing the server sends is cached by the system** (`HttpRequest::cache(NoStore)`, new in
+     0.7, on every request in `backend::transfer`): NSH's Apple stack used the shared
+     `URLCache`, a database on disk outside the encrypted store, which could keep API answers,
+     key bundles and sealed files.
+  3. **Auto-download follows the link in use** (`network()`, new in 0.7): the mobile-data choice
+     on cellular, on a costly link (a hotspot, a metered network) or in Low Data Mode / Data
+     Saver, the Wi-Fi choice on Wi-Fi and wired links; where the platform can't tell (Windows,
+     Linux), the old rule (phones mobile, desktops Wi-Fi). **Delivery reconnects when the route
+     changes** (back online, or Wi-Fi handing over to cellular) instead of waiting out the dead
+     socket's idle limit; the outboxes make a reconnect safe (D-0186, D-0187).
+  4. **Copying says what happened**: clipboard writes now answer whether the system took them
+     (0.7); `ui::copy` toasts "Couldn't copy" when it refused (macOS, Windows) and the usual
+     message otherwise (iOS, Android and Linux can't tell).
+  5. **`nsh-extra` 0.7** (the release's official modules; `nsh add nsh-extra --features
+     push,location`, so it is in `nsh.json` `dependencies` and `nsh.lock`):
+     - `push` on iOS: the APNs token from NSH's own app delegate
+       (`nsh_platform_ios::on_application_event`, new in 0.7). It replaces the device crate's
+       `class_addMethod` on NSH's delegate class (two `unsafe` C callbacks). The Notification
+       Service Extension's wake-up (thread `songbird`) neither shows nor sounds while the app is
+       in front: the open app has the message already and its own notifier decides. Android
+       stays on UnifiedPush through the device crate (`nsh-extra` push wants one token string;
+       a Web Push endpoint is a URL and two keys).
+     - `location` on macOS and iOS: CoreLocation at about 100 m, asked once (the person's
+       answer first, without a deadline), then 30 s for the fix. It replaces the device crate's
+       `CLLocationManager` delegate and its `objc2-core-location` dependency. Android, Windows
+       and Linux keep the device crate's. The app's own usage descriptions win over the
+       module's defaults in the packaged `Info.plist` (checked).
+     - Not used: `camera` (one still from the system's camera; Songbird's camera does the live
+       preview, code scanning, video and call video), `photos` (reads the library; Songbird
+       only saves to it), `speech`.
+  6. **Android: NSH's own activity.** 0.7's `AppActivity` keeps the running app across activity
+     recreation, receives shares and owns the system bars, and an app's crate can make Android
+     components (`#[native_components(android)]`). Songbird's `SongbirdActivity` and the
+     `com.longbridge.nsh.SongbirdHost` shim (NSH's package-private helpers reached from inside
+     its package) are gone: the camera preview and call video are Rust components in the camera
+     crate (`android::register`) over the same Java views; a start-up provider
+     (`chat.songbird.app.Startup`, as NSH's docs say for start-up work, since an NSH app has no
+     `Application` of its own) hands the activity in front to the camera and device bridges; a
+     headless fragment (`Results`) takes their permission answers and the screen capture's
+     result. The Gradle host stays for what NSH packaging can't hold: CameraX, UnifiedPush and
+     Play Billing from Maven, Songbird's services, and the icon aliases (D-0179).
+  7. **Screen readers hear running actions** (`Button` `busy`, new in 0.7) on Register this
+     device, Message this username, the photo sheet's send and the onboarding profile's save.
+  8. **The desktop app declares its window** (0.7's window model: the root's `main_window()`
+     is a hidden host whose `show`, `hide`, `focus` and `close` do nothing). Everything shows in
+     `desktop::app_window` (`window().id("main")`, 1200 × 832 at first, where the user left it
+     after that); on phones a window is the app's one surface. The tray's close-to-tray, "show
+     Songbird", the notifier's focus and the demo's hide act on that window, and the Dock's
+     reopen brings it back, closed or hidden. Without this, the tray, the notifier and the
+     close-to-tray rule would act on the hidden host, so nothing would come back from the tray.
+- Not changed, checked in the 0.7 sources:
+  - **Blurred stand-ins stay PNGs** (D-0186): `ImageData::from_rgba` still hands platforms a
+    stored PNG, only macOS draws the pixel buffer itself, and iOS's image loading is unchanged.
+  - **Photo and link tiles keep `view()` with `on_press`/`on_long_press`**: `nsh_base::button`
+    still has no long press, and iOS's press recognizer is unchanged but for haptics.
+  - **No upload or download percentages** (D-0186): the Rust `fetch` still answers with the whole
+    response; streamed bodies exist only between the engine and the platform, for JS.
+  - **API calls keep their own deadline** (`within`, `deadline_of`): 0.7's request has a cache
+    mode and no timeout. Dropping the waiting task still cancels the request.
+- Consequences: 0.7's breaking changes that touch Songbird: desktop windows close independently
+  under quit modes (the default: macOS keeps running with no window, Windows and Linux quit,
+  which is what closing with the tray icon hidden did before; with the icon, closing hides); on
+  Apple, presses of notifications NSH didn't show go to a native handler
+  (`nsh-extra` push installs one; the extension's wake-up opens no chat anyway); clipboard
+  writes answer. Phone builds need the 0.7 `nsh` (kept apart from the 0.6 one other branches use
+  until they move).
+- Evidence: `apps/ui` `cargo test` 247 pass (two new: the link picks the auto-download choice;
+  a new route reconnects); `cargo check --all-targets` without warnings; clippy without findings
+  on the changed lines of `apps/ui` (macOS and iOS), `apps/device` (macOS and iOS) and
+  `apps/camera` (Android). The iOS device build (`nsh package --target ios`, nsh 0.7) builds and
+  signs, and installs on the iPhone 18; its `Info.plist` keeps Songbird's usage descriptions and
+  background modes. The Android APK builds (Gradle lint passes) and, on the arm64 emulator
+  (Android 16), runs in NSH's `AppActivity` and keeps its page and process through a
+  configuration change. The macOS app (development host and the packaged app) opens its
+  "Songbird" window at 1200 × 832; the Mac's screen was locked, so what it draws wasn't seen.
+  Not checked on a device: the screens on the iPhones (both locked, their
+  screen runner unreachable), the APNs token and the location prompt on iOS, the camera preview,
+  permission prompts and screen capture on Android (every camera screen needs an account, and
+  the emulator build can't reach the LAN server over plain HTTP).
+- Found in passing, not changed here: on Android, the system Back on onboarding's "Scan this code
+  with your phone" leaves the app instead of going back a page; the 0.6 build does the same.
+
 ## D-0186 — Photos sent together: albums that hold their shape, blurred stand-ins, loading spinners
 
 - Date: 2026-11-24

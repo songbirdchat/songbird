@@ -224,8 +224,7 @@ pub fn invite_link_page(chat: ChatId) {
                         Row::new("Copy link")
                             .icon(Icon::Copy)
                             .on_press(move || {
-                                set_clipboard(link());
-                                toast("Link copied");
+                                crate::ui::copy(link(), "Link copied");
                             })
                             .build(),
                         Row::new("Share link…")

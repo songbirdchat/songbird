@@ -979,6 +979,22 @@ pub fn toast_layer() -> View {
         )
 }
 
+/// Puts `text` on the system clipboard, then toasts `done` once the system has answered, or
+/// says it couldn't copy when the system refused (macOS, Windows: another app holding the
+/// clipboard). iOS, Android and Linux don't say: the write was handed on, so `done` (D-0188).
+pub fn copy(text: impl Into<String>, done: impl Into<SharedString>) {
+    let written = set_clipboard(text);
+    let done: SharedString = done.into();
+    Owner::detached().run(|| {
+        spawn(async move {
+            toast(match written.await {
+                ClipboardWrite::Failed => SharedString::from("Couldn't copy. Try again."),
+                _ => done,
+            });
+        })
+    });
+}
+
 /// Hands `text` to the system's share sheet (iOS, Android, macOS; NSH
 /// `share`). Where the platform has none (Windows, Linux), it is copied
 /// instead and the toast says so.
@@ -988,8 +1004,7 @@ pub fn share_text(text: impl Into<String>) {
         spawn(async move {
             let request = nsh_core::share::ShareRequest::new().text(text.clone());
             if !matches!(nsh_core::prelude::share(request).await, Ok(_)) {
-                set_clipboard(text);
-                toast("Copied. Paste it into any app to share it.");
+                copy(text, "Copied. Paste it into any app to share it.");
             }
         })
     });

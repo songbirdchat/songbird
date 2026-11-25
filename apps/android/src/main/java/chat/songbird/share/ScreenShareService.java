@@ -20,7 +20,7 @@ import android.os.IBinder;
 import android.util.DisplayMetrics;
 import android.view.WindowManager;
 
-import chat.songbird.app.SongbirdActivity;
+import com.longbridge.nsh.AppActivity;
 import chat.songbird.device.DeviceBridge;
 
 /**
@@ -148,7 +148,7 @@ public final class ScreenShareService extends Service {
         nm.createNotificationChannel(new NotificationChannel(CHANNEL, "Screen sharing",
                 NotificationManager.IMPORTANCE_LOW));
         PendingIntent open = PendingIntent.getActivity(this, 1,
-                new Intent(this, SongbirdActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                new Intent(this, AppActivity.class).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
         PendingIntent stop = PendingIntent.getService(this, 2,
                 new Intent(this, ScreenShareService.class).setAction(STOP),

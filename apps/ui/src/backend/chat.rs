@@ -1292,8 +1292,7 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
         });
     });
     // Auto-download (Settings → Storage and data): what the user allowed,
-    // by kind. Phones can't tell Wi-Fi from mobile data here, so they follow
-    // the mobile choice; desktops the Wi-Fi one.
+    // by kind, for the link in use now (D-0188).
     if media {
         let photo = s
             .message(chat, id)
@@ -1301,7 +1300,11 @@ fn show(s: Store, me: &[u8; 16], row: &MessageRow, count_unread: bool) {
         let (wifi, mobile) = s
             .settings
             .with_untracked(|x| if photo { x.auto_photos } else { x.auto_docs });
-        let allowed = if is_desktop() { wifi } else { mobile };
+        let allowed = if super::net_route::mobile_choice(untracked(network), is_desktop()) {
+            mobile
+        } else {
+            wifi
+        };
         // This device's own photos are in its store already: always shown (D-0183).
         if photo && (mine || allowed) {
             load_photo(id);

@@ -36,6 +36,7 @@ pub mod group_sync;
 pub mod icon;
 pub mod link;
 pub mod lock;
+pub(crate) mod net_route;
 pub mod nudge;
 pub mod packs;
 pub mod passkeys;
@@ -193,6 +194,7 @@ pub fn restore() {
     if is_live() && registered() {
         connect();
     }
+    net_route::follow();
 }
 
 /// Whether the real backend is on.
@@ -477,7 +479,10 @@ async fn transfer(request: HttpRequest) -> Result<(u16, Vec<u8>), Problem> {
         usage::count(lane, out, r.body.len() + 200);
         return Ok((r.status, r.body));
     }
-    match fetch(request).await {
+    // Nothing the server sends is kept by the system's HTTP cache (D-0188): on Apple that cache
+    // is a database on disk outside the encrypted store, and API answers, key bundles and
+    // sealed files have no business there, nor would any of them be read from it again.
+    match fetch(request.cache(nsh_core::platform::HttpCache::NoStore)).await {
         Ok(r) => {
             usage::count(lane, out, r.body.len() + 200);
             Ok((r.status(), r.body))

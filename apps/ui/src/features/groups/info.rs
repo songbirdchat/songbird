@@ -868,8 +868,7 @@ fn channel_page(s: Store, chat: ChatId) -> Screen {
                         }))
                         .child(action_tile(Icon::Share, "Share", move || {
                             if let Some(c) = s.chat(chat) {
-                                set_clipboard(c.invite_link);
-                                toast("Channel link copied");
+                                crate::ui::copy(c.invite_link, "Channel link copied");
                             }
                         }))
                         .child(action_tile(Icon::LogOut, "Unfollow", unfollow)),

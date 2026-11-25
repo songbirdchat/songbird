@@ -75,6 +75,14 @@ fn camera_components_ios(components: &nsh_platform_ios::Components) {
     songbird_camera::video::register(components);
 }
 
+/// The camera's live preview (CameraX) and call video on Android, made by Rust in NSH's own
+/// activity (D-0188): Songbird has no activity of its own to register them in. The Android
+/// platform crate's library is `nsh`.
+#[native_components(android)]
+fn camera_components_android(components: &nsh::Components) {
+    songbird_camera::android::register(components);
+}
+
 /// The camera's live preview on Windows (Media Foundation frames drawn with Direct2D).
 #[native_components(windows)]
 fn camera_components_windows(components: &nsh_platform_windows::Components) {
@@ -129,6 +137,16 @@ pub fn App() -> impl IntoElement {
     features::notify::install(features::desktop::current_chat);
     features::notify::demo_from_env();
     let onboarded = move || s.session.with(|x| x.onboarded);
+    // The window everything shows in (D-0188): on the desktops NSH 0.7's root is a hidden host.
+    features::desktop::app_window(move || {
+        // A window renders beside the root, as the pop-out chats do: the store goes with it.
+        provide_context(s);
+        app_body(s, onboarded)
+    })
+}
+
+/// What the app's window shows: the first run or the app, and the layers over everything.
+fn app_body(s: Store, onboarded: impl Fn() -> bool + Copy + 'static) -> AnyElement {
     view()
         .flex_1()
         .bg(move || ui::c::background())
@@ -150,4 +168,5 @@ pub fn App() -> impl IntoElement {
         .child(features::cover::layer(s))
         .child(features::calls::call_layer())
         .child(ui::toast_layer())
+        .into_element()
 }

@@ -11,8 +11,8 @@ use nsh_core::{
     element::{
         FileDragEvent, FileDropEvent,
         desktop::{
-            MenuItem, WindowRef, main_window, open_window, set_application_menu, set_tray, tray,
-            window as new_window,
+            MenuItem, WindowRef, current_window, on_reopen, open_window, set_application_menu,
+            set_tray, tray, window as new_window,
         },
     },
     keymap::When,
@@ -127,16 +127,60 @@ pub fn install_shortcuts() {
     desktop_menus();
     s.restore_tray_choice();
     desktop_tray();
-    close_to_tray();
+    // The Dock (or Finder) asks for the app again: its window comes back, closed or hidden.
+    on_reopen(show_main_window);
 }
 
-/// While the tray / menu bar icon shows, closing the main window hides it
-/// and Songbird keeps running there, connected, so messages and calls still
-/// notify (D-0098; desktops have no push service). Quit from the tray's
-/// menu or the app menu. Without the icon, closing works as the system's
-/// does.
-fn close_to_tray() {
-    let window = main_window();
+thread_local! {
+    /// The app's window while it is open ([`app_window`]).
+    static APP_WINDOW: std::cell::RefCell<Option<WindowRef>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Whether the app's window is open: false once the user closed it with the tray icon hidden
+/// (macOS keeps the app running then, as its apps do).
+#[derive(Clone, Copy, PartialEq)]
+struct AppWindowOpen(bool);
+
+impl Default for AppWindowOpen {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
+/// Songbird's window, with `body` in it (NSH 0.7, D-0188): on the desktops an app declares the
+/// window its UI shows in (the root's own is a hidden host now), and on phones the window is
+/// the app's one surface. It opens where the user left it.
+pub fn app_window(body: impl Fn() -> AnyElement + 'static) -> impl IntoElement {
+    let open = global::<AppWindowOpen>();
+    new_window()
+        .id("main")
+        .title("Songbird")
+        .default_size(size(px(1200.0), px(832.0)))
+        .restore_bounds(true)
+        .open(move || open.get().0)
+        .on_open_change(move |e| {
+            if !e.open {
+                open.set(AppWindowOpen(false));
+            }
+        })
+        .content(move || {
+            if is_desktop() {
+                let w = current_window();
+                APP_WINDOW.with_borrow_mut(|a| *a = Some(w.clone()));
+                cleanup(|| APP_WINDOW.with_borrow_mut(|a| *a = None));
+                close_to_tray(&w);
+                features::notify::follow_focus(&w);
+            }
+            body()
+        })
+}
+
+/// While the tray / menu bar icon shows, closing the window hides it and Songbird keeps running
+/// there, connected, so messages and calls still notify (D-0098; desktops have no push
+/// service). Quit from the tray's menu or the app menu. Without the icon, closing works as the
+/// system's does.
+fn close_to_tray(window: &WindowRef) {
     let w = window.clone();
     effect(move || {
         let keep = !extras().with(|e| e.tray_hidden);
@@ -156,11 +200,21 @@ fn close_to_tray() {
     });
 }
 
-/// Brings the main window back (from the tray, a notification).
+/// Brings the app's window back (from the tray, the Dock, a notification): shown if hidden,
+/// opened again if closed.
 pub fn show_main_window() {
-    let w = main_window();
-    w.show();
-    w.focus();
+    global::<AppWindowOpen>().set(AppWindowOpen(true));
+    if let Some(w) = APP_WINDOW.with_borrow(Clone::clone) {
+        w.show();
+        w.focus();
+    }
+}
+
+/// Hides the app's window as closing it to the tray does.
+pub fn hide_main_window() {
+    if let Some(w) = APP_WINDOW.with_borrow(Clone::clone) {
+        w.hide();
+    }
 }
 
 const SHEET_KEY: &str = "shortcuts";

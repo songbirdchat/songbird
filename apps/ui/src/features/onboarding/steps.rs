@@ -386,6 +386,7 @@ pub(super) fn claim_username(s: Store, f: Flow) -> View {
                 next,
             )
             .w_full()
+            .busy(move || saving.get())
             .disabled(move || !ok() || saving.get()),
         ),
     )
@@ -591,8 +592,7 @@ pub(super) fn recovery(s: Store, f: Flow) -> View {
                     .justify_center()
                     .gap_2()
                     .child(btn_with_icon("Copy", Some(Icon::Copy), Variant::Secondary, BtnSize::Md, move || {
-                        set_clipboard(copy_key.clone());
-                        toast("Recovery key copied. Keep it somewhere safe.");
+                        crate::ui::copy(copy_key.clone(), "Recovery key copied. Keep it somewhere safe.");
                     }))
                     .child(btn_with_icon(
                         "Save printable sheet",
@@ -815,7 +815,8 @@ pub(super) fn connect(s: Store, f: Flow) -> View {
             return;
         }
         if let Some(chat) = s.chat(id) {
-            set_clipboard(chat.invite_link);
+            // The screen after says the link is copied; a refusal has its own toast (D-0188).
+            crate::ui::copy(chat.invite_link, "Invite link copied");
         }
         finish(
             s,
@@ -869,8 +870,7 @@ pub(super) fn connect(s: Store, f: Flow) -> View {
                                     Variant::Secondary,
                                     BtnSize::Md,
                                     move || {
-                                        set_clipboard(link.clone());
-                                        toast("Invite link copied");
+                                        crate::ui::copy(link.clone(), "Invite link copied");
                                     },
                                 )),
                             ),

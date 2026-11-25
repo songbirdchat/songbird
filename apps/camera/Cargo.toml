@@ -20,14 +20,14 @@ jpeg-encoder = { version = "0.7.1", default-features = false, features = ["std"]
 # Windows: Media Foundation, the consent store, Direct2D (D-0114); the version NSH links.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Registry", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_Dxgi_Common"] }
-nsh-platform-windows = { version = "0.6.0", default-features = false }
+nsh-platform-windows = { version = "0.7.0", default-features = false }
 serde_json = "1"
 
 # Linux: V4L2 and a GTK picture (D-0114); gtk4 at the version NSH links.
 [target.'cfg(target_os = "linux")'.dependencies]
 v4l = { version = "0.14.0", default-features = false, features = ["v4l2"] }
 gtk4 = "0.11"
-nsh-platform-linux = { version = "0.6.0", default-features = false }
+nsh-platform-linux = { version = "0.7.0", default-features = false }
 serde_json = "1"
 
 [dev-dependencies]
@@ -58,7 +58,7 @@ serde_json = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSResponder", "NSView"] }
-nsh-platform-macos = { version = "0.6.0", default-features = false }
+nsh-platform-macos = { version = "0.7.0", default-features = false }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFCGTypes", "CFData"] }
@@ -66,11 +66,15 @@ objc2-ui-kit = { version = "0.3.2", default-features = false, features = ["std",
 # Call video drawn natively (D-0183): CGImages on a layer.
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["std", "CGImage", "CGDataProvider", "CGColorSpace"] }
 objc2-quartz-core = { version = "0.3.2", default-features = false, features = ["std", "CALayer", "CATransaction", "objc2-core-foundation"] }
-nsh-platform-ios = { version = "0.6.0", default-features = false }
+nsh-platform-ios = { version = "0.7.0", default-features = false }
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dev-dependencies]
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSDate", "NSRunLoop"] }
 
 # Android: CameraX in the Gradle host, reached over JNI (D-0113); the jni version NSH links.
+# The preview and call video register with NSH's own activity as Rust components (D-0188).
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
+nsh-platform-android = { version = "0.7.0", default-features = false }
+log = "0.4"
+serde_json = "1"
